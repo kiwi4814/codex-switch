@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.0.19 — 2026-06-29
+
+### Fixed
+
+- **Daemon free-account switching logic** — Free accounts have no `primary` window (7d usage is remapped to `secondary`), so `check_and_switch` now falls back to `secondary` when `primary` is absent. Previously the daemon always read 0% usage for free accounts and never triggered a switch, even when quota was exhausted.
+- **Lock file seek after truncate** — `write_lock_holder` now calls `seek(0)` after `set_len(0)` to ensure the PID is written at the beginning of the file, preventing potential corruption if the file pointer was not at position zero.
+- **Semaphore error handling in warmup** — `sem.acquire().await` result is now checked instead of silently unwrapped, returning a clear error if the semaphore is unexpectedly closed.
+
+### Changed
+
+- **Daemon candidate queries run concurrently** — `check_and_switch` now fetches usage for all candidate accounts via a `JoinSet` instead of a sequential `for` loop, reducing each poll cycle's wall-clock time from `O(N × network_timeout)` to `O(network_timeout)`.
+- **`lock_live_auth` no longer blocks the async runtime** — Both `launch_cmd` call sites now wrap the blocking lock-acquire-and-file-copy sequence in `tokio::task::spawn_blocking`, preventing up to 15 seconds of tokio worker stalls.
+- **`cache::get` on async hot path** — `select_best_profile` now uses the existing `cache::get_async` wrapper instead of calling the synchronous `cache::get` directly on a tokio worker thread.
+- **Migrated `fs2` → `fs4`** — Replaced the unmaintained `fs2` crate (last release 2018) with its actively maintained successor `fs4`, which provides improved cross-platform file locking behavior.
+
 ## v0.0.18 — 2026-06-08
 
 ### Fixed

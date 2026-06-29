@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use fs2::FileExt;
+use fs4::fs_std::FileExt;
 
 use crate::auth::{
     app_home, backup_auth, codex_auth_path, current_file, profiles_dir, read_auth, write_auth,
@@ -182,6 +182,7 @@ fn try_open_lock_file(path: &Path) -> io::Result<File> {
 /// Best-effort: write `pid epoch_secs` to the lock file for diagnostics.
 /// Failure is non-fatal — the OS-level flock is the source of truth.
 fn write_lock_holder(file: &File) {
+    use std::io::Seek;
     let pid = std::process::id();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -190,6 +191,7 @@ fn write_lock_holder(file: &File) {
     let line = format!("{pid} {ts}\n");
     let _ = file.set_len(0);
     let mut f = file;
+    let _ = f.seek(std::io::SeekFrom::Start(0));
     let _ = f.write_all(line.as_bytes());
 }
 
@@ -811,7 +813,7 @@ mod tests {
     use std::time::Duration;
 
     use anyhow::Result;
-    use fs2::FileExt;
+    use fs4::fs_std::FileExt;
 
     use super::{cmd_delete, cmd_use, rename_profile, switch_profile, validate_alias};
 

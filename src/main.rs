@@ -653,7 +653,7 @@ async fn select_best_profile(json: bool) -> Result<(String, usage::UsageInfo, f6
     let mut fetched: Vec<(String, usage::UsageInfo)> = Vec::with_capacity(profiles.len());
 
     for alias in profiles {
-        if let Some(cached) = cache::get(&alias) {
+        if let Some(cached) = cache::get_async(&alias).await {
             fetched.push((alias, cached));
             continue;
         }
@@ -790,22 +790,28 @@ async fn launch_cmd(alias: Option<&str>, args: Vec<String>, json: bool) -> Resul
     // Codex CLI reads auth.json only at startup, so we only need to hold
     // the swapped state for a few seconds, not the entire session.
     {
-        let _lock = profile::lock_live_auth().context("acquiring auth lock")?;
+        let codex_auth2 = codex_auth.clone();
+        let backup2 = backup.clone();
+        let target_alias2 = target_alias.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let _lock = profile::lock_live_auth().context("acquiring auth lock")?;
 
-        if had_original {
-            std::fs::copy(&codex_auth, &backup)
-                .with_context(|| format!("backing up {}", codex_auth.display()))?;
-            // Backup holds full tokens — restrict to 0600 so other local users
-            // cannot read it during the (brief) window before restore.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600));
+            if had_original {
+                std::fs::copy(&codex_auth2, &backup2)
+                    .with_context(|| format!("backing up {}", codex_auth2.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(&backup2, std::fs::Permissions::from_mode(0o600));
+                }
             }
-        }
 
-        profile::stage_profile_auth(&target_alias)?;
+            profile::stage_profile_auth(&target_alias2)?;
+            Ok(())
+        })
+        .await
+        .context("lock task panicked")??;
     }
     // Lock released here — other commands can proceed while codex runs.
 
@@ -838,15 +844,21 @@ async fn launch_cmd(alias: Option<&str>, args: Vec<String>, json: bool) -> Resul
     }
 
     {
-        let _lock = profile::lock_live_auth().context("acquiring auth lock for restore")?;
-        if had_original {
-            if std::fs::copy(&backup, &codex_auth).is_ok() {
-                let _ = std::fs::remove_file(&backup);
+        let codex_auth2 = codex_auth.clone();
+        let backup2 = backup.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let _lock = profile::lock_live_auth().context("acquiring auth lock for restore")?;
+            if had_original {
+                if std::fs::copy(&backup2, &codex_auth2).is_ok() {
+                    let _ = std::fs::remove_file(&backup2);
+                }
+            } else {
+                let _ = std::fs::remove_file(&codex_auth2);
             }
-            // If copy fails, backup is preserved for manual recovery
-        } else {
-            let _ = std::fs::remove_file(&codex_auth);
-        }
+            Ok(())
+        })
+        .await
+        .context("lock task panicked")??;
     }
 
     // Wait for codex to exit
@@ -1410,7 +1422,9 @@ async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
         };
         let sem = semaphore.clone();
         tasks.spawn(async move {
-            let _permit = sem.acquire().await;
+            let Ok(_permit) = sem.acquire().await else {
+                return (alias, Err(anyhow::anyhow!("semaphore closed")));
+            };
             let result = warmup::warmup_account(&alias, &path).await;
             (alias, result)
         });

@@ -86,9 +86,12 @@ async fn check_and_switch() -> Result<bool> {
         .map_err(|e| anyhow::anyhow!("{}", e.detail))?;
 
     // 2. Check if current account exceeds threshold
+    // Free accounts have no primary window (7d is remapped to secondary),
+    // so fall back to secondary when primary is absent.
     let current_used = current_usage
         .primary
         .as_ref()
+        .or(current_usage.secondary.as_ref())
         .and_then(|w| w.used_percent)
         .unwrap_or(0.0);
 
@@ -127,8 +130,8 @@ async fn check_and_switch() -> Result<bool> {
     current_candidate.pool_size = pool_size;
     current_candidate.team_priority = team_priority;
 
-    // 4. Fetch all other candidates, then compute pool_exhausted and score
-    let mut other_candidates: Vec<(usage::Candidate, String)> = Vec::new();
+    // 4. Fetch all other candidates concurrently, then compute pool_exhausted and score
+    let mut tasks = tokio::task::JoinSet::new();
 
     for alias in &profiles {
         if alias == &current {
@@ -138,26 +141,39 @@ async fn check_and_switch() -> Result<bool> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let u = match usage::fetch_usage_retried(alias, &path, &current).await {
+        let alias = alias.clone();
+        let current = current.clone();
+        tasks.spawn(async move {
+            let u = usage::fetch_usage_retried(&alias, &path, &current).await;
+            (alias, path, u)
+        });
+    }
+
+    let mut other_candidates: Vec<(usage::Candidate, String)> = Vec::new();
+    while let Some(res) = tasks.join_next().await {
+        let (alias, path, u) = match res {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let u = match u {
             Ok(u) => u,
             Err(e) => {
                 tracing::warn!("[{alias}] fetch failed: {}", e.summary);
                 continue;
             }
         };
-
         let info = auth::read_account_info(&path);
         let mut candidate = usage::Candidate::from_usage(
             alias.clone(),
             &u,
             info.is_team(),
             info.is_free(),
-            cache::get_last_used(alias),
+            cache::get_last_used(&alias),
             now,
         );
         candidate.pool_size = pool_size;
         candidate.team_priority = team_priority;
-        other_candidates.push((candidate, alias.clone()));
+        other_candidates.push((candidate, alias));
     }
 
     // Compute pool_exhausted across all accounts (including current)
