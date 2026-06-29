@@ -20,7 +20,7 @@ jobs:
       prerelease: ${{ steps.parse.outputs.prerelease }}
       is_dev: ${{ steps.parse.outputs.is_dev }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Parse tag
         id: parse
         run: |
@@ -75,7 +75,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -141,7 +141,7 @@ jobs:
     needs: [meta, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
