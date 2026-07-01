@@ -37,7 +37,7 @@ pub enum DaemonCommand {
     after_help = "Examples:\n  codex-switch list\n  codex-switch use\n  codex-switch rename old-alias new-alias\n  codex-switch import ./auth-backups\n  codex-switch self-update --check\n\nRun `codex-switch <command> --help` for command-specific options."
 )]
 pub struct Cli {
-    /// Output as compact JSON (supported by list, use, rename, delete, login, import, self-update)
+    /// Output as compact JSON (supported by list, use, reset-card, rename, delete, login, import, self-update)
     #[arg(long, global = true)]
     pub json: bool,
 
@@ -80,6 +80,14 @@ pub enum Commands {
         /// Force refresh, bypass cache
         #[arg(long, short)]
         force: bool,
+    },
+    /// Consume the earliest-expiring Codex reset card for a profile
+    ResetCard {
+        /// Profile alias
+        alias: String,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
     },
     /// Rename a profile
     Rename {

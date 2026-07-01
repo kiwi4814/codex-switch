@@ -186,6 +186,23 @@ fn json_import_keeps_stdout_machine_readable() {
 }
 
 #[test]
+fn json_reset_card_requires_explicit_yes() {
+    let home = temp_home("json-reset-card-confirm");
+
+    let output = run(&home, &["--json", "reset-card", "alice"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        parse_stdout_json(&output),
+        serde_json::json!({
+            "ok": false,
+            "error": "confirmation required; rerun with --yes to consume a reset card"
+        })
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn json_list_auto_track_keeps_stdout_machine_readable() {
     let home = temp_home("json-list");
     write_json(

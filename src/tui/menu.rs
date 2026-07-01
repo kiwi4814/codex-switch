@@ -20,8 +20,7 @@ const C_CYAN: Color = Color::Rgb(100, 210, 255);
 pub enum MenuState {
     /// Account-scoped action menu (Enter on a single account).
     Account {
-        alias: String,
-        email: Option<String>,
+        info: AccountMenuInfo,
         popup: PopupState,
     },
     /// Add new account: choose OAuth flow.
@@ -33,15 +32,20 @@ pub enum MenuState {
         popup: PopupState,
     },
     /// Batch menu shown when one or more accounts are marked.
-    Batch {
-        count: usize,
-        popup: PopupState,
-    },
+    Batch { count: usize, popup: PopupState },
     /// Batch re-login flow chooser (browser vs device code).
-    BatchReloginFlow {
-        count: usize,
-        popup: PopupState,
-    },
+    BatchReloginFlow { count: usize, popup: PopupState },
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountMenuInfo {
+    pub alias: String,
+    pub email: Option<String>,
+    pub plan_label: String,
+    pub is_current: bool,
+    pub reset_cards: Option<u64>,
+    pub reset_card_expiries: Vec<String>,
+    pub can_consume_reset_card: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -58,10 +62,10 @@ pub enum MenuAction {
     Add { device: bool },
     /// Open rename input for alias.
     Rename(String),
-    /// Force-refresh just this alias.
-    RefreshOne(String),
     /// Warmup just this alias.
     WarmupOne(String),
+    /// Consume the earliest-expiring reset card for alias.
+    ConsumeResetCard(String),
     /// Request delete confirmation for alias.
     DeleteRequest(String),
 
@@ -79,10 +83,9 @@ pub enum MenuAction {
 }
 
 impl MenuState {
-    pub fn account(alias: String, email: Option<String>) -> Self {
+    pub fn account(info: AccountMenuInfo) -> Self {
         MenuState::Account {
-            alias,
-            email,
+            info,
             popup: PopupState::new(),
         }
     }
@@ -119,14 +122,16 @@ impl MenuState {
     pub fn handle_key(&self, code: ratatui::crossterm::event::KeyCode) -> MenuAction {
         use ratatui::crossterm::event::KeyCode;
         match self {
-            MenuState::Account { alias, email, .. } => match code {
+            MenuState::Account { info, .. } => match code {
                 KeyCode::Esc | KeyCode::Char('q') => MenuAction::Close,
-                KeyCode::Char('u') => MenuAction::Use(alias.clone()),
-                KeyCode::Char('l') => MenuAction::ReloginRequest(alias.clone(), email.clone()),
-                KeyCode::Char('n') => MenuAction::Rename(alias.clone()),
-                KeyCode::Char('w') => MenuAction::WarmupOne(alias.clone()),
-                KeyCode::Char('f') => MenuAction::RefreshOne(alias.clone()),
-                KeyCode::Char('d') => MenuAction::DeleteRequest(alias.clone()),
+                KeyCode::Char('u') => MenuAction::Use(info.alias.clone()),
+                KeyCode::Char('l') => {
+                    MenuAction::ReloginRequest(info.alias.clone(), info.email.clone())
+                }
+                KeyCode::Char('n') => MenuAction::Rename(info.alias.clone()),
+                KeyCode::Char('w') => MenuAction::WarmupOne(info.alias.clone()),
+                KeyCode::Char('c') => MenuAction::ConsumeResetCard(info.alias.clone()),
+                KeyCode::Char('d') => MenuAction::DeleteRequest(info.alias.clone()),
                 _ => MenuAction::Close,
             },
             MenuState::Add { .. } => match code {
@@ -171,51 +176,98 @@ impl MenuState {
         let header_style = Style::default().fg(C_CYAN);
 
         match self {
-            MenuState::Account {
-                alias,
-                email,
-                popup,
-            } => {
+            MenuState::Account { info, popup } => {
                 let title = "Account";
                 let mut lines: Vec<Line<'static>> = Vec::new();
-                let header = match email {
-                    Some(e) => format!("{alias}  ({e})"),
-                    None => alias.clone(),
-                };
-                lines.push(Line::from(Span::styled(header, header_style)));
-                lines.push(Line::from(""));
-                lines.extend(menu_items(&[
-                    ("u", "Use (switch to)"),
-                    ("l", "re-Login"),
-                    ("n", "reName"),
-                    ("w", "Warmup"),
-                    ("f", "reFresh this one"),
-                    ("d", "Delete"),
-                ], key_style, label_style));
-                lines.push(Line::from(""));
+                let active = if info.is_current { "  active" } else { "" };
                 lines.push(Line::from(Span::styled(
-                    "esc / q to cancel",
-                    dim,
+                    format!("{}{}", info.alias, active),
+                    header_style,
                 )));
+                if let Some(email) = &info.email {
+                    lines.push(Line::from(vec![
+                        Span::styled("email  ", dim),
+                        Span::styled(email.clone(), label_style),
+                    ]));
+                }
+                lines.push(Line::from(vec![
+                    Span::styled("plan   ", dim),
+                    Span::styled(info.plan_label.clone(), label_style),
+                ]));
+                let cards = info
+                    .reset_cards
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "--".to_string());
+                lines.push(Line::from(vec![
+                    Span::styled("cards  ", dim),
+                    Span::styled(cards, label_style),
+                ]));
+                for (idx, expiry) in info.reset_card_expiries.iter().enumerate() {
+                    let note = if idx == 0 { "  next" } else { "" };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  #{}  ", idx + 1), dim),
+                        Span::styled(expiry.clone(), label_style),
+                        Span::styled(note, dim),
+                    ]));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("Primary", header_style)));
+                lines.extend(menu_items(
+                    &[("u", "Use (switch to)")],
+                    key_style,
+                    label_style,
+                ));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("Quota", header_style)));
+                lines.extend(menu_items_stateful(
+                    &[
+                        (
+                            "c",
+                            "Confirm earliest reset card",
+                            info.can_consume_reset_card,
+                        ),
+                        ("w", "Warmup", true),
+                    ],
+                    key_style,
+                    label_style,
+                    dim,
+                ));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("Auth", header_style)));
+                lines.extend(menu_items(&[("l", "re-Login")], key_style, label_style));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("Manage", header_style)));
+                lines.extend(menu_items(
+                    &[("n", "reName"), ("d", "Delete")],
+                    key_style,
+                    label_style,
+                ));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("esc / q to cancel", dim)));
                 render_popup(f, title, &lines, popup, area);
             }
             MenuState::Add { popup } => {
                 let title = "Add new account";
                 let mut lines: Vec<Line<'static>> = Vec::new();
-                lines.push(Line::from(Span::styled(
-                    "Choose OAuth flow:",
-                    header_style,
-                )));
+                lines.push(Line::from(Span::styled("Choose OAuth flow:", header_style)));
                 lines.push(Line::from(""));
-                lines.extend(menu_items(&[
-                    ("b", "Browser (PKCE, opens local callback)"),
-                    ("d", "Device code (for headless / no browser)"),
-                ], key_style, label_style));
+                lines.extend(menu_items(
+                    &[
+                        ("b", "Browser (PKCE, opens local callback)"),
+                        ("d", "Device code (for headless / no browser)"),
+                    ],
+                    key_style,
+                    label_style,
+                ));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled("esc / q to cancel", dim)));
                 render_popup(f, title, &lines, popup, area);
             }
-            MenuState::ReloginFlow { alias, email, popup } => {
+            MenuState::ReloginFlow {
+                alias,
+                email,
+                popup,
+            } => {
                 let header = match email {
                     Some(e) => format!("{alias}  ({e})"),
                     None => alias.clone(),
@@ -223,15 +275,16 @@ impl MenuState {
                 let mut lines: Vec<Line<'static>> =
                     vec![Line::from(Span::styled(header, header_style))];
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "Choose OAuth flow:",
-                    header_style,
-                )));
+                lines.push(Line::from(Span::styled("Choose OAuth flow:", header_style)));
                 lines.push(Line::from(""));
-                lines.extend(menu_items(&[
-                    ("b", "Browser (PKCE, opens local callback)"),
-                    ("d", "Device code (for headless / no browser)"),
-                ], key_style, label_style));
+                lines.extend(menu_items(
+                    &[
+                        ("b", "Browser (PKCE, opens local callback)"),
+                        ("d", "Device code (for headless / no browser)"),
+                    ],
+                    key_style,
+                    label_style,
+                ));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled("esc / q to cancel", dim)));
                 render_popup(f, "re-Login", &lines, popup, area);
@@ -242,12 +295,16 @@ impl MenuState {
                 let mut lines: Vec<Line<'static>> = Vec::new();
                 lines.push(Line::from(Span::styled(header, header_style)));
                 lines.push(Line::from(""));
-                lines.extend(menu_items(&[
-                    ("r", "Refresh selected"),
-                    ("w", "Warmup selected"),
-                    ("l", "re-Login selected (sequential)"),
-                    ("d", "Delete selected"),
-                ], key_style, label_style));
+                lines.extend(menu_items(
+                    &[
+                        ("r", "Refresh selected"),
+                        ("w", "Warmup selected"),
+                        ("l", "re-Login selected (sequential)"),
+                        ("d", "Delete selected"),
+                    ],
+                    key_style,
+                    label_style,
+                ));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled("esc / q to cancel", dim)));
                 render_popup(f, title, &lines, popup, area);
@@ -264,10 +321,11 @@ impl MenuState {
                     Style::default().fg(DIM),
                 )));
                 lines.push(Line::from(""));
-                lines.extend(menu_items(&[
-                    ("b", "Browser (PKCE)"),
-                    ("d", "Device code"),
-                ], key_style, label_style));
+                lines.extend(menu_items(
+                    &[("b", "Browser (PKCE)"), ("d", "Device code")],
+                    key_style,
+                    label_style,
+                ));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled("esc / q to cancel", dim)));
                 render_popup(f, "Batch re-Login", &lines, popup, area);
@@ -276,12 +334,12 @@ impl MenuState {
     }
 }
 
-fn menu_items(
-    items: &[(&str, &str)],
-    key_style: Style,
-    label_style: Style,
-) -> Vec<Line<'static>> {
-    let key_w = items.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(1);
+fn menu_items(items: &[(&str, &str)], key_style: Style, label_style: Style) -> Vec<Line<'static>> {
+    let key_w = items
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(1);
     items
         .iter()
         .map(|(k, label)| {
@@ -292,6 +350,40 @@ fn menu_items(
                 Span::raw(" ".repeat(pad)),
                 Span::raw("  "),
                 Span::styled((*label).to_string(), label_style),
+            ])
+        })
+        .collect()
+}
+
+fn menu_items_stateful(
+    items: &[(&str, &str, bool)],
+    key_style: Style,
+    label_style: Style,
+    disabled_style: Style,
+) -> Vec<Line<'static>> {
+    let key_w = items
+        .iter()
+        .map(|(k, _, _)| k.chars().count())
+        .max()
+        .unwrap_or(1);
+    items
+        .iter()
+        .map(|(k, label, enabled)| {
+            let pad = key_w.saturating_sub(k.chars().count());
+            let style = if *enabled {
+                label_style
+            } else {
+                disabled_style
+            };
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    (*k).to_string(),
+                    if *enabled { key_style } else { disabled_style },
+                ),
+                Span::raw(" ".repeat(pad)),
+                Span::raw("  "),
+                Span::styled((*label).to_string(), style),
             ])
         })
         .collect()

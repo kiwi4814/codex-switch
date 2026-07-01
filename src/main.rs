@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands};
 use output::{
-    MessageMode, ProgressReporter, account_to_json, print_error, print_json,
+    MessageMode, ProgressReporter, account_to_json, format_local_datetime, print_error, print_json,
     reset_credits_detail_lines, usage_to_json, user_println,
 };
 use tracing_subscriber::EnvFilter;
@@ -93,6 +93,7 @@ async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
     match cmd {
         Commands::Use { alias } => use_cmd(alias.as_deref(), json).await?,
         Commands::List { force } => list_cmd(force, json, auth_handled).await?,
+        Commands::ResetCard { alias, yes } => reset_card_cmd(&alias, yes, json).await?,
         Commands::Rename { old, new } => rename_cmd(&old, &new, json)?,
         Commands::Delete { alias } => delete_cmd(&alias, json)?,
         Commands::Login { alias, device } => login_cmd(alias.as_deref(), device, json).await?,
@@ -470,6 +471,78 @@ fn delete_cmd(alias: &str, json: bool) -> Result<()> {
         });
     }
     Ok(())
+}
+
+async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result<()> {
+    profile::validate_alias(alias)?;
+    if json && !yes {
+        anyhow::bail!("confirmation required; rerun with --yes to consume a reset card");
+    }
+    let path = profile::profile_auth_path(alias)?;
+    if !path.exists() {
+        anyhow::bail!("profile '{alias}' not found");
+    }
+
+    let usage = usage::fetch_usage_retried_force(alias, &path, &profile::read_current())
+        .await
+        .map_err(|e| anyhow::anyhow!("{alias}: {}", e.detail))?;
+    let credit = usage::earliest_reset_credit(&usage.reset_credits)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{alias}: no available reset cards"))?;
+
+    if !yes {
+        let expires = format_local_datetime(&credit.expires_at);
+        if !confirm_reset_card(alias, &expires) {
+            anyhow::bail!("aborted");
+        }
+    }
+
+    let result = usage::consume_earliest_reset_credit(alias, &path).await?;
+    if let Err(err) = cache::invalidate(alias) {
+        tracing::warn!("Failed to invalidate usage cache for {alias}: {err}");
+    }
+    if json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "alias": alias,
+            "action": "reset-card-consumed",
+            "credit_id": result.credit.id,
+            "expires_at": result.credit.expires_at,
+            "code": result.code,
+            "windows_reset": result.windows_reset,
+            "redeemed_at": result.redeemed_at,
+        }));
+    } else {
+        println!(
+            "{}",
+            color::success(&format!(
+                "[ok] Consumed reset card for {alias} (was expiring at {})",
+                format_local_datetime(&result.credit.expires_at)
+            ))
+        );
+        if let Some(windows_reset) = result.windows_reset {
+            println!("  windows reset: {windows_reset}");
+        }
+    }
+    Ok(())
+}
+
+fn confirm_reset_card(alias: &str, expires: &str) -> bool {
+    use std::io::{self, Write as _};
+
+    eprint!(
+        "{}",
+        color::dim(&format!(
+            "Use earliest reset card for '{alias}' (expires {expires})? [y/N] "
+        ))
+    );
+    io::stderr().flush().ok();
+    let mut input = String::new();
+    match io::stdin().read_line(&mut input) {
+        Ok(0) => false,
+        Ok(_) => matches!(input.trim().to_lowercase().as_str(), "y" | "yes"),
+        Err(_) => false,
+    }
 }
 
 // ── login / reauth ────────────────────────────────────────

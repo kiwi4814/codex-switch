@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -19,6 +20,14 @@ pub struct ResetCredit {
     pub id: String,
     pub granted_at: Option<String>,
     pub expires_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConsumedResetCredit {
+    pub credit: ResetCredit,
+    pub code: Option<String>,
+    pub windows_reset: Option<u64>,
+    pub redeemed_at: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -174,6 +183,8 @@ pub fn visible_pace_percent(w: &WindowUsage, window_secs: i64) -> Option<f64> {
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const RESET_CREDITS_CONSUME_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
@@ -220,6 +231,16 @@ fn reset_credits_url() -> String {
         return format!("{base}/rate-limit-reset-credits");
     }
     RESET_CREDITS_URL.to_string()
+}
+
+fn reset_credits_consume_url() -> String {
+    if let Ok(url) = std::env::var("CS_RESET_CREDITS_CONSUME_URL") {
+        return url;
+    }
+    if std::env::var("CS_RESET_CREDITS_URL").is_ok() {
+        return format!("{}/consume", reset_credits_url().trim_end_matches('/'));
+    }
+    RESET_CREDITS_CONSUME_URL.to_string()
 }
 
 /// Extract a short summary from an error message for user-facing display.
@@ -687,6 +708,104 @@ async fn fetch_reset_credits(
         anyhow::bail!("reset credits response missing expected fields");
     }
     Ok((available_count, credits))
+}
+
+pub fn earliest_reset_credit(credits: &[ResetCredit]) -> Option<&ResetCredit> {
+    credits.iter().min_by_key(|credit| {
+        chrono::DateTime::parse_from_rfc3339(&credit.expires_at)
+            .map(|dt| dt.timestamp())
+            .unwrap_or(i64::MAX)
+    })
+}
+
+pub async fn consume_earliest_reset_credit(
+    alias: &str,
+    profile_path: &Path,
+) -> Result<ConsumedResetCredit> {
+    let val = auth::read_auth(profile_path)?;
+    let (access_token, _) = auth::extract_tokens(&val);
+    let access_token = access_token
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{alias}: auth.json missing access_token"))?;
+    let account_id = crate::jwt::parse_account_info(&val).account_id;
+    let client = auth::build_http_client()?;
+
+    let (_, credits) = fetch_reset_credits(&client, &access_token, account_id.as_deref()).await?;
+    let credit = earliest_reset_credit(&credits)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{alias}: no available reset cards"))?;
+
+    consume_reset_credit(&client, &access_token, account_id.as_deref(), credit).await
+}
+
+async fn consume_reset_credit(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    credit: ResetCredit,
+) -> Result<ConsumedResetCredit> {
+    let mut req = client
+        .post(reset_credits_consume_url())
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .header("OpenAI-Beta", "codex-1")
+        .header("Originator", "Codex Desktop")
+        .json(&serde_json::json!({
+            "credit_id": &credit.id,
+            "redeem_request_id": redeem_request_id(),
+        }));
+
+    if let Some(account_id) = account_id.filter(|s| !s.trim().is_empty()) {
+        req = req.header("Chatgpt-Account-Id", account_id);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format_reqwest_error("reset credit consume request failed", &e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("reset credit consume request failed (HTTP {status})");
+    }
+
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to parse reset credit consume response: {e}"))?;
+    Ok(ConsumedResetCredit {
+        credit,
+        code: body
+            .get("code")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        windows_reset: parse_optional_u64(body.get("windows_reset")),
+        redeemed_at: body
+            .get("credit")
+            .and_then(|v| v.as_object())
+            .and_then(|obj| {
+                obj.get("redeemed_at")
+                    .or_else(|| obj.get("redeemedAt"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(|s| s.to_string()),
+    })
+}
+
+fn redeem_request_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let value = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &value[0..8],
+        &value[8..12],
+        &value[12..16],
+        &value[16..20],
+        &value[20..32]
+    )
 }
 
 fn parse_optional_u64(value: Option<&Value>) -> Option<u64> {

@@ -12,6 +12,40 @@ use mock::scenarios;
 use serde_json::json;
 use std::path::PathBuf;
 
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: String) -> Self {
+        let previous = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 /// Create a temp directory with fake profile auth.json files.
 /// Returns (temp_dir, vec of (alias, path, token, is_team)).
 fn setup_profiles(
@@ -330,6 +364,30 @@ async fn http_mock_returns_correct_structure() {
     assert!(info.primary.is_some(), "should parse primary window");
     assert!(info.secondary.is_some(), "should parse secondary window");
     assert_eq!(info.primary.as_ref().unwrap().used_percent, Some(0.0));
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn http_reset_card_consume_uses_earliest_expiry() {
+    let entries = scenarios::healthy_pool();
+    let (_dir, profiles) = setup_profiles(&entries);
+    let server = mock::MockServer::start(entries).await;
+    let (_alias, auth_path, _token, _is_team) = profiles
+        .iter()
+        .find(|(alias, _, _, _)| alias == "healthy_a")
+        .unwrap();
+
+    let _reset_url_guard = EnvVarGuard::set("CS_RESET_CREDITS_URL", server.reset_credits_url());
+    let _consume_url_guard = EnvVarGuard::remove("CS_RESET_CREDITS_CONSUME_URL");
+
+    let result = usage::consume_earliest_reset_credit("healthy_a", auth_path)
+        .await
+        .unwrap();
+
+    assert_eq!(result.credit.id, "reset_credit_1");
+    assert_eq!(result.windows_reset, Some(2));
+    assert_eq!(result.code.as_deref(), Some("success"));
 
     server.shutdown();
 }

@@ -11,11 +11,14 @@ use crate::auth;
 use crate::cache;
 use crate::jwt::AccountInfo;
 use crate::login;
+use crate::output::{format_local_datetime, reset_credits_count};
 use crate::profile::{
     self, cmd_delete, list_profiles, profile_auth_path, read_current, rename_profile,
-    sync_current_from_live, switch_profile, validate_alias,
+    switch_profile, sync_current_from_live, validate_alias,
 };
-use crate::usage::{UsageError, UsageInfo, fetch_usage_retried, fetch_usage_retried_force};
+use crate::usage::{
+    ConsumedResetCredit, UsageError, UsageInfo, fetch_usage_retried, fetch_usage_retried_force,
+};
 
 #[derive(Debug, Clone)]
 pub struct AccountEntry {
@@ -53,6 +56,7 @@ impl SortMode {
 pub enum ConfirmAction {
     Delete(String),
     BatchDelete(Vec<String>),
+    ConsumeResetCard { alias: String, expires_at: String },
 }
 
 pub struct RenameState {
@@ -81,6 +85,9 @@ pub struct App {
     pub result_sender: tokio::sync::mpsc::Sender<(String, Result<UsageInfo, UsageError>)>,
     pub pending_warmup: tokio::sync::mpsc::Receiver<(u64, String, Result<(), String>)>,
     pub warmup_sender: tokio::sync::mpsc::Sender<(u64, String, Result<(), String>)>,
+    pub pending_reset_cards:
+        tokio::sync::mpsc::Receiver<(String, Result<ConsumedResetCredit, String>)>,
+    pub reset_card_sender: tokio::sync::mpsc::Sender<(String, Result<ConsumedResetCredit, String>)>,
     /// Tracks in-flight warmup tasks: task_id → (alias, start_time).
     /// Each spawn gets a unique `warmup_next_id`; results are matched by ID
     /// so a late-arriving result from a timed-out task cannot clear a newer task.
@@ -103,6 +110,7 @@ impl App {
     pub fn new() -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(128);
         let (warmup_tx, warmup_rx) = tokio::sync::mpsc::channel(64);
+        let (reset_card_tx, reset_card_rx) = tokio::sync::mpsc::channel(16);
         let cfg = crate::config::get();
         App {
             accounts: vec![],
@@ -118,6 +126,8 @@ impl App {
             result_sender: tx,
             pending_warmup: warmup_rx,
             warmup_sender: warmup_tx,
+            pending_reset_cards: reset_card_rx,
+            reset_card_sender: reset_card_tx,
             warmup_tasks: HashMap::new(),
             warmup_next_id: 0,
             confirm: None,
@@ -149,9 +159,41 @@ impl App {
         else {
             return;
         };
+        let loaded_usage = match &entry.usage {
+            UsageStatus::Loaded(u) => Some(u),
+            _ => None,
+        };
+        let plan = loaded_usage
+            .and_then(|u| u.plan_type.as_deref())
+            .or(entry.info.plan_type.as_deref());
+        let reset_cards = loaded_usage.and_then(reset_credits_count);
+        let reset_card_expiries = loaded_usage
+            .map(|u| {
+                let mut credits: Vec<_> = u.reset_credits.iter().collect();
+                credits.sort_by_key(|credit| {
+                    chrono::DateTime::parse_from_rfc3339(&credit.expires_at)
+                        .map(|dt| dt.timestamp())
+                        .unwrap_or(i64::MAX)
+                });
+                credits
+                    .into_iter()
+                    .map(|credit| format_local_datetime(&credit.expires_at))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let can_consume_reset_card = loaded_usage
+            .and_then(|u| crate::usage::earliest_reset_credit(&u.reset_credits))
+            .is_some();
         self.menu = Some(super::menu::MenuState::account(
-            entry.alias.clone(),
-            entry.info.email.clone(),
+            super::menu::AccountMenuInfo {
+                alias: entry.alias.clone(),
+                email: entry.info.email.clone(),
+                plan_label: entry.info.plan_label_with(plan),
+                is_current: entry.is_current,
+                reset_cards,
+                reset_card_expiries,
+                can_consume_reset_card,
+            },
         ));
     }
 
@@ -183,14 +225,6 @@ impl App {
         self.menu = None;
     }
 
-    /// Refresh just one alias unconditionally.
-    pub fn refresh_one(&mut self, alias: &str) {
-        if let Some(idx) = self.accounts.iter().position(|a| a.alias == alias) {
-            self.refresh_indices(&[idx], true);
-            self.set_status(format!("Refreshing {alias}..."), 3);
-        }
-    }
-
     /// Warmup just one alias.
     pub fn warmup_one(&mut self, alias: &str) {
         let target_indices: Vec<usize> = self
@@ -210,6 +244,24 @@ impl App {
         } else {
             self.set_status(format!("Warming up {alias}..."), 6);
         }
+    }
+
+    pub fn request_consume_reset_card(&mut self, alias: &str) {
+        let Some(entry) = self.accounts.iter().find(|a| a.alias == alias) else {
+            return;
+        };
+        let UsageStatus::Loaded(u) = &entry.usage else {
+            self.set_status(format!("{alias}: refresh usage before using reset card"), 4);
+            return;
+        };
+        let Some(credit) = crate::usage::earliest_reset_credit(&u.reset_credits) else {
+            self.set_status(format!("{alias}: no available reset cards"), 4);
+            return;
+        };
+        self.confirm = Some(ConfirmAction::ConsumeResetCard {
+            alias: alias.to_string(),
+            expires_at: format_local_datetime(&credit.expires_at),
+        });
     }
 
     /// Request delete confirmation for a specific alias (called from menu).
@@ -547,6 +599,36 @@ impl App {
         }
     }
 
+    pub fn poll_reset_card_results(&mut self) {
+        let mut to_refresh = std::collections::BTreeSet::<String>::new();
+        while let Ok((alias, result)) = self.pending_reset_cards.try_recv() {
+            match result {
+                Ok(consumed) => {
+                    if let Err(err) = cache::invalidate(&alias) {
+                        tracing::warn!("Failed to invalidate usage cache for {alias}: {err}");
+                    }
+                    self.set_status(
+                        format!(
+                            "Used reset card for {alias} (was expiring {})",
+                            format_local_datetime(&consumed.credit.expires_at)
+                        ),
+                        6,
+                    );
+                    to_refresh.insert(alias);
+                }
+                Err(e) => {
+                    self.set_status(format!("Reset card failed ({alias}): {e}"), 7);
+                }
+            }
+        }
+        for alias in to_refresh {
+            if let Some(idx) = self.accounts.iter().position(|a| a.alias == alias) {
+                self.accounts[idx].usage = UsageStatus::Idle;
+                self.fetch_usage_for(idx, true);
+            }
+        }
+    }
+
     fn get_5h_used_pct(&self, idx: usize) -> f64 {
         match &self.accounts[idx].usage {
             UsageStatus::Loaded(u) => u
@@ -714,7 +796,29 @@ impl App {
                 };
                 self.set_status(msg, 6);
             }
+            ConfirmAction::ConsumeResetCard { alias, .. } => {
+                self.consume_reset_card(&alias);
+            }
         }
+    }
+
+    fn consume_reset_card(&mut self, alias: &str) {
+        let path = match profile_auth_path(alias) {
+            Ok(p) => p,
+            Err(e) => {
+                self.set_status(format!("Path error for {alias}: {e}"), 5);
+                return;
+            }
+        };
+        let alias_owned = alias.to_string();
+        let tx = self.reset_card_sender.clone();
+        self.set_status(format!("Using reset card for {alias}..."), 6);
+        tokio::spawn(async move {
+            let result = crate::usage::consume_earliest_reset_credit(&alias_owned, &path)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send((alias_owned, result)).await;
+        });
     }
 
     pub fn request_batch_delete(&mut self) {
@@ -757,7 +861,10 @@ impl App {
         let candidate = target_indices.len();
         let (count, _, skipped) = self.warmup_indices(target_indices);
         if count == 0 {
-            self.set_status(format!("All {candidate} marked already active or skipped"), 4);
+            self.set_status(
+                format!("All {candidate} marked already active or skipped"),
+                4,
+            );
         } else {
             let mut msg = format!("Warming up {count} marked account(s)");
             if skipped > 0 {
@@ -812,12 +919,11 @@ impl App {
                 }
                 return false;
             }
-            KeyCode::Backspace
-                if state.cursor > 0 => {
-                    state.cursor -= 1;
-                    let byte_pos = char_to_byte(&state.input, state.cursor);
-                    state.input.remove(byte_pos);
-                }
+            KeyCode::Backspace if state.cursor > 0 => {
+                state.cursor -= 1;
+                let byte_pos = char_to_byte(&state.input, state.cursor);
+                state.input.remove(byte_pos);
+            }
             KeyCode::Delete => {
                 let char_count = state.input.chars().count();
                 if state.cursor < char_count {
@@ -825,10 +931,9 @@ impl App {
                     state.input.remove(byte_pos);
                 }
             }
-            KeyCode::Left
-                if state.cursor > 0 => {
-                    state.cursor -= 1;
-                }
+            KeyCode::Left if state.cursor > 0 => {
+                state.cursor -= 1;
+            }
             KeyCode::Right => {
                 let char_count = state.input.chars().count();
                 if state.cursor < char_count {
@@ -868,12 +973,11 @@ impl App {
                 KeyCode::Enter => {
                     accept_search = true;
                 }
-                KeyCode::Backspace
-                    if state.cursor > 0 => {
-                        state.cursor -= 1;
-                        let byte_pos = char_to_byte(&state.query, state.cursor);
-                        state.query.remove(byte_pos);
-                    }
+                KeyCode::Backspace if state.cursor > 0 => {
+                    state.cursor -= 1;
+                    let byte_pos = char_to_byte(&state.query, state.cursor);
+                    state.query.remove(byte_pos);
+                }
                 KeyCode::Delete => {
                     let char_count = state.query.chars().count();
                     if state.cursor < char_count {
@@ -881,10 +985,9 @@ impl App {
                         state.query.remove(byte_pos);
                     }
                 }
-                KeyCode::Left
-                    if state.cursor > 0 => {
-                        state.cursor -= 1;
-                    }
+                KeyCode::Left if state.cursor > 0 => {
+                    state.cursor -= 1;
+                }
                 KeyCode::Right => {
                     let char_count = state.query.chars().count();
                     if state.cursor < char_count {
@@ -1068,6 +1171,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     loop {
         app.poll_results();
         app.poll_warmup_results();
+        app.poll_reset_card_results();
         app.poll_update();
         app.tick();
         app.run_due_auto_refresh();
@@ -1109,9 +1213,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             // Normalize letter case for top-level dispatch:
             // any uppercase letter is treated as its lowercase equivalent.
             let code = match key.code {
-                KeyCode::Char(c) if c.is_ascii_uppercase() => {
-                    KeyCode::Char(c.to_ascii_lowercase())
-                }
+                KeyCode::Char(c) if c.is_ascii_uppercase() => KeyCode::Char(c.to_ascii_lowercase()),
                 other => other,
             };
 
@@ -1145,14 +1247,12 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                         app.clear_marks();
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j')
-                    if app.selected + 1 < app.view_indices.len() => {
-                        app.selected += 1;
-                    }
-                KeyCode::Up | KeyCode::Char('k')
-                    if app.selected > 0 => {
-                        app.selected -= 1;
-                    }
+                KeyCode::Down | KeyCode::Char('j') if app.selected + 1 < app.view_indices.len() => {
+                    app.selected += 1;
+                }
+                KeyCode::Up | KeyCode::Char('k') if app.selected > 0 => {
+                    app.selected -= 1;
+                }
                 KeyCode::Enter => {
                     if app.marked.is_empty() {
                         app.open_account_menu();
@@ -1187,7 +1287,9 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
 }
 
 async fn handle_menu_key(app: &mut App, terminal: &mut DefaultTerminal, code: KeyCode) {
-    let Some(menu) = app.menu.as_ref() else { return };
+    let Some(menu) = app.menu.as_ref() else {
+        return;
+    };
     let action = menu.handle_key(code);
     use super::menu::MenuAction;
     match action {
@@ -1217,13 +1319,13 @@ async fn handle_menu_key(app: &mut App, terminal: &mut DefaultTerminal, code: Ke
             app.close_menu();
             app.start_rename_alias(&alias);
         }
-        MenuAction::RefreshOne(alias) => {
-            app.close_menu();
-            app.refresh_one(&alias);
-        }
         MenuAction::WarmupOne(alias) => {
             app.close_menu();
             app.warmup_one(&alias);
+        }
+        MenuAction::ConsumeResetCard(alias) => {
+            app.close_menu();
+            app.request_consume_reset_card(&alias);
         }
         MenuAction::DeleteRequest(alias) => {
             app.close_menu();
@@ -1290,19 +1392,14 @@ async fn perform_oauth(
     // before TUI repaints, particularly important on Windows.
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
-    // Wait briefly so user can read the result line before TUI repaints.
     if result.is_ok() {
         println!("\nReturning to TUI...");
     } else {
         if let Err(ref e) = result {
             eprintln!("\nError: {e}");
         }
-        println!("\nPress Enter to return to TUI...");
-        let _ = tokio::task::spawn_blocking(|| {
-            let mut buf = String::new();
-            let _ = std::io::stdin().read_line(&mut buf);
-        })
-        .await;
+        println!("\nReturning to TUI...");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
     }
 
     // Restore silent mode before reinitializing TUI.
@@ -1364,21 +1461,14 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     }
 
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    println!(
-        "\n=== Batch complete: {ok} ok, {} failed ===",
-        failed.len()
-    );
+    println!("\n=== Batch complete: {ok} ok, {} failed ===", failed.len());
     if !failed.is_empty() {
         for (a, e) in &failed {
             println!("  - {a}: {e}");
         }
     }
-    println!("\nPress Enter to return to TUI...");
-    let _ = tokio::task::spawn_blocking(|| {
-        let mut buf = String::new();
-        let _ = std::io::stdin().read_line(&mut buf);
-    })
-    .await;
+    println!("\nReturning to TUI...");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
 
     crate::output::set_message_mode(crate::output::MessageMode::Silent);
     *terminal = ratatui::init();

@@ -164,6 +164,18 @@ pub fn put(alias: &str, usage: &UsageInfo) {
     }
 }
 
+/// Remove cached usage for an alias while preserving last-used metadata.
+pub fn invalidate(alias: &str) -> Result<()> {
+    let _lock = CACHE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("cache lock poisoned"))?;
+    let mut cache = load_cache();
+    if cache.entries.remove(alias).is_some() {
+        save_cache(&cache).context("writing usage cache invalidation")?;
+    }
+    Ok(())
+}
+
 /// Async wrapper around [`get`]: runs the blocking lock + file read on a
 /// dedicated blocking thread so it never stalls a tokio worker. Use this on
 /// the high-concurrency usage-fetch path (up to `network.max_concurrent`

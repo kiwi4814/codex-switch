@@ -10,10 +10,10 @@ use super::app::{App, UsageStatus};
 use super::keymap;
 use super::popup;
 use crate::output::{
-    format_local_time, format_reset_short, format_reset_time, reset_credits_count,
-    reset_credits_detail_lines, reset_credits_expiry_table,
+    format_local_datetime, format_local_time, format_reset_short, format_reset_time,
+    reset_credits_count,
 };
-use crate::usage::{UsageInfo, is_available};
+use crate::usage::{UsageInfo, earliest_reset_credit, is_available};
 
 // ── RGB-only color palette ───────────────────────────────
 // All colors are explicit RGB to avoid mixing ANSI-16 + 24-bit,
@@ -47,7 +47,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(6),                       // account list
-            Constraint::Length(10),                   // detail panel
+            Constraint::Length(12),                   // detail panel
             Constraint::Length(status_height as u16), // status bar
         ])
         .split(area);
@@ -153,7 +153,6 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
         Cell::from("5h Reset").style(hdr),
         Cell::from("7d Reset").style(hdr),
         Cell::from("Cards").style(hdr),
-        Cell::from("Card Exp").style(hdr),
     ])
     .height(1);
 
@@ -209,15 +208,11 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 reset_7d_color,
                 reset_cards,
                 reset_cards_color,
-                reset_card_expiry,
-                reset_card_expiry_color,
             ): (
                 String,
                 Color,
                 String,
                 String,
-                String,
-                Color,
                 String,
                 Color,
                 String,
@@ -236,8 +231,6 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                     DIM,
                     "--".into(),
                     DIM,
-                    "--".into(),
-                    DIM,
                 ),
                 UsageStatus::Loading => (
                     "...".into(),
@@ -250,8 +243,6 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                     DIM,
                     "...".into(),
                     C_YELLOW,
-                    "loading".into(),
-                    DIM,
                 ),
                 UsageStatus::Error(_) => (
                     "Error".into(),
@@ -264,8 +255,6 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                     DIM,
                     "Err".into(),
                     C_RED,
-                    "--".into(),
-                    DIM,
                 ),
                 UsageStatus::Loaded(u) => {
                     let over_5h = u.primary.as_ref().is_some_and(|w| {
@@ -308,8 +297,6 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                     let r7c = r7_ts.map(|ts| reset_color(ts - now)).unwrap_or(DIM);
                     let cards = reset_cards_table_text(u);
                     let cards_color = reset_cards_color(u);
-                    let card_expiry = reset_credits_expiry_table(u);
-                    let card_expiry_color = reset_card_expiry_color(u);
                     if is_available(u) {
                         (
                             "OK".into(),
@@ -322,8 +309,6 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                             r7c,
                             cards,
                             cards_color,
-                            card_expiry,
-                            card_expiry_color,
                         )
                     } else {
                         (
@@ -337,8 +322,6 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                             r7c,
                             cards,
                             cards_color,
-                            card_expiry,
-                            card_expiry_color,
                         )
                     }
                 }
@@ -361,7 +344,6 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(reset_5h).style(base().fg(reset_5h_color)),
                 Cell::from(reset_7d).style(base().fg(reset_7d_color)),
                 Cell::from(reset_cards).style(base().fg(reset_cards_color)),
-                Cell::from(reset_card_expiry).style(base().fg(reset_card_expiry_color)),
             ])
             .height(1)
         })
@@ -407,7 +389,6 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(12), // 5h reset
             Constraint::Length(12), // 7d reset
             Constraint::Length(7),  // reset cards
-            Constraint::Length(12), // reset card expiry
         ],
     )
     .header(header)
@@ -515,6 +496,8 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
 fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
     let now = crate::auth::now_unix_secs();
     let has_credits = u.credits_balance.is_some();
+    let reset_lines = reset_credits_lines(u);
+    let reset_height = u16::from(has_reset_credits(u));
     let mut constraints = vec![];
     if u.primary.is_some() {
         constraints.push(Constraint::Length(2));
@@ -525,8 +508,8 @@ fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
     if has_credits {
         constraints.push(Constraint::Length(1));
     }
-    if has_reset_credits(u) {
-        constraints.push(Constraint::Length(1));
+    if reset_height > 0 {
+        constraints.push(Constraint::Length(reset_height));
     }
     if constraints.is_empty() {
         constraints.push(Constraint::Min(1));
@@ -562,7 +545,7 @@ fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
     }
 
     if has_reset_credits(u) {
-        let p = Paragraph::new(reset_credits_text(u)).style(base().fg(DIM));
+        let p = Paragraph::new(reset_lines).style(base());
         f.render_widget(p, layout[idx]);
     }
 
@@ -594,25 +577,38 @@ fn reset_cards_color(u: &UsageInfo) -> Color {
     }
 }
 
-fn reset_card_expiry_color(u: &UsageInfo) -> Color {
-    if !u.reset_credits.is_empty() {
-        C_CYAN
-    } else if u.reset_credits_error.is_some() {
-        C_YELLOW
-    } else {
-        DIM
-    }
-}
+fn reset_credits_lines(u: &UsageInfo) -> Vec<Line<'static>> {
+    let count = reset_credits_count(u)
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "--".to_string());
+    let mut spans = vec![
+        Span::styled("Reset cards  ", base().fg(DIM)),
+        Span::styled(
+            count,
+            base().fg(reset_cards_color(u)).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" available", base().fg(DIM)),
+    ];
 
-fn reset_credits_text(u: &UsageInfo) -> String {
-    let lines = reset_credits_detail_lines(u, 2);
-    if !lines.is_empty() {
-        return lines.join("  ");
-    }
     if let Some(err) = &u.reset_credits_error {
-        return format!("reset cards: --  expiry unavailable: {err}");
+        spans.extend([
+            Span::styled("  |  expiry unavailable: ", base().fg(DIM)),
+            Span::styled(err.clone(), base().fg(C_YELLOW)),
+        ]);
+        return vec![Line::from(spans)];
     }
-    "reset cards: --".to_string()
+
+    if let Some(credit) = earliest_reset_credit(&u.reset_credits) {
+        spans.extend([
+            Span::styled("  |  earliest expiry ", base().fg(DIM)),
+            Span::styled(
+                format_local_datetime(&credit.expires_at),
+                base().fg(C_CYAN).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+
+    vec![Line::from(spans)]
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
@@ -636,6 +632,11 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             }
             super::app::ConfirmAction::BatchDelete(aliases) => {
                 format!("Delete {} marked profile(s)? (y/n)", aliases.len())
+            }
+            super::app::ConfirmAction::ConsumeResetCard { alias, expires_at } => {
+                format!(
+                    "Confirm reset card for '{alias}' expiring {expires_at}: y to use, any other key cancels"
+                )
             }
         };
         let line = Line::from(Span::styled(

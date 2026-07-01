@@ -286,7 +286,10 @@ pub fn reset_credits_compact(u: &UsageInfo) -> Option<String> {
     let count = reset_credits_count(u)?;
     let mut text = format!("reset cards: {count}");
     if let Some(expires_at) = reset_credits_next_expiry(u) {
-        text.push_str(&format!("  next expiry: {}", format_local_datetime(expires_at)));
+        text.push_str(&format!(
+            "  next expiry: {}",
+            format_local_datetime(expires_at)
+        ));
         if u.reset_credits.len() > 1 {
             text.push_str(&format!(" (+{})", u.reset_credits.len() - 1));
         }
@@ -294,13 +297,6 @@ pub fn reset_credits_compact(u: &UsageInfo) -> Option<String> {
         text.push_str(&format!("  expiry unavailable: {err}"));
     }
     Some(text)
-}
-
-pub fn reset_credits_expiry_table(u: &UsageInfo) -> String {
-    reset_credits_next_expiry(u)
-        .map(format_local_datetime)
-        .or_else(|| u.reset_credits_error.as_ref().map(|_| "error".to_string()))
-        .unwrap_or_else(|| "--".to_string())
 }
 
 pub fn reset_credits_detail_lines(u: &UsageInfo, max_lines: usize) -> Vec<String> {

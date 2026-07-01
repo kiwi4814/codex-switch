@@ -55,6 +55,10 @@ impl MockServer {
                 "/backend-api/wham/rate-limit-reset-credits",
                 get(reset_credits_handler),
             )
+            .route(
+                "/backend-api/wham/rate-limit-reset-credits/consume",
+                post(reset_credits_consume_handler),
+            )
             .route("/oauth/token", post(token_handler))
             .with_state(state);
 
@@ -142,6 +146,47 @@ async fn reset_credits_handler(
                 "expires_at": "2026-07-09T00:00:00Z"
             }
         ]
+    }))
+    .into_response()
+}
+
+/// POST /backend-api/wham/rate-limit-reset-credits/consume handler.
+async fn reset_credits_consume_handler(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> impl IntoResponse {
+    let token = match extract_bearer(&headers) {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, "Missing Bearer token").into_response(),
+    };
+
+    let map = state.lock().unwrap();
+    if !map.contains_key(&token) {
+        return (StatusCode::UNAUTHORIZED, format!("Unknown token: {token}")).into_response();
+    }
+
+    let credit_id = body.get("credit_id").and_then(|v| v.as_str());
+    if credit_id != Some("reset_credit_1") {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": "wrong_credit",
+                "expected": "reset_credit_1",
+                "actual": credit_id
+            })),
+        )
+            .into_response();
+    }
+
+    axum::Json(json!({
+        "code": "success",
+        "credit": {
+            "id": "reset_credit_1",
+            "status": "redeemed",
+            "redeemed_at": "2026-07-01T00:01:00Z"
+        },
+        "windows_reset": 2
     }))
     .into_response()
 }
