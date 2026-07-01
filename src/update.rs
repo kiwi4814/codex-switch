@@ -96,7 +96,7 @@ pub async fn check_for_dev_update() -> Result<Option<UpdateInfo>> {
         None => return Ok(None), // No dev release exists (404).
     };
     let dev_version = extract_release_version(&release);
-    if !is_newer_version(&dev_version, &current_version) {
+    if !is_dev_update_available(&dev_version, &current_version) {
         return Ok(None);
     }
     Ok(Some(UpdateInfo {
@@ -178,7 +178,7 @@ pub async fn self_update_dev(show_progress: bool) -> Result<SelfUpdateResult> {
         .context("fetching dev release from GitHub")?;
     let dev_version = extract_release_version(&release);
 
-    if !is_newer_version(&dev_version, &current_version) {
+    if !is_dev_update_available(&dev_version, &current_version) {
         return Ok(SelfUpdateResult {
             current_version,
             latest_version: dev_version,
@@ -581,6 +581,36 @@ fn is_older_version(candidate: &str, current: &str) -> bool {
         .is_some_and(|ordering| ordering == std::cmp::Ordering::Less)
 }
 
+fn is_dev_update_available(candidate: &str, current: &str) -> bool {
+    if is_newer_version(candidate, current) {
+        return true;
+    }
+    // Explicit --dev should be able to switch from a stable/base install to the
+    // rolling dev build with the same base version, e.g. 0.0.20 -> 0.0.20-dev.TS.
+    // Once already on dev, normal semver prerelease ordering handles timestamps.
+    if is_dev_version(current) || !is_dev_version(candidate) {
+        return false;
+    }
+    let Some(candidate_base) = version_base(candidate) else {
+        return false;
+    };
+    let Some(current_base) = version_base(current) else {
+        return false;
+    };
+    candidate_base >= current_base
+}
+
+fn version_base(version: &str) -> Option<(u64, u64, u64)> {
+    let parsed = match Version::parse(&normalize_version(version)) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("failed to parse version '{version}': {e}");
+            return None;
+        }
+    };
+    Some((parsed.major, parsed.minor, parsed.patch))
+}
+
 fn compare_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
     let left_parsed = match Version::parse(&normalize_version(left)) {
         Ok(v) => v,
@@ -642,5 +672,25 @@ mod tests {
         assert!(is_dev_version("1.2.3-dev.20260408143000"));
         assert!(is_dev_version("1.2.3-dev+abc1234"));
         assert!(!is_dev_version("1.2.3"));
+    }
+
+    #[test]
+    fn dev_update_can_switch_from_same_base_stable() {
+        assert!(is_dev_update_available(
+            "0.0.20-dev.20260701094804",
+            "0.0.20"
+        ));
+        assert!(is_dev_update_available(
+            "0.0.20-dev.20260701094804",
+            "0.0.20-dev.20260701090000"
+        ));
+        assert!(!is_dev_update_available(
+            "0.0.20-dev.20260701094804",
+            "0.0.20-dev.20260701094804"
+        ));
+        assert!(!is_dev_update_available(
+            "0.0.20-dev.20260701094804",
+            "0.0.21"
+        ));
     }
 }
