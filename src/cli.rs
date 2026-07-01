@@ -37,7 +37,7 @@ pub enum DaemonCommand {
     after_help = "Examples:\n  codex-switch list\n  codex-switch use\n  codex-switch rename old-alias new-alias\n  codex-switch import ./auth-backups\n  codex-switch self-update --check\n\nRun `codex-switch <command> --help` for command-specific options."
 )]
 pub struct Cli {
-    /// Output as compact JSON (supported by list, use, reset-card, rename, delete, login, import, self-update)
+    /// Output as compact JSON (supported by list, use, reset-card, rename, delete, login, import, self-update, daemon status)
     #[arg(long, global = true)]
     pub json: bool,
 

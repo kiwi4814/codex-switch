@@ -108,7 +108,7 @@ async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
         Commands::Launch { alias, args } => launch_cmd(alias.as_deref(), args, json).await?,
         Commands::Tui => tui::run_tui().await?,
         Commands::Open => open_cmd()?,
-        Commands::Daemon(sub) => daemon::dispatch(sub).await?,
+        Commands::Daemon(sub) => daemon::dispatch(sub, json).await?,
     }
 
     // If startup check actually synced the profile, re-sync after command execution

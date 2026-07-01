@@ -4,14 +4,14 @@ pub mod pidfile;
 pub mod service;
 
 use crate::cli::DaemonCommand;
-use crate::output::user_println;
+use crate::output::{print_json, user_println};
 use anyhow::Result;
 
-pub async fn dispatch(cmd: DaemonCommand) -> Result<()> {
+pub async fn dispatch(cmd: DaemonCommand, json: bool) -> Result<()> {
     match cmd {
         DaemonCommand::Start { foreground } => start(foreground).await,
         DaemonCommand::Stop => stop(),
-        DaemonCommand::Status => status(),
+        DaemonCommand::Status => status(json),
         DaemonCommand::Install => service::install(),
         DaemonCommand::Uninstall => service::uninstall(),
     }
@@ -101,16 +101,47 @@ fn stop() -> Result<()> {
     Ok(())
 }
 
-fn status() -> Result<()> {
-    match pidfile::read_pidfile() {
-        Some(pid) if pidfile::process_alive(pid) => {
+fn status(json: bool) -> Result<()> {
+    let pidfile = pidfile::pidfile_path()?;
+    let pid = pidfile::read_pidfile();
+    let running = pid.is_some_and(pidfile::process_alive);
+    let state = match (pid, running) {
+        (Some(_), true) => "running",
+        (Some(_), false) => "stale",
+        (None, _) => "stopped",
+    };
+
+    if json {
+        let cfg = crate::config::get();
+        print_json(&serde_json::json!({
+            "running": running,
+            "state": state,
+            "pid": pid,
+            "pidfile": pidfile,
+            "stale_pid_cleaned": state == "stale",
+            "config": {
+                "poll_interval_secs": cfg.daemon.poll_interval_secs,
+                "token_check_interval_secs": cfg.daemon.token_check_interval_secs,
+                "switch_threshold": cfg.daemon.switch_threshold,
+                "notify": cfg.daemon.notify,
+                "log_level": cfg.daemon.log_level,
+            }
+        }));
+        if state == "stale" {
+            pidfile::cleanup_pidfile()?;
+        }
+        return Ok(());
+    }
+
+    match (pid, running) {
+        (Some(pid), true) => {
             user_println(&format!("Daemon is running (PID {pid})"));
         }
-        Some(pid) => {
+        (Some(pid), false) => {
             user_println(&format!("Daemon is not running (stale PID {pid})"));
             pidfile::cleanup_pidfile()?;
         }
-        None => {
+        (None, _) => {
             user_println("Daemon is not running");
         }
     }

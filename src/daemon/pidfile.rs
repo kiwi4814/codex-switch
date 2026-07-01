@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-fn pidfile_path() -> Result<PathBuf> {
+pub fn pidfile_path() -> Result<PathBuf> {
     Ok(crate::auth::app_home()?.join("daemon.pid"))
 }
 

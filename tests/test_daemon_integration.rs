@@ -136,6 +136,10 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn stdout_json(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 fn wait_until<F>(timeout: Duration, label: &str, mut check: F)
 where
     F: FnMut() -> bool,
@@ -170,6 +174,24 @@ async fn daemon_start_switch_status_and_stop() {
         server.token_url(),
     );
 
+    std::fs::write(env.pidfile(), "99999999").unwrap();
+    let stale_status = run_cmd(&env, &["--json", "daemon", "status"]);
+    assert!(
+        stale_status.status.success(),
+        "stale status stderr: {}",
+        String::from_utf8_lossy(&stale_status.stderr)
+    );
+    let stale_json = stdout_json(&stale_status);
+    assert_eq!(stale_json["state"], "stale");
+    assert_eq!(stale_json["running"], false);
+    assert_eq!(stale_json["pid"], 99999999);
+    assert_eq!(stale_json["stale_pid_cleaned"], true);
+    assert_eq!(stale_json["config"]["poll_interval_secs"], 1);
+    assert!(
+        !env.pidfile().exists(),
+        "status --json should clean stale pidfile"
+    );
+
     let status_before = run_cmd(&env, &["daemon", "status"]);
     assert!(status_before.status.success());
     assert_eq!(stdout(&status_before), "Daemon is not running");
@@ -190,6 +212,23 @@ async fn daemon_start_switch_status_and_stop() {
         let out = run_cmd(&env, &["daemon", "status"]);
         out.status.success() && stdout(&out).starts_with("Daemon is running (PID ")
     });
+
+    let json_status = run_cmd(&env, &["--json", "daemon", "status"]);
+    assert!(
+        json_status.status.success(),
+        "json status stderr: {}",
+        String::from_utf8_lossy(&json_status.stderr)
+    );
+    let status_json = stdout_json(&json_status);
+    assert_eq!(status_json["state"], "running");
+    assert_eq!(status_json["running"], true);
+    assert!(status_json["pid"].as_u64().is_some());
+    assert!(
+        status_json["pidfile"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("daemon.pid"))
+    );
+    assert_eq!(status_json["config"]["switch_threshold"], 50.0);
 
     wait_until(
         Duration::from_secs(15),

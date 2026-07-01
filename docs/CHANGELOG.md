@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.0.21 — Unreleased
+
+### Added
+
+- **Daemon status diagnostics JSON** — `codex-switch --json daemon status` now reports running state, PID, PID file path, stale PID cleanup status, and the active daemon config summary for scriptable diagnostics.
+
 ## v0.0.20 — 2026-07-02
 
 ### Added
