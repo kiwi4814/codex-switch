@@ -141,7 +141,7 @@ codex-switch launch
 # 8. Launch Codex with a specific account
 codex-switch launch alice -- --model gpt-4o
 
-# 9. Start the background daemon (Beta, optional)
+# 9. Start the background daemon (Beta, optional; macOS/Linux)
 codex-switch daemon start
 
 # 10. Check for a new release manually
@@ -160,9 +160,9 @@ codex-switch self-update --check
 | `codex-switch rename <old> <new>` | Rename a profile |
 | `codex-switch delete <alias>` | Delete a profile |
 | `codex-switch import <path> [alias]` | Import one auth.json file, or recursively validate and import all JSON files under a directory |
-| `codex-switch daemon start [--foreground]` | Start the auto-switch daemon (Beta). Detached by default; use `--foreground` for service managers |
-| `codex-switch daemon stop` | Stop a running Beta daemon |
-| `codex-switch daemon status` | Show Beta daemon status |
+| `codex-switch daemon start [--foreground]` | Start the auto-switch daemon (Beta, macOS/Linux). Detached by default; use `--foreground` for service managers |
+| `codex-switch daemon stop` | Stop a running Beta daemon (macOS/Linux) |
+| `codex-switch daemon status` | Show Beta daemon status and platform support details |
 | `codex-switch daemon install` | Install the Beta daemon as a user service (LaunchAgent on macOS, systemd user service on Linux) |
 | `codex-switch daemon uninstall` | Remove the Beta daemon user service |
 | `codex-switch self-update [--check] [--dev]` | Manually check GitHub Releases or update the current direct-install binary. `--dev` switches to the dev channel |
@@ -259,6 +259,8 @@ team_priority = true        # Prefer Team accounts with a +500 tier bonus (defau
 [daemon]
 poll_interval_secs = 60         # Usage poll interval (default: 60)
 switch_threshold = 80           # Switch when current 5h usage >= this % (default: 80)
+cache_refresh_interval_secs = 300 # Refresh all profile usage cache in the background (default: 300)
+auto_warmup = false             # Warm up inactive quota windows during cache refresh (default: false)
 token_check_interval_secs = 300 # Background token refresh check interval (default: 300)
 notify = false                  # Desktop notification on switch (default: false)
 log_level = "error"             # Daemon log level (default: "error")
@@ -293,7 +295,7 @@ codex-switch use && codex
 
 ### Keep the next session ready with the daemon (Beta)
 
-Use the Beta daemon when you want `codex-switch` to monitor the current account continuously and prepare the next Codex launch in the background:
+Use the Beta daemon on macOS or Linux when you want `codex-switch` to monitor the current account continuously and prepare the next Codex launch in the background:
 
 ```bash
 # Start a detached daemon
@@ -310,7 +312,7 @@ codex-switch daemon install
 codex-switch daemon uninstall
 ```
 
-The Beta daemon uses the same adaptive scoring logic as `codex-switch use`. It refreshes the current account on each poll, switches only when `daemon.switch_threshold` is met or exceeded and a better candidate exists, and refreshes expiring tokens on a separate timer. It prepares future Codex launches; an already-running Codex process still needs to be restarted after a switch.
+The Beta daemon uses the same adaptive scoring logic as `codex-switch use`. It refreshes the current account on each poll, refreshes every saved profile into `cache.json` on `daemon.cache_refresh_interval_secs`, switches only when `daemon.switch_threshold` is met or exceeded and a better candidate exists, and refreshes expiring tokens on a separate timer. Set `daemon.auto_warmup = true` to also warm up inactive quota windows during cache refresh. macOS service install uses LaunchAgent; Linux service install uses a systemd user service. Windows background daemon support is not implemented yet, so use direct commands or external scheduling there. It prepares future Codex launches; an already-running Codex process still needs to be restarted after a switch.
 
 ### Scheduled token refresh via cron (optional)
 
@@ -462,6 +464,7 @@ When a usage query returns HTTP 401/403, the tool automatically attempts to refr
 - File manager opens via `explorer.exe`
 - Terminal: works with Windows Terminal, PowerShell, and cmd.exe
 - TUI rendering uses Windows Console API via `crossterm`
+- Background daemon commands are not supported yet on Windows; `daemon status --json` reports this in `platform.daemon_start_supported`
 - **Recommended terminal: [Windows Terminal](https://aka.ms/terminal).** Git Bash (mintty) has known compatibility issues with TUI rendering — use Windows Terminal or PowerShell instead
 
 ## JSON Output

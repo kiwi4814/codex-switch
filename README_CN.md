@@ -140,7 +140,7 @@ codex-switch launch
 # 8. 用指定账号启动 Codex
 codex-switch launch alice -- --model gpt-4o
 
-# 9. 启动后台守护进程（Beta，可选）
+# 9. 启动后台守护进程（Beta，可选；macOS/Linux）
 codex-switch daemon start
 
 # 10. 手动检查新版本
@@ -159,9 +159,9 @@ codex-switch self-update --check
 | `codex-switch rename <旧别名> <新别名>` | 重命名账号 |
 | `codex-switch delete <别名>` | 删除账号 |
 | `codex-switch import <路径> [别名]` | 导入单个 auth.json，或递归扫描目录下所有 JSON 文件并校验后导入 |
-| `codex-switch daemon start [--foreground]` | 启动自动切换守护进程（Beta）。默认后台运行；`--foreground` 用于服务管理器 |
-| `codex-switch daemon stop` | 停止运行的 Beta 守护进程 |
-| `codex-switch daemon status` | 显示 Beta 守护进程状态 |
+| `codex-switch daemon start [--foreground]` | 启动自动切换守护进程（Beta，macOS/Linux）。默认后台运行；`--foreground` 用于服务管理器 |
+| `codex-switch daemon stop` | 停止运行的 Beta 守护进程（macOS/Linux） |
+| `codex-switch daemon status` | 显示 Beta 守护进程状态和平台支持信息 |
 | `codex-switch daemon install` | 安装 Beta 守护进程作为系统服务（macOS LaunchAgent / Linux systemd 用户服务） |
 | `codex-switch daemon uninstall` | 卸载 Beta 守护进程系统服务 |
 | `codex-switch self-update [--check] [--dev]` | 手动检查 GitHub Releases，或更新当前直装版本。`--dev` 切换到开发通道 |
@@ -258,6 +258,8 @@ team_priority = true        # 优先使用 Team 账号，+500 层级加成（默
 [daemon]
 poll_interval_secs = 60         # 用量轮询间隔（秒，默认：60）
 switch_threshold = 80           # 触发切换的 5h 用量百分比（默认：80）
+cache_refresh_interval_secs = 300 # 后台刷新所有账号用量缓存的间隔（秒，默认：300）
+auto_warmup = false             # 缓存刷新时预热未激活的配额窗口（默认：false）
 token_check_interval_secs = 300 # Token 刷新检查间隔（秒，默认：300）
 notify = false                  # 切换时桌面通知（默认：false）
 log_level = "error"             # 守护进程日志级别（默认："error"）
@@ -292,7 +294,7 @@ codex-switch use && codex
 
 ### 使用守护进程保持下一次会话就绪（Beta）
 
-当你希望 `codex-switch` 持续监控当前账号并在后台准备好下一次 Codex 启动时，使用 Beta 守护进程：
+当你希望 `codex-switch` 持续监控当前账号并在后台准备好下一次 Codex 启动时，可在 macOS 或 Linux 上使用 Beta 守护进程：
 
 ```bash
 # 启动后台守护进程
@@ -309,7 +311,7 @@ codex-switch daemon install
 codex-switch daemon uninstall
 ```
 
-Beta 守护进程使用与 `codex-switch use` 相同的自适应评分逻辑。它在每次轮询时刷新当前账号，仅在 `daemon.switch_threshold` 达到或超过阈值且存在更好的候选账号时才切换，并在单独的定时器上刷新即将过期的 Token。守护进程为未来的 Codex 启动做准备；已运行的 Codex 进程在切换后仍需重启。
+Beta 守护进程使用与 `codex-switch use` 相同的自适应评分逻辑。它在每次轮询时刷新当前账号，按 `daemon.cache_refresh_interval_secs` 把所有已保存账号的用量刷新到 `cache.json`，仅在 `daemon.switch_threshold` 达到或超过阈值且存在更好的候选账号时才切换，并在单独的定时器上刷新即将过期的 Token。设置 `daemon.auto_warmup = true` 后，也会在缓存刷新期间预热未激活的配额窗口。macOS 服务安装使用 LaunchAgent；Linux 服务安装使用 systemd user service。Windows 后台 daemon 暂未实现，请在 Windows 上使用直接命令或外部调度。守护进程为未来的 Codex 启动做准备；已运行的 Codex 进程在切换后仍需重启。
 
 ### 定时刷新 Token（可选）
 
@@ -461,6 +463,7 @@ v0.0.13+ 不再有模式选择。此统一算法替代了之前的 `max-remainin
 - 文件管理器通过 `explorer.exe` 打开
 - 终端：支持 Windows Terminal、PowerShell 和 cmd.exe
 - TUI 通过 `crossterm` 使用 Windows Console API 渲染
+- 后台 daemon 命令暂不支持 Windows；`daemon status --json` 会在 `platform.daemon_start_supported` 中报告这一点
 - **推荐终端：[Windows Terminal](https://aka.ms/terminal)。** Git Bash（mintty）与 TUI 渲染存在已知兼容性问题，请使用 Windows Terminal 或 PowerShell
 
 ## JSON 输出

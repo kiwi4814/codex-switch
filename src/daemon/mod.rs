@@ -119,8 +119,16 @@ fn status(json: bool) -> Result<()> {
             "pid": pid,
             "pidfile": pidfile,
             "stale_pid_cleaned": state == "stale",
+            "platform": {
+                "os": std::env::consts::OS,
+                "daemon_start_supported": cfg!(unix),
+                "service_install_supported": cfg!(any(target_os = "macos", target_os = "linux")),
+                "service_manager": service_manager_name(),
+            },
             "config": {
                 "poll_interval_secs": cfg.daemon.poll_interval_secs,
+                "cache_refresh_interval_secs": cfg.daemon.cache_refresh_interval_secs,
+                "auto_warmup": cfg.daemon.auto_warmup,
                 "token_check_interval_secs": cfg.daemon.token_check_interval_secs,
                 "switch_threshold": cfg.daemon.switch_threshold,
                 "notify": cfg.daemon.notify,
@@ -133,17 +141,46 @@ fn status(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    match (pid, running) {
-        (Some(pid), true) => {
-            user_println(&format!("Daemon is running (PID {pid})"));
-        }
-        (Some(pid), false) => {
-            user_println(&format!("Daemon is not running (stale PID {pid})"));
-            pidfile::cleanup_pidfile()?;
-        }
-        (None, _) => {
-            user_println("Daemon is not running");
+    #[cfg(unix)]
+    {
+        match (pid, running) {
+            (Some(pid), true) => {
+                user_println(&format!("Daemon is running (PID {pid})"));
+            }
+            (Some(pid), false) => {
+                user_println(&format!("Daemon is not running (stale PID {pid})"));
+                pidfile::cleanup_pidfile()?;
+            }
+            (None, _) => {
+                user_println("Daemon is not running");
+            }
         }
     }
+    #[cfg(not(unix))]
+    {
+        user_println(&format!(
+            "Daemon is not supported on this platform ({})",
+            std::env::consts::OS
+        ));
+    }
     Ok(())
+}
+
+fn service_manager_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "launchd"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "systemd-user"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "unsupported"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        "unsupported"
+    }
 }

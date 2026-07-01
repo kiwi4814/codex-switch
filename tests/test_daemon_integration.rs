@@ -34,6 +34,10 @@ impl TestEnv {
     fn pidfile(&self) -> PathBuf {
         self.app_home().join("daemon.pid")
     }
+
+    fn cache_file(&self) -> PathBuf {
+        self.app_home().join("cache.json")
+    }
 }
 
 fn make_id_token(email: &str, plan_type: &str, account_id: &str) -> String {
@@ -103,6 +107,8 @@ team_priority = true
 [daemon]
 poll_interval_secs = 1
 switch_threshold = 50
+cache_refresh_interval_secs = 1
+auto_warmup = false
 token_check_interval_secs = 60
 notify = false
 log_level = "error"
@@ -228,7 +234,35 @@ async fn daemon_start_switch_status_and_stop() {
             .as_str()
             .is_some_and(|path| path.ends_with("daemon.pid"))
     );
+    assert_eq!(status_json["platform"]["daemon_start_supported"], true);
+    let os = status_json["platform"]["os"].as_str().unwrap_or("");
+    assert_eq!(
+        status_json["platform"]["service_install_supported"],
+        os == "macos" || os == "linux"
+    );
+    assert!(
+        status_json["platform"]["service_manager"]
+            .as_str()
+            .is_some()
+    );
+    assert_eq!(status_json["config"]["cache_refresh_interval_secs"], 1);
+    assert_eq!(status_json["config"]["auto_warmup"], false);
     assert_eq!(status_json["config"]["switch_threshold"], 50.0);
+
+    wait_until(
+        Duration::from_secs(10),
+        "daemon refreshed all profile usage into cache",
+        || {
+            let Ok(raw) = std::fs::read_to_string(env.cache_file()) else {
+                return false;
+            };
+            let Ok(cache) = serde_json::from_str::<Value>(&raw) else {
+                return false;
+            };
+            cache["entries"].get("gradual_a").is_some()
+                && cache["entries"].get("gradual_b").is_some()
+        },
+    );
 
     wait_until(
         Duration::from_secs(15),

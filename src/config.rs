@@ -37,6 +37,12 @@ impl AppConfig {
             );
             self.tui.auto_refresh_interval_secs = 30;
         }
+        if self.daemon.cache_refresh_interval_secs == 0 {
+            tracing::warn!(
+                "config.daemon.cache_refresh_interval_secs=0 is invalid; using 300 instead"
+            );
+            self.daemon.cache_refresh_interval_secs = 300;
+        }
         self
     }
 }
@@ -114,6 +120,10 @@ pub struct DaemonConfig {
     pub poll_interval_secs: u64,
     /// 5h usage % threshold that triggers a switch (default: 80.0)
     pub switch_threshold: f64,
+    /// Background cache refresh interval in seconds (default: 300)
+    pub cache_refresh_interval_secs: u64,
+    /// Warm up accounts whose quota window is not active during cache refresh (default: false)
+    pub auto_warmup: bool,
     /// Token expiry check interval in seconds (default: 300)
     pub token_check_interval_secs: u64,
     /// Send desktop notification on switch (default: false)
@@ -127,6 +137,8 @@ impl Default for DaemonConfig {
         Self {
             poll_interval_secs: 60,
             switch_threshold: 80.0,
+            cache_refresh_interval_secs: 300,
+            auto_warmup: false,
             token_check_interval_secs: 300,
             notify: false,
             log_level: "error".to_string(),

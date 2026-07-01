@@ -1,23 +1,33 @@
 use anyhow::Result;
 
-use crate::{auth, cache, config, profile, usage};
+use crate::{auth, cache, config, profile, usage, warmup};
 
 /// Main daemon event loop: periodically checks usage and switches account when needed.
 pub async fn run_daemon_loop() -> Result<()> {
     let cfg = config::get();
     let poll_secs = cfg.daemon.poll_interval_secs;
     let token_secs = cfg.daemon.token_check_interval_secs;
+    let cache_refresh_secs = cfg.daemon.cache_refresh_interval_secs;
+    let auto_warmup = cfg.daemon.auto_warmup;
 
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
     poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut token_interval = tokio::time::interval(std::time::Duration::from_secs(token_secs));
     token_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let cache_refresh_period = std::time::Duration::from_secs(cache_refresh_secs);
+    let mut cache_refresh_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + cache_refresh_period,
+        cache_refresh_period,
+    );
+    cache_refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut consecutive_failures: u32 = 0;
 
     tracing::info!(
-        "Daemon loop started: poll={}s, token_check={}s, threshold={}%",
+        "Daemon loop started: poll={}s, token_check={}s, cache_refresh={}s, auto_warmup={}, threshold={}%",
         poll_secs,
         token_secs,
+        cache_refresh_secs,
+        auto_warmup,
         cfg.daemon.switch_threshold,
     );
 
@@ -50,6 +60,17 @@ pub async fn run_daemon_loop() -> Result<()> {
             }
             _ = token_interval.tick() => {
                 usage::refresh_expiring_tokens().await;
+            }
+            _ = cache_refresh_interval.tick() => {
+                match refresh_profile_cache(auto_warmup).await {
+                    Ok(summary) => tracing::debug!(
+                        "Cache refresh completed: refreshed={}, warmed={}, failed={}",
+                        summary.refreshed,
+                        summary.warmed,
+                        summary.failed
+                    ),
+                    Err(e) => tracing::warn!("Cache refresh skipped: {e}"),
+                }
             }
             _ = shutdown_signal() => {
                 tracing::info!("Received shutdown signal, exiting daemon loop");
@@ -237,6 +258,88 @@ async fn check_and_switch() -> Result<bool> {
 
     tracing::debug!("No better candidate found");
     Ok(false)
+}
+
+#[derive(Default)]
+struct CacheRefreshSummary {
+    refreshed: usize,
+    warmed: usize,
+    failed: usize,
+}
+
+async fn refresh_profile_cache(auto_warmup: bool) -> Result<CacheRefreshSummary> {
+    let profiles = profile::list_profiles()?;
+    if profiles.is_empty() {
+        return Ok(CacheRefreshSummary::default());
+    }
+
+    let current = profile::read_current();
+    let now = auth::now_unix_secs();
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        config::get().network.max_concurrent,
+    ));
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for alias in profiles {
+        let current = current.clone();
+        let sem = semaphore.clone();
+        tasks.spawn(async move {
+            let Ok(_permit) = sem.acquire_owned().await else {
+                return (
+                    alias,
+                    false,
+                    false,
+                    Some("usage limiter closed".to_string()),
+                );
+            };
+            let path = match profile::profile_auth_path(&alias) {
+                Ok(path) => path,
+                Err(e) => return (alias, false, false, Some(e.to_string())),
+            };
+
+            let usage = match usage::fetch_usage_retried_force(&alias, &path, &current).await {
+                Ok(usage) => usage,
+                Err(e) => return (alias, false, false, Some(e.summary)),
+            };
+
+            if !auto_warmup || usage::usage_has_active_warmup_window(&usage, now) {
+                return (alias, true, false, None);
+            }
+
+            if let Err(e) = warmup::warmup_account(&alias, &path).await {
+                return (alias, true, false, Some(format!("warmup failed: {e}")));
+            }
+
+            if let Err(e) = usage::fetch_usage_retried_force(&alias, &path, &current).await {
+                tracing::warn!("[{alias}] post-warmup cache refresh failed: {}", e.summary);
+            }
+            (alias, true, true, None)
+        });
+    }
+
+    let mut summary = CacheRefreshSummary::default();
+    while let Some(res) = tasks.join_next().await {
+        let (alias, refreshed, warmed, err) = match res {
+            Ok(value) => value,
+            Err(e) => {
+                summary.failed += 1;
+                tracing::warn!("Cache refresh worker failed: {e}");
+                continue;
+            }
+        };
+        if refreshed {
+            summary.refreshed += 1;
+        }
+        if warmed {
+            summary.warmed += 1;
+        }
+        if let Some(err) = err {
+            summary.failed += 1;
+            tracing::warn!("[{alias}] cache refresh failed: {err}");
+        }
+    }
+
+    Ok(summary)
 }
 
 async fn shutdown_signal() {
