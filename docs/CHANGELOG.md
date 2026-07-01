@@ -1,17 +1,22 @@
 # Changelog
 
-## v0.0.20 — 2026-07-01
+## v0.0.20 — 2026-07-02
 
 ### Added
 
 - **Manual reset cards visibility** — Usage fetch now reads Codex manual reset card count and detailed expiry data from `rate-limit-reset-credits`, without failing the main usage request when that secondary endpoint is unavailable.
+- **Reset card consume flow** — `codex-switch reset-card <alias>` and TUI `Enter > c` can consume the earliest-expiring available Codex reset card, with an explicit confirmation prompt before any consume request is sent.
 - **CLI reset card display** — `codex-switch list` now prints reset card count, next expiry, and up to three card expiry lines. `--json` includes `reset_credits_available_count`, `reset_credits`, and `reset_credits_error`.
-- **TUI reset card display** — Account table now includes reset card count and next card expiry columns; the selected-account detail panel also shows a compact reset card summary.
+- **TUI reset card display** — Account rows show reset card counts, selected-account details stay compact, and the account context panel shows the full expiry list sorted by earliest expiry.
 
 ### Changed
 
-- **Version base bumped to 0.0.20** — This is the base version for the next rolling `dev` build (`0.0.20-dev.<timestamp>` in CI).
+- **Stable version base set to 0.0.20** — This is the formal release base after the reset card work stabilized on the rolling `dev` channel.
 - **Dependency refresh** — Merged `anyhow` 1.0.103 patch update and upgraded `fs4` to 1.1.0 with the required `FileExt::lock` / `FileExt::try_lock` API adaptation.
+
+### Fixed
+
+- **Reset card cache invalidation after consume** — Successful consume now invalidates the alias usage cache before refreshing, so the CLI and TUI do not keep showing already-used reset cards until the cache TTL expires.
 
 ## v0.0.19 — 2026-06-29
 
