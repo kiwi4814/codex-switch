@@ -6,7 +6,7 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::jwt::AccountInfo;
-use crate::usage::{UsageInfo, WindowUsage};
+use crate::usage::{ResetCredit, UsageInfo, WindowUsage};
 
 // ── JSON types ───────────────────────────────────────────
 
@@ -31,6 +31,14 @@ pub struct JsonWindow {
 }
 
 #[derive(Serialize)]
+pub struct JsonResetCredit {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<String>,
+    pub expires_at: String,
+}
+
+#[derive(Serialize)]
 #[serde(untagged)]
 pub enum JsonUsage {
     Ok {
@@ -41,6 +49,12 @@ pub enum JsonUsage {
         credits_balance: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         unlimited_credits: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reset_credits_available_count: Option<u64>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        reset_credits: Vec<JsonResetCredit>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reset_credits_error: Option<String>,
     },
     Err {
         error: String,
@@ -142,6 +156,14 @@ fn window_to_json(w: &WindowUsage, label: &str, window_secs: i64) -> JsonWindow 
     }
 }
 
+fn reset_credit_to_json(credit: &ResetCredit) -> JsonResetCredit {
+    JsonResetCredit {
+        id: credit.id.clone(),
+        granted_at: credit.granted_at.clone(),
+        expires_at: credit.expires_at.clone(),
+    }
+}
+
 pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
     match result {
         Err(e) => JsonUsage::Err {
@@ -164,6 +186,9 @@ pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
                     .map(|w| Box::new(window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS))),
                 credits_balance: u.credits_balance,
                 unlimited_credits: u.unlimited_credits,
+                reset_credits_available_count: u.reset_credits_available_count,
+                reset_credits: u.reset_credits.iter().map(reset_credit_to_json).collect(),
+                reset_credits_error: u.reset_credits_error.clone(),
             }
         }
     }
@@ -230,6 +255,77 @@ pub fn format_local_time(ts: i64) -> String {
     } else {
         dt.format("%m-%d %H:%M").to_string()
     }
+}
+
+pub fn format_local_datetime(value: &str) -> String {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| {
+            let local = dt.with_timezone(&Local);
+            local.format("%m-%d %H:%M").to_string()
+        })
+        .unwrap_or_else(|_| value.to_string())
+}
+
+pub fn reset_credits_count(u: &UsageInfo) -> Option<u64> {
+    u.reset_credits_available_count
+        .or_else(|| (!u.reset_credits.is_empty()).then_some(u.reset_credits.len() as u64))
+}
+
+pub fn reset_credits_next_expiry(u: &UsageInfo) -> Option<&str> {
+    u.reset_credits
+        .iter()
+        .min_by_key(|credit| {
+            DateTime::parse_from_rfc3339(&credit.expires_at)
+                .map(|dt| dt.timestamp())
+                .unwrap_or(i64::MAX)
+        })
+        .map(|credit| credit.expires_at.as_str())
+}
+
+pub fn reset_credits_compact(u: &UsageInfo) -> Option<String> {
+    let count = reset_credits_count(u)?;
+    let mut text = format!("reset cards: {count}");
+    if let Some(expires_at) = reset_credits_next_expiry(u) {
+        text.push_str(&format!("  next expiry: {}", format_local_datetime(expires_at)));
+        if u.reset_credits.len() > 1 {
+            text.push_str(&format!(" (+{})", u.reset_credits.len() - 1));
+        }
+    } else if let Some(err) = &u.reset_credits_error {
+        text.push_str(&format!("  expiry unavailable: {err}"));
+    }
+    Some(text)
+}
+
+pub fn reset_credits_expiry_table(u: &UsageInfo) -> String {
+    reset_credits_next_expiry(u)
+        .map(format_local_datetime)
+        .or_else(|| u.reset_credits_error.as_ref().map(|_| "error".to_string()))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+pub fn reset_credits_detail_lines(u: &UsageInfo, max_lines: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(summary) = reset_credits_compact(u) {
+        lines.push(summary);
+    }
+    if max_lines <= 1 {
+        return lines;
+    }
+    let detail_budget = max_lines - 1;
+    for (idx, credit) in u.reset_credits.iter().take(detail_budget).enumerate() {
+        lines.push(format!(
+            "  card #{} expires {}",
+            idx + 1,
+            format_local_datetime(&credit.expires_at)
+        ));
+    }
+    if u.reset_credits.len() > detail_budget {
+        lines.push(format!(
+            "  ... {} more",
+            u.reset_credits.len() - detail_budget
+        ));
+    }
+    lines
 }
 
 // ── Output ───────────────────────────────────────────────

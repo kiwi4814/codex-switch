@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use fs4::fs_std::FileExt;
+use fs4::{FileExt, TryLockError};
 
 use crate::auth::{
     app_home, backup_auth, codex_auth_path, current_file, profiles_dir, read_auth, write_auth,
@@ -101,12 +101,12 @@ pub fn lock_live_auth() -> Result<File> {
 
     let deadline = Instant::now() + LOCK_STALE_AFTER;
     loop {
-        match file.try_lock_exclusive() {
+        match FileExt::try_lock(&file) {
             Ok(()) => {
                 write_lock_holder(&file);
                 return Ok(file);
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            Err(TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     // Holder didn't release within the stale window.
                     // Force takeover: unlink the old lock file (parent dir is user-owned,
@@ -119,7 +119,7 @@ pub fn lock_live_auth() -> Result<File> {
                         format!("removing stale auth lock {}", path.display())
                     })?;
                     let new_file = open_lock_file(&path)?;
-                    new_file.lock_exclusive().with_context(|| {
+                    FileExt::lock(&new_file).with_context(|| {
                         format!("locking recreated auth lock {}", path.display())
                     })?;
                     tracing::warn!(
@@ -133,7 +133,7 @@ pub fn lock_live_auth() -> Result<File> {
                 }
                 std::thread::sleep(LOCK_POLL_INTERVAL);
             }
-            Err(e) => {
+            Err(TryLockError::Error(e)) => {
                 return Err(anyhow::Error::from(e))
                     .with_context(|| format!("locking {}", path.display()));
             }
@@ -813,7 +813,7 @@ mod tests {
     use std::time::Duration;
 
     use anyhow::Result;
-    use fs4::fs_std::FileExt;
+    use fs4::FileExt;
 
     use super::{cmd_delete, cmd_use, rename_profile, switch_profile, validate_alias};
 
@@ -956,7 +956,7 @@ mod tests {
             .write(true)
             .open(lock_path)
             .unwrap();
-        lock_file.lock_exclusive().unwrap();
+        FileExt::lock(&lock_file).unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {

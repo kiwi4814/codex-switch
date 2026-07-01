@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
-use crate::usage::UsageInfo;
+use crate::usage::{ResetCredit, UsageInfo};
 
 static CACHE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -24,6 +24,12 @@ struct CacheEntry {
     unlimited_credits: Option<bool>,
     #[serde(default)]
     plan_type: Option<String>,
+    #[serde(default)]
+    reset_credits_available_count: Option<u64>,
+    #[serde(default)]
+    reset_credits: Vec<ResetCredit>,
+    #[serde(default)]
+    reset_credits_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -88,6 +94,9 @@ fn to_entry(u: &UsageInfo) -> CacheEntry {
         credits_balance: u.credits_balance,
         unlimited_credits: u.unlimited_credits,
         plan_type: u.plan_type.clone(),
+        reset_credits_available_count: u.reset_credits_available_count,
+        reset_credits: u.reset_credits.clone(),
+        reset_credits_error: u.reset_credits_error.clone(),
     }
 }
 
@@ -116,6 +125,9 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         credits_balance: e.credits_balance,
         unlimited_credits: e.unlimited_credits,
         plan_type: e.plan_type.clone(),
+        reset_credits_available_count: e.reset_credits_available_count,
+        reset_credits: e.reset_credits.clone(),
+        reset_credits_error: e.reset_credits_error.clone(),
     }
 }
 
@@ -236,9 +248,14 @@ mod tests {
 
         assert_eq!(entry.credits_balance, None);
         assert_eq!(entry.unlimited_credits, None);
+        assert_eq!(entry.reset_credits_available_count, None);
+        assert!(entry.reset_credits.is_empty());
+        assert_eq!(entry.reset_credits_error, None);
 
         let usage = from_entry(&entry);
         assert_eq!(usage.credits_balance, None);
         assert_eq!(usage.unlimited_credits, None);
+        assert_eq!(usage.reset_credits_available_count, None);
+        assert!(usage.reset_credits.is_empty());
     }
 }

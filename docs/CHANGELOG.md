@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.0.20 — 2026-07-01
+
+### Added
+
+- **Manual reset cards visibility** — Usage fetch now reads Codex manual reset card count and detailed expiry data from `rate-limit-reset-credits`, without failing the main usage request when that secondary endpoint is unavailable.
+- **CLI reset card display** — `codex-switch list` now prints reset card count, next expiry, and up to three card expiry lines. `--json` includes `reset_credits_available_count`, `reset_credits`, and `reset_credits_error`.
+- **TUI reset card display** — Account table now includes reset card count and next card expiry columns; the selected-account detail panel also shows a compact reset card summary.
+
+### Changed
+
+- **Version base bumped to 0.0.20** — This is the base version for the next rolling `dev` build (`0.0.20-dev.<timestamp>` in CI).
+- **Dependency refresh** — Merged `anyhow` 1.0.103 patch update and upgraded `fs4` to 1.1.0 with the required `FileExt::lock` / `FileExt::try_lock` API adaptation.
+
 ## v0.0.19 — 2026-06-29
 
 ### Fixed

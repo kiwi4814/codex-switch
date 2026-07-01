@@ -19,7 +19,7 @@ use clap::Parser;
 use cli::{Cli, Commands};
 use output::{
     MessageMode, ProgressReporter, account_to_json, print_error, print_json,
-    usage_to_json, user_println,
+    reset_credits_detail_lines, usage_to_json, user_println,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -102,9 +102,7 @@ async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
             version,
             dev,
             stable,
-        } => {
-            self_update_cmd(check, version.as_deref(), dev, stable, json).await?
-        }
+        } => self_update_cmd(check, version.as_deref(), dev, stable, json).await?,
         Commands::Warmup { alias } => warmup_cmd(alias.as_deref(), json).await?,
         Commands::Launch { alias, args } => launch_cmd(alias.as_deref(), args, json).await?,
         Commands::Tui => tui::run_tui().await?,
@@ -135,8 +133,8 @@ async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
 #[derive(Debug)]
 enum AuthCheckResult {
     NoChange,
-    Detected,  // change detected but not synced (non-interactive or user declined)
-    Synced,    // change detected and user accepted the sync
+    Detected, // change detected but not synced (non-interactive or user declined)
+    Synced,   // change detected and user accepted the sync
 }
 
 fn check_auth_change() -> AuthCheckResult {
@@ -151,7 +149,9 @@ fn check_auth_change() -> AuthCheckResult {
     if !io::stdin().is_terminal() {
         match &change {
             profile::AuthChange::NewAccount => {
-                let info = auth::codex_auth_path().map(|p| auth::read_account_info(&p)).unwrap_or_default();
+                let info = auth::codex_auth_path()
+                    .map(|p| auth::read_account_info(&p))
+                    .unwrap_or_default();
                 let label = info.email.as_deref().unwrap_or("unknown");
                 user_println(&format!(
                     "Detected new account ({label}) in auth.json (use `codex-switch list` interactively to save)."
@@ -171,7 +171,9 @@ fn check_auth_change() -> AuthCheckResult {
 
     match change {
         profile::AuthChange::NewAccount => {
-            let info = auth::codex_auth_path().map(|p| auth::read_account_info(&p)).unwrap_or_default();
+            let info = auth::codex_auth_path()
+                .map(|p| auth::read_account_info(&p))
+                .unwrap_or_default();
             let label = info.email.as_deref().unwrap_or("unknown");
             user_println(&format!(
                 "Detected new account ({label}) in auth.json — not in any saved profile."
@@ -179,11 +181,7 @@ fn check_auth_change() -> AuthCheckResult {
             if confirm("Save as a new profile? [Y/n] ") {
                 match profile::cmd_save(None) {
                     Ok(action) => {
-                        user_println(&format!(
-                            "Profile {}: {}",
-                            action.action(),
-                            action.alias()
-                        ));
+                        user_println(&format!("Profile {}: {}", action.action(), action.alias()));
                         synced = true;
                     }
                     Err(e) => eprintln!("{}", color::error(&format!("Failed to save: {e}"))),
@@ -191,7 +189,9 @@ fn check_auth_change() -> AuthCheckResult {
             }
         }
         profile::AuthChange::TokensUpdated { alias } => {
-            let info = auth::codex_auth_path().map(|p| auth::read_account_info(&p)).unwrap_or_default();
+            let info = auth::codex_auth_path()
+                .map(|p| auth::read_account_info(&p))
+                .unwrap_or_default();
             let label = info.email.as_deref().unwrap_or("unknown");
             user_println(&format!(
                 "auth.json credentials changed for account '{alias}' ({label})."
@@ -385,7 +385,10 @@ async fn list_cmd(force: bool, json: bool, auth_already_handled: bool) -> Result
                 is_current: row.is_current,
                 account: account_to_json(
                     &row.info,
-                    usage_result.as_ref().ok().and_then(|u| u.plan_type.as_deref()),
+                    usage_result
+                        .as_ref()
+                        .ok()
+                        .and_then(|u| u.plan_type.as_deref()),
                 ),
                 usage: ju,
             });
@@ -423,11 +426,7 @@ async fn list_cmd(force: bool, json: bool, auth_already_handled: bool) -> Result
             println!();
             match usage_result {
                 Ok(u) => print_usage_line(&u),
-                Err(e) => println!(
-                    "  {} {}",
-                    color::error("!!"),
-                    color::error(&e.summary)
-                ),
+                Err(e) => println!("  {} {}", color::error("!!"), color::error(&e.summary)),
             }
             println!(); // blank line between accounts
         }
@@ -593,16 +592,14 @@ fn score_profile_candidates(
             let last_used = cache::get_last_used(&alias);
             // API plan_type is authoritative over JWT for scoring (handles plan downgrades)
             let api_plan = u.plan_type.as_deref();
-            let is_team = api_plan.map(|p| p == "team").unwrap_or_else(|| info.is_team());
-            let is_free = api_plan.map(|p| p == "free").unwrap_or_else(|| info.is_free());
-            let mut candidate = usage::Candidate::from_usage(
-                alias,
-                &u,
-                is_team,
-                is_free,
-                last_used,
-                now,
-            );
+            let is_team = api_plan
+                .map(|p| p == "team")
+                .unwrap_or_else(|| info.is_team());
+            let is_free = api_plan
+                .map(|p| p == "free")
+                .unwrap_or_else(|| info.is_free());
+            let mut candidate =
+                usage::Candidate::from_usage(alias, &u, is_team, is_free, last_used, now);
             candidate.pool_size = pool_size;
             candidate.team_priority = team_priority;
             (candidate, u)
@@ -738,10 +735,7 @@ async fn best_cmd(json: bool) -> Result<()> {
             mode: "unified".to_string(),
         });
     } else {
-        println!(
-            "{}",
-            color::success(&format!("Switched to: {best_alias}"))
-        );
+        println!("{}", color::success(&format!("Switched to: {best_alias}")));
         print_usage_line(&best_usage);
     }
 
@@ -1197,9 +1191,7 @@ async fn self_update_cmd(
                 "Switched to dev channel. Run `codex-switch self-update --stable` to return.",
             ));
         } else if stable && update::is_dev_version(&result.current_version) {
-            user_println(&color::dim(
-                "Switched back to stable channel.",
-            ));
+            user_println(&color::dim("Switched back to stable channel."));
         }
     } else {
         println!(
@@ -1283,9 +1275,17 @@ fn format_reset_short_relative(w: &usage::WindowUsage) -> String {
     if remaining_secs < 3600 {
         format!("~{}m", remaining_secs / 60)
     } else if remaining_secs < 86400 {
-        format!("~{}h{}m", remaining_secs / 3600, (remaining_secs % 3600) / 60)
+        format!(
+            "~{}h{}m",
+            remaining_secs / 3600,
+            (remaining_secs % 3600) / 60
+        )
     } else {
-        format!("~{}d{}h", remaining_secs / 86400, (remaining_secs % 86400) / 3600)
+        format!(
+            "~{}d{}h",
+            remaining_secs / 86400,
+            (remaining_secs % 86400) / 3600
+        )
     }
 }
 
@@ -1307,7 +1307,11 @@ fn print_usage_line(u: &usage::UsageInfo) {
         let over = pct >= 10.0 && pace.is_some_and(|p| pct > p);
         let bar = render_progress_bar(pct, pace, bar_width);
         let reset = format_reset_short_relative(w);
-        let warn = if over { color::error("!") } else { String::new() };
+        let warn = if over {
+            color::error("!")
+        } else {
+            String::new()
+        };
         println!(
             "  5h  {}  {}{}   {}",
             color::usage_pct(&bar, pct),
@@ -1323,7 +1327,11 @@ fn print_usage_line(u: &usage::UsageInfo) {
         let over = pct >= 10.0 && pace.is_some_and(|p| pct > p);
         let bar = render_progress_bar(pct, pace, bar_width);
         let reset = format_reset_short_relative(w);
-        let warn = if over { color::error("!") } else { String::new() };
+        let warn = if over {
+            color::error("!")
+        } else {
+            String::new()
+        };
         println!(
             "  7d  {}  {}{}   {}",
             color::usage_pct(&bar, pct),
@@ -1340,6 +1348,9 @@ fn print_usage_line(u: &usage::UsageInfo) {
             format!("credits: ${balance:.2}")
         };
         println!("  {}", color::credits(&text, balance, unlimited));
+    }
+    for line in reset_credits_detail_lines(u, 4) {
+        println!("  {}", color::dim(&line));
     }
 }
 
@@ -1395,7 +1406,10 @@ async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
     if to_warmup.is_empty() {
         if json {
             results.sort_by(|a, b| {
-                a["alias"].as_str().unwrap_or("").cmp(b["alias"].as_str().unwrap_or(""))
+                a["alias"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["alias"].as_str().unwrap_or(""))
             });
             print_json(&serde_json::json!({"ok": true, "results": results}));
         }
@@ -1414,7 +1428,9 @@ async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
             Err(e) => {
                 tracing::warn!("[{alias}] failed to resolve profile path: {e}");
                 if json {
-                    results.push(serde_json::json!({"alias": alias, "ok": false, "error": e.to_string()}));
+                    results.push(
+                        serde_json::json!({"alias": alias, "ok": false, "error": e.to_string()}),
+                    );
                 }
                 had_error = true;
                 continue;
@@ -1437,12 +1453,18 @@ async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
                 if json {
                     results.push(serde_json::json!({"alias": alias, "ok": true}));
                 } else {
-                    user_println(&format!("  {} {}", color::success(&alias), color::dim("warmed up")));
+                    user_println(&format!(
+                        "  {} {}",
+                        color::success(&alias),
+                        color::dim("warmed up")
+                    ));
                 }
             }
             Err(e) => {
                 if json {
-                    results.push(serde_json::json!({"alias": alias, "ok": false, "error": e.to_string()}));
+                    results.push(
+                        serde_json::json!({"alias": alias, "ok": false, "error": e.to_string()}),
+                    );
                 } else {
                     user_println(&format!("  {} failed: {}", color::error(&alias), e));
                 }
@@ -1453,7 +1475,10 @@ async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
 
     if json {
         results.sort_by(|a, b| {
-            a["alias"].as_str().unwrap_or("").cmp(b["alias"].as_str().unwrap_or(""))
+            a["alias"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["alias"].as_str().unwrap_or(""))
         });
         // Embed overall status in JSON so callers get a single valid object.
         // Use std::process::exit to signal failure without a second JSON error line.

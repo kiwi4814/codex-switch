@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -14,6 +14,13 @@ pub struct WindowUsage {
     pub resets_at: Option<i64>,
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ResetCredit {
+    pub id: String,
+    pub granted_at: Option<String>,
+    pub expires_at: String,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct UsageInfo {
     pub fetched_at: Option<i64>,
@@ -23,6 +30,9 @@ pub struct UsageInfo {
     pub unlimited_credits: Option<bool>,
     /// plan_type from usage API response (authoritative; overrides JWT claims when present)
     pub plan_type: Option<String>,
+    pub reset_credits_available_count: Option<u64>,
+    pub reset_credits: Vec<ResetCredit>,
+    pub reset_credits_error: Option<String>,
 }
 
 /// All data needed to score an account. Pure data, no I/O.
@@ -57,9 +67,17 @@ impl Candidate {
     ) -> Self {
         Self {
             alias,
-            used_5h: u.primary.as_ref().and_then(|w| w.used_percent).unwrap_or(0.0),
+            used_5h: u
+                .primary
+                .as_ref()
+                .and_then(|w| w.used_percent)
+                .unwrap_or(0.0),
             resets_at_5h: u.primary.as_ref().and_then(|w| w.resets_at),
-            used_7d: u.secondary.as_ref().and_then(|w| w.used_percent).unwrap_or(0.0),
+            used_7d: u
+                .secondary
+                .as_ref()
+                .and_then(|w| w.used_percent)
+                .unwrap_or(0.0),
             resets_at_7d: u.secondary.as_ref().and_then(|w| w.resets_at),
             has_5h_data: u.primary.is_some(),
             has_7d_data: u.secondary.is_some(),
@@ -75,12 +93,20 @@ impl Candidate {
 
     /// Reset-aware effective 5h usage: 0.0 if window has already reset.
     pub fn effective_used_5h(&self) -> f64 {
-        if self.resets_at_5h.is_some_and(|ts| ts <= self.now) { 0.0 } else { self.used_5h }
+        if self.resets_at_5h.is_some_and(|ts| ts <= self.now) {
+            0.0
+        } else {
+            self.used_5h
+        }
     }
 
     /// Reset-aware effective 7d usage: 0.0 if window has already reset.
     pub fn effective_used_7d(&self) -> f64 {
-        if self.resets_at_7d.is_some_and(|ts| ts <= self.now) { 0.0 } else { self.used_7d }
+        if self.resets_at_7d.is_some_and(|ts| ts <= self.now) {
+            0.0
+        } else {
+            self.used_7d
+        }
     }
 }
 
@@ -147,6 +173,7 @@ pub fn visible_pace_percent(w: &WindowUsage, window_secs: i64) -> Option<f64> {
 }
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
@@ -181,6 +208,18 @@ impl std::fmt::Display for UsageError {
 
 fn usage_url() -> String {
     std::env::var("CS_USAGE_URL").unwrap_or_else(|_| USAGE_URL.to_string())
+}
+
+fn reset_credits_url() -> String {
+    if let Ok(url) = std::env::var("CS_RESET_CREDITS_URL") {
+        return url;
+    }
+    if let Ok(url) = std::env::var("CS_USAGE_URL")
+        && let Some(base) = url.strip_suffix("/usage")
+    {
+        return format!("{base}/rate-limit-reset-credits");
+    }
+    RESET_CREDITS_URL.to_string()
 }
 
 /// Extract a short summary from an error message for user-facing display.
@@ -281,6 +320,7 @@ async fn fetch_usage_retried_inner(
             detail,
         }
     })?;
+    let account_id = crate::jwt::parse_account_info(&val).account_id;
     let (access_token, refresh_token) = auth::extract_tokens(&val);
 
     let at = match access_token {
@@ -300,7 +340,9 @@ async fn fetch_usage_retried_inner(
             debug!("[{alias}] retry attempt {}/{MAX_RETRIES}", attempt + 1);
             tokio::time::sleep(RETRY_DELAY).await;
         }
-        match fetch_usage_with_refresh(alias, &at, refresh_token.as_deref()).await {
+        match fetch_usage_with_refresh(alias, &at, refresh_token.as_deref(), account_id.as_deref())
+            .await
+        {
             Ok((usage, refreshed)) => {
                 if let Some(new_tokens) = refreshed {
                     persist_refreshed_tokens(alias, profile_path, &new_tokens);
@@ -330,6 +372,7 @@ pub async fn fetch_usage_with_refresh(
     alias: &str,
     access_token: &str,
     refresh_token: Option<&str>,
+    account_id: Option<&str>,
 ) -> Result<(UsageInfo, Option<RefreshedTokens>)> {
     let client = auth::build_http_client()?;
     let usage_url = usage_url();
@@ -362,7 +405,16 @@ pub async fn fetch_usage_with_refresh(
                         "[{alias}] Usage API raw body (proactive): {}",
                         crate::auth::redact_sensitive_log_body(&body)
                     );
-                    return Ok((parse_usage(&body), Some(new_tokens)));
+                    let mut usage = parse_usage(&body);
+                    enrich_reset_credits(
+                        alias,
+                        &client,
+                        &new_tokens.access_token,
+                        account_id,
+                        &mut usage,
+                    )
+                    .await;
+                    return Ok((usage, Some(new_tokens)));
                 }
                 anyhow::bail!("Usage API failed (HTTP {status}) after proactive token refresh");
             }
@@ -390,7 +442,9 @@ pub async fn fetch_usage_with_refresh(
             "[{alias}] Usage API raw body: {}",
             crate::auth::redact_sensitive_log_body(&body)
         );
-        return Ok((parse_usage(&body), None));
+        let mut usage = parse_usage(&body);
+        enrich_reset_credits(alias, &client, access_token, account_id, &mut usage).await;
+        return Ok((usage, None));
     }
 
     // If 401/403 and we have a refresh_token, try to refresh
@@ -419,7 +473,16 @@ pub async fn fetch_usage_with_refresh(
                             "failed to parse usage response after refresh (HTTP {status2}): {e}"
                         )
                     })?;
-                    return Ok((parse_usage(&body), Some(new_tokens)));
+                    let mut usage = parse_usage(&body);
+                    enrich_reset_credits(
+                        alias,
+                        &client,
+                        &new_tokens.access_token,
+                        account_id,
+                        &mut usage,
+                    )
+                    .await;
+                    return Ok((usage, Some(new_tokens)));
                 }
                 anyhow::bail!("Usage API still failed (HTTP {status2}) after token refresh");
             }
@@ -445,11 +508,13 @@ pub async fn validate_import_auth(
     }
 
     let (access_token, refresh_token) = auth::extract_tokens(val);
+    let account_id = crate::jwt::parse_account_info(val).account_id;
 
     let alias = "import";
     match (access_token, refresh_token) {
         (Some(at), rt) => {
-            let (usage, refreshed) = fetch_usage_with_refresh(alias, &at, rt.as_deref()).await?;
+            let (usage, refreshed) =
+                fetch_usage_with_refresh(alias, &at, rt.as_deref(), account_id.as_deref()).await?;
             if let Some(tokens) = &refreshed {
                 auth::apply_tokens(
                     val,
@@ -469,10 +534,12 @@ pub async fn validate_import_auth(
                 &refreshed.access_token,
                 &refreshed.refresh_token,
             )?;
+            let account_id = crate::jwt::parse_account_info(val).account_id;
             let (usage, refreshed_again) = fetch_usage_with_refresh(
                 alias,
                 &refreshed.access_token,
                 Some(&refreshed.refresh_token),
+                account_id.as_deref(),
             )
             .await?;
             if let Some(tokens) = &refreshed_again {
@@ -561,6 +628,146 @@ pub(crate) async fn do_refresh_token(
     }
 }
 
+async fn enrich_reset_credits(
+    alias: &str,
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    usage: &mut UsageInfo,
+) {
+    match fetch_reset_credits(client, access_token, account_id).await {
+        Ok((available_count, credits)) => {
+            if available_count.is_some() {
+                usage.reset_credits_available_count = available_count;
+            }
+            if !credits.is_empty() {
+                usage.reset_credits = credits;
+            }
+            usage.reset_credits_error = None;
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            debug!("[{alias}] reset credits fetch failed: {msg}");
+            usage.reset_credits_error = Some(extract_error_summary(&msg));
+        }
+    }
+}
+
+async fn fetch_reset_credits(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<(Option<u64>, Vec<ResetCredit>)> {
+    let mut req = client
+        .get(reset_credits_url())
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .header("OpenAI-Beta", "codex-1")
+        .header("Originator", "Codex Desktop");
+
+    if let Some(account_id) = account_id.filter(|s| !s.trim().is_empty()) {
+        req = req.header("Chatgpt-Account-Id", account_id);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format_reqwest_error("reset credits request failed", &e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("reset credits request failed (HTTP {status})");
+    }
+
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to parse reset credits response: {e}"))?;
+    let (available_count, credits, valid_shape) = parse_reset_credits_summary(&body);
+    if !valid_shape {
+        anyhow::bail!("reset credits response missing expected fields");
+    }
+    Ok((available_count, credits))
+}
+
+fn parse_optional_u64(value: Option<&Value>) -> Option<u64> {
+    match value? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn parse_reset_credit(value: &Value) -> Option<ResetCredit> {
+    let obj = value.as_object()?;
+
+    let reset_type = obj
+        .get("reset_type")
+        .or_else(|| obj.get("resetType"))
+        .and_then(|v| v.as_str())
+        .map(str::trim);
+    if let Some(reset_type) = reset_type
+        && reset_type != "codex_rate_limits"
+    {
+        return None;
+    }
+
+    let status = obj.get("status").and_then(|v| v.as_str()).map(str::trim);
+    if let Some(status) = status
+        && status != "available"
+    {
+        return None;
+    }
+
+    let expires_at = obj
+        .get("expires_at")
+        .or_else(|| obj.get("expiresAt"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+
+    let id = obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let granted_at = obj
+        .get("granted_at")
+        .or_else(|| obj.get("grantedAt"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    Some(ResetCredit {
+        id,
+        granted_at,
+        expires_at,
+    })
+}
+
+fn parse_reset_credits_summary(body: &Value) -> (Option<u64>, Vec<ResetCredit>, bool) {
+    let Some(obj) = body.as_object() else {
+        return (None, vec![], false);
+    };
+
+    let available_count = parse_optional_u64(
+        obj.get("available_count")
+            .or_else(|| obj.get("availableCount")),
+    );
+    let credits = obj
+        .get("credits")
+        .and_then(|v| v.as_array())
+        .map(|items| items.iter().filter_map(parse_reset_credit).collect())
+        .unwrap_or_default();
+    let valid_shape = obj.contains_key("credits")
+        || obj.contains_key("available_count")
+        || obj.contains_key("availableCount");
+
+    (available_count, credits, valid_shape)
+}
+
 fn parse_window(val: &Value) -> Option<WindowUsage> {
     // Require used_percent to be present for meaningful scoring data.
     // A window with only resets_at but no used_percent would cause
@@ -590,31 +797,39 @@ pub fn is_available(u: &UsageInfo) -> bool {
     true
 }
 
-
 /// Eligibility check on a Candidate (reset-aware).
 pub fn is_candidate_eligible(c: &Candidate, safety_margin_7d: f64) -> bool {
     let used_5h = c.effective_used_5h();
     let used_7d = c.effective_used_7d();
 
     // Gate 1: 5h exhausted (and not past reset)
-    if used_5h >= 100.0 { return false; }
+    if used_5h >= 100.0 {
+        return false;
+    }
     // Gate 2: 7d exhausted (and not past reset)
-    if used_7d >= 100.0 { return false; }
+    if used_7d >= 100.0 {
+        return false;
+    }
     // Gate 3: 7d critically low and reset far away
     if c.has_7d_data {
         let remaining_7d = 100.0 - used_7d;
         let critical_pct = (safety_margin_7d * 0.25_f64).max(1.0);
         if remaining_7d < critical_pct {
-            let hours_to_reset = c.resets_at_7d
+            let hours_to_reset = c
+                .resets_at_7d
                 .map(|ts| ((ts - c.now) as f64 / 3600.0).max(0.0))
                 .unwrap_or(f64::MAX);
-            if hours_to_reset > 48.0 { return false; }
+            if hours_to_reset > 48.0 {
+                return false;
+            }
         }
     }
     // Gate 4: Free plan safety floor
     if c.is_free && c.has_5h_data {
         let remaining_5h = 100.0 - used_5h;
-        if remaining_5h < FREE_FLOOR_PCT { return false; }
+        if remaining_5h < FREE_FLOOR_PCT {
+            return false;
+        }
     }
     true
 }
@@ -638,7 +853,11 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
     let used_7d = c.effective_used_7d();
 
     // ── Component A: tier_bonus (0 or 500) ──
-    let tier_bonus = if c.is_team && c.team_priority { 500.0 } else { 0.0 };
+    let tier_bonus = if c.is_team && c.team_priority {
+        500.0
+    } else {
+        0.0
+    };
 
     // ── Component B: headroom (0..1100) ──
     // Pace-aware: uses burn rate to project effective remaining time,
@@ -725,7 +944,8 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
             };
 
             // Time relief: if 7d resets within 48h, reduce penalty
-            let time_relief = c.resets_at_7d
+            let time_relief = c
+                .resets_at_7d
                 .map(|ts| {
                     let hours = ((ts - c.now) as f64 / 3600.0).max(0.0);
                     if hours < RELIEF_WINDOW_HOURS {
@@ -751,7 +971,8 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
             let remaining_min = ((reset_ts - c.now).max(0) as f64) / 60.0;
             if remaining_min <= DRAIN_WINDOW_MIN {
                 let remaining_pct = 100.0 - used_5h;
-                let urgency = ((DRAIN_WINDOW_MIN - remaining_min) / DRAIN_WINDOW_MIN).clamp(0.0, 1.0);
+                let urgency =
+                    ((DRAIN_WINDOW_MIN - remaining_min) / DRAIN_WINDOW_MIN).clamp(0.0, 1.0);
                 // waste = remaining quota × urgency, scaled to 0..300
                 (remaining_pct * urgency * 3.0).min(300.0)
             } else {
@@ -826,11 +1047,16 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
         (primary_parsed, secondary_parsed)
     };
 
-    debug!("parse_usage: primary={} secondary={}", primary.is_some(), secondary.is_some());
+    debug!(
+        "parse_usage: primary={} secondary={}",
+        primary.is_some(),
+        secondary.is_some()
+    );
 
     // has_credits=false means no pay-per-use credits (Plus/Pro included usage only).
     // Default true for old API format which lacked this field.
-    let has_credits = body.pointer("/credits/has_credits")
+    let has_credits = body
+        .pointer("/credits/has_credits")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
@@ -839,7 +1065,8 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
     // that simply don't use the pay-per-use credits system.
     let credits_balance = if has_credits {
         body.pointer("/credits/balance").and_then(|v| {
-            v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
     } else {
         None
@@ -847,7 +1074,16 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
 
     let unlimited_credits = body.pointer("/credits/unlimited").and_then(|v| v.as_bool());
 
-    let plan_type = body.get("plan_type").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let plan_type = body
+        .get("plan_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let reset_credits_raw = body
+        .get("rate_limit_reset_credits")
+        .or_else(|| body.get("rateLimitResetCredits"));
+    let (reset_credits_available_count, reset_credits, _) = reset_credits_raw
+        .map(parse_reset_credits_summary)
+        .unwrap_or((None, vec![], false));
 
     UsageInfo {
         fetched_at: Some(auth::now_unix_secs()),
@@ -856,6 +1092,9 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
         credits_balance,
         unlimited_credits,
         plan_type,
+        reset_credits_available_count,
+        reset_credits,
+        reset_credits_error: None,
     }
 }
 
@@ -962,6 +1201,9 @@ mod tests {
             credits_balance: None,
             unlimited_credits: None,
             plan_type: None,
+            reset_credits_available_count: None,
+            reset_credits: vec![],
+            reset_credits_error: None,
         }
     }
 
@@ -1002,6 +1244,9 @@ mod tests {
             "credits": {
                 "balance": 15.50,
                 "unlimited": false
+            },
+            "rate_limit_reset_credits": {
+                "available_count": "2"
             }
         });
 
@@ -1028,6 +1273,36 @@ mod tests {
         );
         assert_eq!(usage.credits_balance, Some(15.5));
         assert_eq!(usage.unlimited_credits, Some(false));
+        assert_eq!(usage.reset_credits_available_count, Some(2));
+    }
+
+    #[test]
+    fn test_parse_usage_reset_credit_details() {
+        let usage = parse_usage(&json!({
+            "rate_limit_reset_credits": {
+                "available_count": 2,
+                "credits": [
+                    {
+                        "id": "cred_1",
+                        "reset_type": "codex_rate_limits",
+                        "status": "available",
+                        "granted_at": "2026-07-01T00:00:00Z",
+                        "expires_at": "2026-07-08T00:00:00Z"
+                    },
+                    {
+                        "id": "cred_2",
+                        "reset_type": "codex_rate_limits",
+                        "status": "consumed",
+                        "expires_at": "2026-07-08T00:00:00Z"
+                    }
+                ]
+            }
+        }));
+
+        assert_eq!(usage.reset_credits_available_count, Some(2));
+        assert_eq!(usage.reset_credits.len(), 1);
+        assert_eq!(usage.reset_credits[0].id, "cred_1");
+        assert_eq!(usage.reset_credits[0].expires_at, "2026-07-08T00:00:00Z");
     }
 
     #[test]
@@ -1071,7 +1346,10 @@ mod tests {
             }
         }));
 
-        assert_eq!(usage.credits_balance, None, "has_credits=false must suppress balance");
+        assert_eq!(
+            usage.credits_balance, None,
+            "has_credits=false must suppress balance"
+        );
         assert_eq!(usage.plan_type.as_deref(), Some("plus"));
     }
 
@@ -1108,8 +1386,14 @@ mod tests {
             }
         }));
 
-        assert!(usage.primary.is_none(), "free account must have no 5h window");
-        assert!(usage.secondary.is_some(), "free account 7d data must be in secondary");
+        assert!(
+            usage.primary.is_none(),
+            "free account must have no 5h window"
+        );
+        assert!(
+            usage.secondary.is_some(),
+            "free account 7d data must be in secondary"
+        );
         assert_eq!(
             usage.secondary.as_ref().and_then(|w| w.used_percent),
             Some(100.0)
@@ -1175,19 +1459,29 @@ mod tests {
         assert!(is_available(&UsageInfo::default()));
     }
 
-
-
     // ── adaptive scoring tests ──
 
-    fn make_candidate(alias: &str, used_5h: f64, reset_5h: Option<i64>, used_7d: f64, reset_7d: Option<i64>) -> Candidate {
+    fn make_candidate(
+        alias: &str,
+        used_5h: f64,
+        reset_5h: Option<i64>,
+        used_7d: f64,
+        reset_7d: Option<i64>,
+    ) -> Candidate {
         Candidate {
             alias: alias.to_string(),
-            used_5h, resets_at_5h: reset_5h,
-            used_7d, resets_at_7d: reset_7d,
-            has_5h_data: true, has_7d_data: true,
-            is_team: false, is_free: false,
-            last_used: 0, now: 1_000_000,
-            pool_size: 5, pool_exhausted: 0,
+            used_5h,
+            resets_at_5h: reset_5h,
+            used_7d,
+            resets_at_7d: reset_7d,
+            has_5h_data: true,
+            has_7d_data: true,
+            is_team: false,
+            is_free: false,
+            last_used: 0,
+            now: 1_000_000,
+            pool_size: 5,
+            pool_exhausted: 0,
             team_priority: true,
         }
     }
@@ -1209,7 +1503,10 @@ mod tests {
         b.is_team = true;
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
-        assert!(sb > sa, "team account should beat non-team even with worse 5h: {sb} > {sa}");
+        assert!(
+            sb > sa,
+            "team account should beat non-team even with worse 5h: {sb} > {sa}"
+        );
     }
 
     #[test]
@@ -1223,7 +1520,10 @@ mod tests {
         b.team_priority = false;
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
-        assert!(sa > sb, "without team_priority, more remaining should win: {sa} > {sb}");
+        assert!(
+            sa > sb,
+            "without team_priority, more remaining should win: {sa} > {sb}"
+        );
     }
 
     #[test]
@@ -1235,7 +1535,10 @@ mod tests {
         let b = make_candidate("b", 40.0, Some(now + 14400), 20.0, Some(now + 5 * 86400));
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
-        assert!(sa > sb, "near-reset account should score higher due to drain: {sa} > {sb}");
+        assert!(
+            sa > sb,
+            "near-reset account should score higher due to drain: {sa} > {sb}"
+        );
     }
 
     #[test]
@@ -1248,7 +1551,10 @@ mod tests {
         let b = make_candidate("b", 40.0, Some(now + 14400), 20.0, Some(now + 5 * 86400));
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
-        assert!(sa > 1000.0 && sb > 1000.0, "both should be usable: {sa}, {sb}");
+        assert!(
+            sa > 1000.0 && sb > 1000.0,
+            "both should be usable: {sa}, {sb}"
+        );
         // A consumed 40% over 3h (lower burn rate) → more projected headroom
         assert!(sa > sb, "lower burn rate gives more headroom: {sa} > {sb}");
     }
@@ -1258,7 +1564,10 @@ mod tests {
         let now = 1_000_000i64;
         let a = make_candidate("a", 0.0, Some(now + 18000), 95.0, Some(now + 6 * 86400));
         let b = make_candidate("b", 50.0, Some(now + 7200), 30.0, Some(now + 5 * 86400));
-        assert!(score_unified(&b, 20.0) > score_unified(&a, 20.0), "7d-critical should lose");
+        assert!(
+            score_unified(&b, 20.0) > score_unified(&a, 20.0),
+            "7d-critical should lose"
+        );
     }
 
     #[test]
@@ -1270,7 +1579,10 @@ mod tests {
         let b = make_candidate("b", 30.0, Some(now + 3600), 85.0, Some(now + 5 * 3600));
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
-        assert!(sb > sa, "higher budget-per-window should score better: {sb} > {sa}");
+        assert!(
+            sb > sa,
+            "higher budget-per-window should score better: {sb} > {sa}"
+        );
     }
 
     #[test]
@@ -1280,7 +1592,10 @@ mod tests {
         a.last_used = now - 5; // used 5 seconds ago
         let mut b = make_candidate("b", 40.0, Some(now + 3600), 20.0, Some(now + 5 * 86400));
         b.last_used = now - 1200; // used 20 minutes ago
-        assert!(score_unified(&b, 20.0) > score_unified(&a, 20.0), "recently-used should score lower");
+        assert!(
+            score_unified(&b, 20.0) > score_unified(&a, 20.0),
+            "recently-used should score lower"
+        );
     }
 
     #[test]
@@ -1288,7 +1603,10 @@ mod tests {
         let now = 1_000_000i64;
         let a = make_candidate("a", 80.0, Some(now - 600), 20.0, Some(now + 5 * 86400));
         let score = score_unified(&a, 20.0);
-        assert!(score > 1000.0, "past-reset account should score as fully available, got {score}");
+        assert!(
+            score > 1000.0,
+            "past-reset account should score as fully available, got {score}"
+        );
     }
 
     #[test]
@@ -1330,16 +1648,26 @@ mod tests {
     fn test_adaptive_no_data_low_score() {
         let c = Candidate {
             alias: "unknown".to_string(),
-            used_5h: 0.0, resets_at_5h: None,
-            used_7d: 0.0, resets_at_7d: None,
-            has_5h_data: false, has_7d_data: false,
-            is_team: false, is_free: false,
-            last_used: 0, now: 1_000_000,
-            pool_size: 1, pool_exhausted: 0,
+            used_5h: 0.0,
+            resets_at_5h: None,
+            used_7d: 0.0,
+            resets_at_7d: None,
+            has_5h_data: false,
+            has_7d_data: false,
+            is_team: false,
+            is_free: false,
+            last_used: 0,
+            now: 1_000_000,
+            pool_size: 1,
+            pool_exhausted: 0,
             team_priority: true,
         };
         // headroom=50 (no 5h data) + sustain=-50 (no 7d data) = 0
-        assert_eq!(score_unified(&c, 20.0), 0.0, "no-data account should score exactly 0");
+        assert_eq!(
+            score_unified(&c, 20.0),
+            0.0,
+            "no-data account should score exactly 0"
+        );
     }
 
     #[test]
@@ -1351,7 +1679,10 @@ mod tests {
         c.has_7d_data = true;
         let s = score_unified(&c, 20.0);
         // headroom=0 (exhausted, no reset), sustain should still be heavily negative
-        assert!(s < -700.0, "doubly-exhausted account must score very low, got {s}");
+        assert!(
+            s < -700.0,
+            "doubly-exhausted account must score very low, got {s}"
+        );
     }
 
     #[test]
@@ -1359,16 +1690,25 @@ mod tests {
         // Worst case: both exhausted, no reset info at all
         let c = Candidate {
             alias: "dead".to_string(),
-            used_5h: 100.0, resets_at_5h: None,
-            used_7d: 100.0, resets_at_7d: None,
-            has_5h_data: true, has_7d_data: true,
-            is_team: false, is_free: false,
-            last_used: 0, now: 1_000_000,
-            pool_size: 1, pool_exhausted: 1,
+            used_5h: 100.0,
+            resets_at_5h: None,
+            used_7d: 100.0,
+            resets_at_7d: None,
+            has_5h_data: true,
+            has_7d_data: true,
+            is_team: false,
+            is_free: false,
+            last_used: 0,
+            now: 1_000_000,
+            pool_size: 1,
+            pool_exhausted: 1,
             team_priority: false,
         };
         let s = score_unified(&c, 20.0);
-        assert!(s < -700.0, "doubly-exhausted no-reset account must score very low, got {s}");
+        assert!(
+            s < -700.0,
+            "doubly-exhausted no-reset account must score very low, got {s}"
+        );
     }
 
     #[test]
@@ -1383,7 +1723,10 @@ mod tests {
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
         // B has slower burn rate → higher projected exhaustion → higher headroom
-        assert!(sb > sa, "slower burn rate should give higher headroom: {sb} > {sa}");
+        assert!(
+            sb > sa,
+            "slower burn rate should give higher headroom: {sb} > {sa}"
+        );
     }
 
     #[test]

@@ -51,6 +51,10 @@ impl MockServer {
 
         let app = Router::new()
             .route("/backend-api/wham/usage", get(usage_handler))
+            .route(
+                "/backend-api/wham/rate-limit-reset-credits",
+                get(reset_credits_handler),
+            )
             .route("/oauth/token", post(token_handler))
             .with_state(state);
 
@@ -76,6 +80,14 @@ impl MockServer {
         format!("http://{}/backend-api/wham/usage", self.addr)
     }
 
+    /// The reset credits URL for setting CS_RESET_CREDITS_URL.
+    pub fn reset_credits_url(&self) -> String {
+        format!(
+            "http://{}/backend-api/wham/rate-limit-reset-credits",
+            self.addr
+        )
+    }
+
     /// The base URL for setting CS_TOKEN_URL.
     pub fn token_url(&self) -> String {
         format!("http://{}/oauth/token", self.addr)
@@ -95,6 +107,43 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
         .ok()?
         .strip_prefix("Bearer ")
         .map(|s| s.to_string())
+}
+
+/// GET /backend-api/wham/rate-limit-reset-credits handler.
+async fn reset_credits_handler(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let token = match extract_bearer(&headers) {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, "Missing Bearer token").into_response(),
+    };
+
+    let map = state.lock().unwrap();
+    if !map.contains_key(&token) {
+        return (StatusCode::UNAUTHORIZED, format!("Unknown token: {token}")).into_response();
+    }
+
+    axum::Json(json!({
+        "available_count": 2,
+        "credits": [
+            {
+                "id": "reset_credit_1",
+                "reset_type": "codex_rate_limits",
+                "status": "available",
+                "granted_at": "2026-07-01T00:00:00Z",
+                "expires_at": "2026-07-08T00:00:00Z"
+            },
+            {
+                "id": "reset_credit_2",
+                "reset_type": "codex_rate_limits",
+                "status": "available",
+                "granted_at": "2026-07-01T00:00:00Z",
+                "expires_at": "2026-07-09T00:00:00Z"
+            }
+        ]
+    }))
+    .into_response()
 }
 
 /// GET /backend-api/wham/usage handler.

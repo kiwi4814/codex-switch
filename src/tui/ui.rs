@@ -9,23 +9,26 @@ use ratatui::{
 use super::app::{App, UsageStatus};
 use super::keymap;
 use super::popup;
-use crate::output::{format_local_time, format_reset_short, format_reset_time};
+use crate::output::{
+    format_local_time, format_reset_short, format_reset_time, reset_credits_count,
+    reset_credits_detail_lines, reset_credits_expiry_table,
+};
 use crate::usage::{UsageInfo, is_available};
 
 // ── RGB-only color palette ───────────────────────────────
 // All colors are explicit RGB to avoid mixing ANSI-16 + 24-bit,
 // which causes rendering glitches on Windows conhost (cmd.exe / PowerShell).
 
-const BG: Color = Color::Rgb(24, 24, 24);        // near-black background
+const BG: Color = Color::Rgb(24, 24, 24); // near-black background
 const C_WHITE: Color = Color::Rgb(240, 240, 240); // primary text
-const C_GRAY: Color = Color::Rgb(180, 180, 180);  // secondary text
-const DIM: Color = Color::Rgb(120, 120, 120);     // dim labels / placeholders
-const C_RED: Color = Color::Rgb(255, 90, 90);     // errors, warnings
-const C_GREEN: Color = Color::Rgb(80, 220, 120);  // OK, active
+const C_GRAY: Color = Color::Rgb(180, 180, 180); // secondary text
+const DIM: Color = Color::Rgb(120, 120, 120); // dim labels / placeholders
+const C_RED: Color = Color::Rgb(255, 90, 90); // errors, warnings
+const C_GREEN: Color = Color::Rgb(80, 220, 120); // OK, active
 const C_YELLOW: Color = Color::Rgb(255, 220, 80); // keys, markers
-const C_CYAN: Color = Color::Rgb(100, 210, 255);  // headers, prompts
+const C_CYAN: Color = Color::Rgb(100, 210, 255); // headers, prompts
 const C_MAGENTA: Color = Color::Rgb(220, 130, 255); // team plans
-const C_BLUE: Color = Color::Rgb(80, 140, 220);   // borders (inactive)
+const C_BLUE: Color = Color::Rgb(80, 140, 220); // borders (inactive)
 const C_HIGHLIGHT_BG: Color = Color::Rgb(55, 55, 65); // selected row bg
 
 fn base() -> Style {
@@ -43,8 +46,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(6),                    // account list
-            Constraint::Length(9),                  // detail panel
+            Constraint::Min(6),                       // account list
+            Constraint::Length(10),                   // detail panel
             Constraint::Length(status_height as u16), // status bar
         ])
         .split(area);
@@ -82,7 +85,10 @@ fn render_help_popup(f: &mut Frame, state: &mut popup::PopupState, area: ratatui
         if i > 0 {
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(Span::styled((*heading).to_string(), heading_style)));
+        lines.push(Line::from(Span::styled(
+            (*heading).to_string(),
+            heading_style,
+        )));
         for (k, label) in items {
             let pad = key_col.saturating_sub(display_width(k));
             let mut spans: Vec<Span<'static>> = Vec::new();
@@ -118,9 +124,15 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
             .style(base());
         let hint = Paragraph::new(Line::from(vec![
             Span::styled("No accounts yet. Press ", Style::default().fg(DIM)),
-            Span::styled("a", Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "a",
+                Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" to add one, or ", Style::default().fg(DIM)),
-            Span::styled("q", Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "q",
+                Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" to quit.", Style::default().fg(DIM)),
         ]))
         .block(block)
@@ -129,9 +141,7 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let hdr = base()
-        .fg(C_CYAN)
-        .add_modifier(Modifier::BOLD);
+    let hdr = base().fg(C_CYAN).add_modifier(Modifier::BOLD);
     let header = Row::new(vec![
         Cell::from(" ").style(base().fg(DIM)),
         Cell::from("Alias").style(hdr),
@@ -142,6 +152,8 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
         Cell::from("7d").style(hdr),
         Cell::from("5h Reset").style(hdr),
         Cell::from("7d Reset").style(hdr),
+        Cell::from("Cards").style(hdr),
+        Cell::from("Card Exp").style(hdr),
     ])
     .height(1);
 
@@ -160,22 +172,16 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 " "
             };
             let marker_style = if is_marked {
-                base()
-                    .fg(C_YELLOW)
-                    .add_modifier(Modifier::BOLD)
+                base().fg(C_YELLOW).add_modifier(Modifier::BOLD)
             } else if entry.is_current {
-                base()
-                    .fg(C_GREEN)
-                    .add_modifier(Modifier::BOLD)
+                base().fg(C_GREEN).add_modifier(Modifier::BOLD)
             } else {
                 base()
             };
 
             let is_selected = view_i == app.selected;
             let row_style = if is_selected {
-                base()
-                    .fg(C_WHITE)
-                    .add_modifier(Modifier::BOLD)
+                base().fg(C_WHITE).add_modifier(Modifier::BOLD)
             } else {
                 base().fg(C_GRAY)
             };
@@ -201,12 +207,33 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 reset_5h_color,
                 reset_7d,
                 reset_7d_color,
-            ): (String, Color, String, String, String, Color, String, Color) = match &entry.usage {
+                reset_cards,
+                reset_cards_color,
+                reset_card_expiry,
+                reset_card_expiry_color,
+            ): (
+                String,
+                Color,
+                String,
+                String,
+                String,
+                Color,
+                String,
+                Color,
+                String,
+                Color,
+                String,
+                Color,
+            ) = match &entry.usage {
                 UsageStatus::Idle => (
                     "--".into(),
                     DIM,
                     "--".into(),
                     "--".into(),
+                    "--".into(),
+                    DIM,
+                    "--".into(),
+                    DIM,
                     "--".into(),
                     DIM,
                     "--".into(),
@@ -221,6 +248,10 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                     DIM,
                     "loading".into(),
                     DIM,
+                    "...".into(),
+                    C_YELLOW,
+                    "loading".into(),
+                    DIM,
                 ),
                 UsageStatus::Error(_) => (
                     "Error".into(),
@@ -229,6 +260,10 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                     "Err".into(),
                     "--".into(),
                     DIM,
+                    "--".into(),
+                    DIM,
+                    "Err".into(),
+                    C_RED,
                     "--".into(),
                     DIM,
                 ),
@@ -267,18 +302,44 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                         .unwrap_or_else(|| "--".into());
                     let r5_ts = u.primary.as_ref().and_then(|w| w.resets_at);
                     let r5 = r5_ts.map(format_reset_short).unwrap_or_else(|| "--".into());
-                    let r5c = r5_ts
-                        .map(|ts| reset_color(ts - now))
-                        .unwrap_or(DIM);
+                    let r5c = r5_ts.map(|ts| reset_color(ts - now)).unwrap_or(DIM);
                     let r7_ts = u.secondary.as_ref().and_then(|w| w.resets_at);
                     let r7 = r7_ts.map(format_reset_short).unwrap_or_else(|| "--".into());
-                    let r7c = r7_ts
-                        .map(|ts| reset_color(ts - now))
-                        .unwrap_or(DIM);
+                    let r7c = r7_ts.map(|ts| reset_color(ts - now)).unwrap_or(DIM);
+                    let cards = reset_cards_table_text(u);
+                    let cards_color = reset_cards_color(u);
+                    let card_expiry = reset_credits_expiry_table(u);
+                    let card_expiry_color = reset_card_expiry_color(u);
                     if is_available(u) {
-                        ("OK".into(), C_GREEN, p5, p7, r5, r5c, r7, r7c)
+                        (
+                            "OK".into(),
+                            C_GREEN,
+                            p5,
+                            p7,
+                            r5,
+                            r5c,
+                            r7,
+                            r7c,
+                            cards,
+                            cards_color,
+                            card_expiry,
+                            card_expiry_color,
+                        )
                     } else {
-                        ("Limited".into(), C_RED, p5, p7, r5, r5c, r7, r7c)
+                        (
+                            "Limited".into(),
+                            C_RED,
+                            p5,
+                            p7,
+                            r5,
+                            r5c,
+                            r7,
+                            r7c,
+                            cards,
+                            cards_color,
+                            card_expiry,
+                            card_expiry_color,
+                        )
                     }
                 }
             };
@@ -299,6 +360,8 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(pct_7d.clone()).style(usage_pct_style(&pct_7d, is_selected)),
                 Cell::from(reset_5h).style(base().fg(reset_5h_color)),
                 Cell::from(reset_7d).style(base().fg(reset_7d_color)),
+                Cell::from(reset_cards).style(base().fg(reset_cards_color)),
+                Cell::from(reset_card_expiry).style(base().fg(reset_card_expiry_color)),
             ])
             .height(1)
         })
@@ -341,8 +404,10 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(8),  // status
             Constraint::Length(6),  // 5h %
             Constraint::Length(6),  // 7d %
-            Constraint::Length(14), // 5h reset
-            Constraint::Length(14), // 7d reset
+            Constraint::Length(12), // 5h reset
+            Constraint::Length(12), // 7d reset
+            Constraint::Length(7),  // reset cards
+            Constraint::Length(12), // reset card expiry
         ],
     )
     .header(header)
@@ -381,11 +446,7 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(base().fg(if entry.is_current {
-            C_GREEN
-        } else {
-            C_BLUE
-        }))
+        .border_style(base().fg(if entry.is_current { C_GREEN } else { C_BLUE }))
         .style(base());
 
     let inner = block.inner(area);
@@ -417,10 +478,7 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(email, base().fg(C_WHITE)),
         Span::styled("  ", base()),
         Span::styled("Plan ", base().fg(DIM)),
-        Span::styled(
-            &plan_label,
-            plan_color(effective_plan_popup, true),
-        ),
+        Span::styled(&plan_label, plan_color(effective_plan_popup, true)),
         Span::styled("  ", base()),
         Span::styled("ID ", base().fg(DIM)),
         Span::styled(
@@ -437,8 +495,7 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
     // Usage area
     match &entry.usage {
         UsageStatus::Idle => {
-            let p = Paragraph::new("Press r to refresh usage")
-                .style(base().fg(DIM));
+            let p = Paragraph::new("Press r to refresh usage").style(base().fg(DIM));
             f.render_widget(p, layout[2]);
         }
         UsageStatus::Loading => {
@@ -446,8 +503,7 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(p, layout[2]);
         }
         UsageStatus::Error(e) => {
-            let p = Paragraph::new(format!("Error: {}", e.detail))
-                .style(base().fg(C_RED));
+            let p = Paragraph::new(format!("Error: {}", e.detail)).style(base().fg(C_RED));
             f.render_widget(p, layout[2]);
         }
         UsageStatus::Loaded(u) => {
@@ -467,6 +523,9 @@ fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
         constraints.push(Constraint::Length(2));
     }
     if has_credits {
+        constraints.push(Constraint::Length(1));
+    }
+    if has_reset_credits(u) {
         constraints.push(Constraint::Length(1));
     }
     if constraints.is_empty() {
@@ -499,35 +558,71 @@ fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
         };
         let p = Paragraph::new(text).style(base().fg(credits_color(balance, unlimited)));
         f.render_widget(p, layout[idx]);
+        idx += 1;
     }
 
-    if u.primary.is_none() && u.secondary.is_none() && !has_credits {
+    if has_reset_credits(u) {
+        let p = Paragraph::new(reset_credits_text(u)).style(base().fg(DIM));
+        f.render_widget(p, layout[idx]);
+    }
+
+    if u.primary.is_none() && u.secondary.is_none() && !has_credits && !has_reset_credits(u) {
         let p = Paragraph::new("No usage data").style(base().fg(DIM));
         f.render_widget(p, layout[0]);
     }
+}
+
+fn has_reset_credits(u: &UsageInfo) -> bool {
+    u.reset_credits_available_count.is_some()
+        || !u.reset_credits.is_empty()
+        || u.reset_credits_error.is_some()
+}
+
+fn reset_cards_table_text(u: &UsageInfo) -> String {
+    reset_credits_count(u)
+        .map(|count| count.to_string())
+        .or_else(|| u.reset_credits_error.as_ref().map(|_| "err".to_string()))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+fn reset_cards_color(u: &UsageInfo) -> Color {
+    match reset_credits_count(u) {
+        Some(0) => DIM,
+        Some(_) => C_GREEN,
+        None if u.reset_credits_error.is_some() => C_YELLOW,
+        None => DIM,
+    }
+}
+
+fn reset_card_expiry_color(u: &UsageInfo) -> Color {
+    if !u.reset_credits.is_empty() {
+        C_CYAN
+    } else if u.reset_credits_error.is_some() {
+        C_YELLOW
+    } else {
+        DIM
+    }
+}
+
+fn reset_credits_text(u: &UsageInfo) -> String {
+    let lines = reset_credits_detail_lines(u, 2);
+    if !lines.is_empty() {
+        return lines.join("  ");
+    }
+    if let Some(err) = &u.reset_credits_error {
+        return format!("reset cards: --  expiry unavailable: {err}");
+    }
+    "reset cards: --".to_string()
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     // Rename input takes top priority
     if let Some(rs) = &app.rename {
         let line = Line::from(vec![
-            Span::styled(
-                " Rename: ",
-                base()
-                    .fg(C_CYAN)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                &rs.input,
-                base()
-                    .fg(C_WHITE)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(" Rename: ", base().fg(C_CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(&rs.input, base().fg(C_WHITE).add_modifier(Modifier::BOLD)),
             Span::styled("#", base().fg(C_GRAY)),
-            Span::styled(
-                "  (Enter confirm / Esc cancel)",
-                base().fg(DIM),
-            ),
+            Span::styled("  (Enter confirm / Esc cancel)", base().fg(DIM)),
         ]);
         f.render_widget(Paragraph::new(line).style(base()), area);
         return;
@@ -555,23 +650,10 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         && let Some(s) = &app.search
     {
         let line = Line::from(vec![
-            Span::styled(
-                " /",
-                base()
-                    .fg(C_CYAN)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                &s.query,
-                base()
-                    .fg(C_WHITE)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(" /", base().fg(C_CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(&s.query, base().fg(C_WHITE).add_modifier(Modifier::BOLD)),
             Span::styled("#", base().fg(C_GRAY)),
-            Span::styled(
-                "  (Enter accept / Esc clear)",
-                base().fg(DIM),
-            ),
+            Span::styled("  (Enter accept / Esc clear)", base().fg(DIM)),
         ]);
         f.render_widget(Paragraph::new(line).style(base()), area);
         return;
@@ -622,7 +704,10 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             width: ver_width as u16,
             height: 1,
         };
-        f.render_widget(Paragraph::new(Line::from(ver_spans)).style(base()), ver_area);
+        f.render_widget(
+            Paragraph::new(Line::from(ver_spans)).style(base()),
+            ver_area,
+        );
     }
 }
 
@@ -662,13 +747,15 @@ fn render_usage_gauge(
     };
     let used_style = base().fg(used_color);
     let remaining_style = base().fg(remaining_color(remaining_pct));
-    let pace_style = base()
-        .fg(C_WHITE)
-        .add_modifier(Modifier::BOLD);
+    let pace_style = base().fg(C_WHITE).add_modifier(Modifier::BOLD);
 
     // L2: if bar_width is 0 (extremely narrow terminal), skip bar rendering entirely
     if bar_width == 0 {
-        let reset_area = Rect { y: area.y + 1, height: 1, ..area };
+        let reset_area = Rect {
+            y: area.y + 1,
+            height: 1,
+            ..area
+        };
         let reset_text = format!("resets in {reset_str}");
         f.render_widget(
             Paragraph::new(reset_text).style(base().fg(reset_color(remaining_secs))),
@@ -712,7 +799,10 @@ fn render_usage_gauge(
             spans.push(Span::styled("█".repeat(used_pos), used_style));
         }
         if bar_width > used_pos {
-            spans.push(Span::styled("░".repeat(bar_width - used_pos), remaining_style));
+            spans.push(Span::styled(
+                "░".repeat(bar_width - used_pos),
+                remaining_style,
+            ));
         }
     }
 
@@ -876,8 +966,14 @@ fn build_help_lines(width: usize) -> Vec<Line<'static>> {
         let key_disp = (*k).to_string();
         let label_short = short_label(label);
         let sep = " \u{2502} ";
-        let item_len = key_disp.chars().count() + 1 + label_short.chars().count()
-            + if i + 1 < items.len() { sep.chars().count() } else { 0 };
+        let item_len = key_disp.chars().count()
+            + 1
+            + label_short.chars().count()
+            + if i + 1 < items.len() {
+                sep.chars().count()
+            } else {
+                0
+            };
         if used + item_len > width && used > 1 {
             lines.push(Line::from(spans));
             spans = vec![Span::styled(" ", space_style)];

@@ -1,6 +1,6 @@
 [package]
 name = "codex-switch"
-version = "0.0.19"
+version = "0.0.20"
 edition = "2024"
 rust-version = "1.88"
 description = "Codex account switcher — multi-profile manager with usage dashboard"
@@ -41,7 +41,7 @@ crossterm = "0.29"
 urlencoding = "2"
 toml = "1"
 rand = "0.10"
-fs4 = "0.12"
+fs4 = "1.1.0"
 chrono = { version = "0.4", features = ["clock"] }
 supports-color = "3"
 owo-colors = "4"
