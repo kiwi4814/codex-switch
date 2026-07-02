@@ -67,7 +67,22 @@ pub fn process_alive(pid: u32) -> bool {
         let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
         ret == 0
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        let Ok(output) = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let quoted_pid = format!("\"{pid}\",");
+        stdout.lines().any(|line| line.starts_with(&quoted_pid))
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         let _ = pid;
         false
@@ -86,10 +101,23 @@ pub fn send_sigterm(pid: u32) -> Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if stderr.is_empty() { stdout } else { stderr };
+            anyhow::bail!("Failed to stop PID {pid}: {detail}");
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         let _ = pid;
-        anyhow::bail!("Stopping daemon is only supported on Unix; use Task Manager on Windows");
+        anyhow::bail!("Stopping daemon is not supported on this platform");
     }
 }
 

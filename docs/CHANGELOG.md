@@ -6,6 +6,7 @@
 
 - **Daemon status diagnostics JSON** — `codex-switch --json daemon status` now reports running state, PID, PID file path, stale PID cleanup status, and the active daemon config summary for scriptable diagnostics.
 - **Daemon background cache refresh** — The Beta daemon now refreshes all saved profile usage into `cache.json` on `daemon.cache_refresh_interval_secs` (default 300s), and can optionally warm up inactive quota windows when `daemon.auto_warmup = true`.
+- **Windows daemon service support** — `daemon install|uninstall` now uses Windows Task Scheduler (`schtasks.exe`) with an on-logon trigger, while `daemon start|stop|status` can manage Windows daemon processes through the shared PID file.
 
 ## v0.0.20 — 2026-07-02
 

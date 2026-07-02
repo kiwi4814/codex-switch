@@ -245,6 +245,7 @@ async fn daemon_start_switch_status_and_stop() {
             .as_str()
             .is_some()
     );
+    assert_eq!(status_json["platform"]["service_installed"], false);
     assert_eq!(status_json["config"]["cache_refresh_interval_secs"], 1);
     assert_eq!(status_json["config"]["auto_warmup"], false);
     assert_eq!(status_json["config"]["switch_threshold"], 50.0);

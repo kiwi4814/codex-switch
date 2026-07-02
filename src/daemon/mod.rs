@@ -18,15 +18,12 @@ pub async fn dispatch(cmd: DaemonCommand, json: bool) -> Result<()> {
 }
 
 async fn start(foreground: bool) -> Result<()> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         let _ = foreground;
-        anyhow::bail!(
-            "The background daemon is only supported on Unix (macOS/Linux). \
-             On Windows, run codex-switch commands directly or use Task Scheduler."
-        );
+        anyhow::bail!("The background daemon is not supported on this platform.");
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "windows"))]
     {
         if pidfile::is_daemon_running() {
             anyhow::bail!(
@@ -37,14 +34,16 @@ async fn start(foreground: bool) -> Result<()> {
         // Clean up stale PID file before starting
         pidfile::cleanup_pidfile()?;
         if foreground {
-            run_foreground().await
-        } else {
-            start_detached()
+            return run_foreground().await;
         }
+        #[cfg(target_os = "windows")]
+        if service::is_installed() {
+            return service::start_installed();
+        }
+        start_detached()
     }
 }
 
-#[cfg(unix)]
 async fn run_foreground() -> Result<()> {
     pidfile::write_pidfile_exclusive()?;
     // RAII guard ensures PID file is cleaned up even on panic
@@ -53,7 +52,6 @@ async fn run_foreground() -> Result<()> {
     loop_runner::run_daemon_loop().await
 }
 
-#[cfg(unix)]
 fn start_detached() -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut child = std::process::Command::new(exe)
@@ -89,6 +87,19 @@ fn start_detached() -> Result<()> {
 }
 
 fn stop() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    if service::is_installed() {
+        match service::stop_installed() {
+            Ok(()) => {
+                let _ = pidfile::cleanup_pidfile();
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::warn!("Failed to stop Windows scheduled task: {err}");
+            }
+        }
+    }
+
     let pid = pidfile::read_pidfile()
         .ok_or_else(|| anyhow::anyhow!("No daemon PID file found; daemon may not be running"))?;
     if !pidfile::process_alive(pid) {
@@ -97,6 +108,10 @@ fn stop() -> Result<()> {
         return Ok(());
     }
     pidfile::send_sigterm(pid)?;
+    #[cfg(target_os = "windows")]
+    {
+        let _ = pidfile::cleanup_pidfile();
+    }
     user_println(&format!("Sent stop signal to daemon (PID {pid})"));
     Ok(())
 }
@@ -121,9 +136,10 @@ fn status(json: bool) -> Result<()> {
             "stale_pid_cleaned": state == "stale",
             "platform": {
                 "os": std::env::consts::OS,
-                "daemon_start_supported": cfg!(unix),
-                "service_install_supported": cfg!(any(target_os = "macos", target_os = "linux")),
+                "daemon_start_supported": cfg!(any(unix, target_os = "windows")),
+                "service_install_supported": cfg!(any(target_os = "macos", target_os = "linux", target_os = "windows")),
                 "service_manager": service_manager_name(),
+                "service_installed": service::is_installed(),
             },
             "config": {
                 "poll_interval_secs": cfg.daemon.poll_interval_secs,
@@ -141,7 +157,7 @@ fn status(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "windows"))]
     {
         match (pid, running) {
             (Some(pid), true) => {
@@ -156,7 +172,7 @@ fn status(json: bool) -> Result<()> {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         user_println(&format!(
             "Daemon is not supported on this platform ({})",
@@ -177,7 +193,7 @@ fn service_manager_name() -> &'static str {
     }
     #[cfg(target_os = "windows")]
     {
-        "unsupported"
+        "task-scheduler"
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
