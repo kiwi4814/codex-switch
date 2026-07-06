@@ -420,6 +420,38 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
 
         // Check for error response
         if let Some(err) = body.get("error") {
+            // Handle OAuth standard format: {"error": "string_code", "error_description": "..."}
+            if let Some(code_str) = err.as_str() {
+                match code_str {
+                    "authorization_pending" | "deviceauth_authorization_unknown" => continue,
+                    "slow_down" => {
+                        interval_secs = interval_secs.saturating_add(5);
+                        continue;
+                    }
+                    "expired_token" | "deviceauth_expired" => {
+                        user_println("");
+                        bail!("Device code expired. Please try again.");
+                    }
+                    "access_denied" => {
+                        user_println("");
+                        bail!("Authorization was denied by the user.");
+                    }
+                    _ => {
+                        // Unknown error code — may be transient, keep polling
+                        let desc = err
+                            .get("error_description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("");
+                        debug!(
+                            "Device poll: unrecognized error code '{}' (desc: '{}'), retrying",
+                            code_str, desc
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // Handle OpenAI nested format: {"error": {"code": "...", "message": "..."}}
             let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("");
             let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
 
@@ -438,8 +470,13 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
                     bail!("Authorization was denied by the user.");
                 }
                 _ => {
-                    user_println("");
-                    bail!("Device token error: {msg}");
+                    // Unrecognized error code — log and keep polling instead of bailing.
+                    // The API may return transient errors that are safe to retry.
+                    debug!(
+                        "Device poll: unrecognized error code '{}' (msg: '{}'), retrying",
+                        code, msg
+                    );
+                    continue;
                 }
             }
         }
