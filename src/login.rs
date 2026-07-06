@@ -313,6 +313,48 @@ struct DeviceTokenResponse {
     status: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DevicePollErrorAction {
+    Continue,
+    SlowDown,
+    Expired,
+    AccessDenied,
+    RetryUnknown { code: String, message: String },
+}
+
+fn device_poll_error_action(body: &serde_json::Value) -> Option<DevicePollErrorAction> {
+    let err = body.get("error")?;
+
+    let (code, message) = if let Some(code) = err.as_str() {
+        let message = body
+            .get("error_description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        (code, message)
+    } else {
+        let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("");
+        let message = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .or_else(|| err.get("error_description").and_then(|d| d.as_str()))
+            .unwrap_or("");
+        (code, message)
+    };
+
+    Some(match code {
+        "deviceauth_authorization_unknown" | "authorization_pending" => {
+            DevicePollErrorAction::Continue
+        }
+        "slow_down" => DevicePollErrorAction::SlowDown,
+        "expired_token" | "deviceauth_expired" => DevicePollErrorAction::Expired,
+        "access_denied" => DevicePollErrorAction::AccessDenied,
+        _ => DevicePollErrorAction::RetryUnknown {
+            code: code.to_string(),
+            message: message.to_string(),
+        },
+    })
+}
+
 /// Run Device Code Flow: request code → display to user → poll for token
 pub async fn run_device_code_auth() -> Result<LoginTokens> {
     let client = crate::auth::build_http_client()?;
@@ -418,28 +460,27 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
         let log_body = redacted_device_poll_log_body(&body);
         debug!("Device poll response: {log_body}");
 
-        // Check for error response
-        if let Some(err) = body.get("error") {
-            let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("");
-            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
-
-            match code {
-                "deviceauth_authorization_unknown" | "authorization_pending" => continue,
-                "slow_down" => {
+        if let Some(action) = device_poll_error_action(&body) {
+            match action {
+                DevicePollErrorAction::Continue => continue,
+                DevicePollErrorAction::SlowDown => {
                     interval_secs = interval_secs.saturating_add(5);
                     continue;
                 }
-                "expired_token" | "deviceauth_expired" => {
+                DevicePollErrorAction::Expired => {
                     user_println("");
                     bail!("Device code expired. Please try again.");
                 }
-                "access_denied" => {
+                DevicePollErrorAction::AccessDenied => {
                     user_println("");
                     bail!("Authorization was denied by the user.");
                 }
-                _ => {
-                    user_println("");
-                    bail!("Device token error: {msg}");
+                DevicePollErrorAction::RetryUnknown { code, message } => {
+                    debug!(
+                        "Device poll: unrecognized error code '{}' (message: '{}'), retrying",
+                        code, message
+                    );
+                    continue;
                 }
             }
         }
@@ -665,5 +706,62 @@ mod tests {
         assert_eq!(redacted["refresh_token"], "***");
         assert_eq!(redacted["id_token"], "***");
         assert_eq!(redacted["status"], "ok");
+    }
+
+    #[test]
+    fn test_device_poll_error_action_accepts_oauth_standard_pending() {
+        let body = serde_json::json!({
+            "error": "authorization_pending",
+            "error_description": "authorization is still pending",
+        });
+
+        assert_eq!(
+            device_poll_error_action(&body),
+            Some(DevicePollErrorAction::Continue)
+        );
+    }
+
+    #[test]
+    fn test_device_poll_error_action_keeps_nested_pending() {
+        let body = serde_json::json!({
+            "error": {
+                "code": "deviceauth_authorization_unknown",
+                "message": "authorization is still pending",
+            },
+        });
+
+        assert_eq!(
+            device_poll_error_action(&body),
+            Some(DevicePollErrorAction::Continue)
+        );
+    }
+
+    #[test]
+    fn test_device_poll_error_action_handles_standard_slow_down() {
+        let body = serde_json::json!({
+            "error": "slow_down",
+            "error_description": "poll less frequently",
+        });
+
+        assert_eq!(
+            device_poll_error_action(&body),
+            Some(DevicePollErrorAction::SlowDown)
+        );
+    }
+
+    #[test]
+    fn test_device_poll_error_action_retries_unknown_errors() {
+        let body = serde_json::json!({
+            "error": "temporarily_unavailable",
+            "error_description": "try again later",
+        });
+
+        assert_eq!(
+            device_poll_error_action(&body),
+            Some(DevicePollErrorAction::RetryUnknown {
+                code: "temporarily_unavailable".to_string(),
+                message: "try again later".to_string(),
+            })
+        );
     }
 }
