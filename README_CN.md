@@ -211,6 +211,7 @@ codex-switch self-update
 
 - Homebrew 安装不会被程序自行覆盖，请使用 `brew upgrade xjoker/tap/codex-switch`
 - 直装版本会先校验 release 对应的 `.sha256`，再替换当前二进制
+- 如果 Beta daemon 正在运行，`self-update` 会先停止 daemon，替换二进制后再重启；已安装服务会分别使用 macOS LaunchAgent、Linux systemd 用户服务或 Windows Task Scheduler。
 - 使用 `--dev` 安装最新开发版，运行 `self-update`（不带 `--dev`）可退回稳定版
 - Homebrew 用户需先 `brew uninstall codex-switch` 才能使用 `--dev`
 

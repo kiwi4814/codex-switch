@@ -6,6 +6,10 @@ use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
 const WINDOWS_TASK_NAME: &str = r"\codex-switch-daemon";
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_LABEL: &str = "com.codex-switch.daemon";
+#[cfg(target_os = "linux")]
+const SYSTEMD_UNIT_NAME: &str = "codex-switch-daemon";
 
 pub fn install() -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -48,15 +52,37 @@ pub fn is_installed() -> bool {
     }
 }
 
-#[cfg(target_os = "windows")]
 pub fn start_installed() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return start_launchd();
+    #[cfg(target_os = "linux")]
+    return start_systemd();
+    #[cfg(target_os = "windows")]
+    return start_task_scheduler();
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    anyhow::bail!("Service start is not supported on this platform")
+}
+
+pub fn stop_installed() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return stop_launchd();
+    #[cfg(target_os = "linux")]
+    return stop_systemd();
+    #[cfg(target_os = "windows")]
+    return stop_task_scheduler();
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    anyhow::bail!("Service stop is not supported on this platform")
+}
+
+#[cfg(target_os = "windows")]
+fn start_task_scheduler() -> Result<()> {
     schtasks(&["/Run", "/TN", WINDOWS_TASK_NAME], "start scheduled task")?;
     user_println("Started Windows scheduled task");
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-pub fn stop_installed() -> Result<()> {
+fn stop_task_scheduler() -> Result<()> {
     schtasks(&["/End", "/TN", WINDOWS_TASK_NAME], "stop scheduled task")?;
     user_println("Stopped Windows scheduled task");
     Ok(())
@@ -71,21 +97,16 @@ fn plist_path() -> Result<PathBuf> {
     Ok(home.join("Library/LaunchAgents/com.codex-switch.daemon.plist"))
 }
 
-#[cfg(target_os = "macos")]
-fn install_launchd() -> Result<()> {
-    let exe = std::env::current_exe()?.display().to_string();
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-        .display()
-        .to_string();
-    let plist = format!(
+#[cfg(any(target_os = "macos", test))]
+fn launchd_plist(exe: &str, home: &str) -> String {
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.codex-switch.daemon</string>
+    <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
@@ -106,7 +127,18 @@ fn install_launchd() -> Result<()> {
 </plist>"#,
         exe = exe,
         home = home,
-    );
+        label = LAUNCHD_LABEL,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn install_launchd() -> Result<()> {
+    let exe = std::env::current_exe()?.display().to_string();
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
+        .display()
+        .to_string();
+    let plist = launchd_plist(&exe, &home);
 
     let path = plist_path()?;
     if path.exists() {
@@ -126,13 +158,54 @@ fn install_launchd() -> Result<()> {
     }
     std::fs::write(&path, plist)?;
 
+    load_launchd(&path)?;
+    user_println(&format!("Installed LaunchAgent at {}", path.display()));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn load_launchd(path: &std::path::Path) -> Result<()> {
     let status = std::process::Command::new("launchctl")
         .args(["load", &path.display().to_string()])
         .status()?;
     if !status.success() {
         anyhow::bail!("launchctl load failed");
     }
-    user_println(&format!("Installed LaunchAgent at {}", path.display()));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn start_launchd() -> Result<()> {
+    let path = plist_path()?;
+    if !path.exists() {
+        anyhow::bail!("LaunchAgent not installed");
+    }
+    let status = std::process::Command::new("launchctl")
+        .args(["load", &path.display().to_string()])
+        .status()?;
+    if !status.success() {
+        let start_status = std::process::Command::new("launchctl")
+            .args(["start", LAUNCHD_LABEL])
+            .status()?;
+        if !start_status.success() {
+            anyhow::bail!("launchctl load/start failed");
+        }
+    }
+    user_println("Started LaunchAgent");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn stop_launchd() -> Result<()> {
+    let path = plist_path()?;
+    if !path.exists() {
+        user_println("LaunchAgent not installed");
+        return Ok(());
+    }
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", &path.display().to_string()])
+        .status();
+    user_println("Stopped LaunchAgent");
     Ok(())
 }
 
@@ -160,15 +233,9 @@ fn unit_path() -> Result<PathBuf> {
     Ok(home.join(".config/systemd/user/codex-switch-daemon.service"))
 }
 
-#[cfg(target_os = "linux")]
-fn install_systemd() -> Result<()> {
-    let exe = std::env::current_exe()?.display().to_string();
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-        .display()
-        .to_string();
-
-    let unit = format!(
+#[cfg(any(target_os = "linux", test))]
+fn systemd_unit(exe: &str, home: &str) -> String {
+    format!(
         r#"[Unit]
 Description=codex-switch auto-switching daemon
 After=network-online.target
@@ -185,7 +252,18 @@ WantedBy=default.target
 "#,
         exe = exe,
         home = home,
-    );
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn install_systemd() -> Result<()> {
+    let exe = std::env::current_exe()?.display().to_string();
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
+        .display()
+        .to_string();
+
+    let unit = systemd_unit(&exe, &home);
 
     let path = unit_path()?;
     if path.exists() {
@@ -218,6 +296,30 @@ WantedBy=default.target
         "Installed systemd user service at {}",
         path.display()
     ));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn start_systemd() -> Result<()> {
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "start", SYSTEMD_UNIT_NAME])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("systemctl start failed");
+    }
+    user_println("Started systemd user service");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn stop_systemd() -> Result<()> {
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "stop", SYSTEMD_UNIT_NAME])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("systemctl stop failed");
+    }
+    user_println("Stopped systemd user service");
     Ok(())
 }
 
@@ -317,8 +419,26 @@ fn uninstall_task_scheduler() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::task_scheduler_command;
+    use super::{launchd_plist, systemd_unit, task_scheduler_command};
     use std::path::Path;
+
+    #[test]
+    fn launchd_plist_runs_foreground_daemon() {
+        let plist = launchd_plist("/usr/local/bin/codex-switch", "/Users/alice");
+        assert!(plist.contains("<string>/usr/local/bin/codex-switch</string>"));
+        assert!(plist.contains("<string>daemon</string>"));
+        assert!(plist.contains("<string>start</string>"));
+        assert!(plist.contains("<string>--foreground</string>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+    }
+
+    #[test]
+    fn systemd_unit_runs_foreground_daemon() {
+        let unit = systemd_unit("/usr/local/bin/codex-switch", "/home/alice");
+        assert!(unit.contains("ExecStart=/usr/local/bin/codex-switch daemon start --foreground"));
+        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("Environment=HOME=/home/alice"));
+    }
 
     #[test]
     fn windows_task_scheduler_command_quotes_exe_path() {

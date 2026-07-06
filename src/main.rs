@@ -1227,10 +1227,30 @@ async fn self_update_cmd(
     }
 
     let show_progress = !json && update::should_show_download_progress();
-    let result = if use_dev {
-        update::self_update_dev(show_progress).await?
+    let mut daemon_restart = daemon::SelfUpdateDaemonRestart::capture();
+    if daemon_restart.is_needed() {
+        daemon_restart.stop_before_update()?;
+    }
+    let update_result = if use_dev {
+        update::self_update_dev(show_progress).await
     } else {
-        update::self_update(version, show_progress).await?
+        update::self_update(version, show_progress).await
+    };
+    let result = match update_result {
+        Ok(result) => {
+            daemon_restart
+                .restart_after_update()
+                .context("self-update completed, but daemon restart failed")?;
+            result
+        }
+        Err(err) => {
+            if let Err(restart_err) = daemon_restart.restart_after_update() {
+                return Err(err.context(format!(
+                    "self-update failed; additionally failed to restart daemon: {restart_err}"
+                )));
+            }
+            return Err(err);
+        }
     };
 
     if json {

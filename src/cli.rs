@@ -22,7 +22,7 @@ pub enum DaemonCommand {
     Stop,
     /// Show Beta daemon status
     Status,
-    /// Install the Beta daemon as a system service (LaunchAgent on macOS, systemd on Linux)
+    /// Install the Beta daemon as a system service (LaunchAgent on macOS, systemd on Linux, Task Scheduler on Windows)
     Install,
     /// Uninstall the Beta daemon system service
     Uninstall,

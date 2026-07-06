@@ -212,6 +212,7 @@ codex-switch self-update
 
 - Homebrew installs are not self-overwritten. Use `brew upgrade xjoker/tap/codex-switch`.
 - Direct installs verify the release `.sha256` before replacing the current executable.
+- If the Beta daemon is running, `self-update` stops it before replacing the binary and restarts it afterward. Installed services use LaunchAgent, systemd user service, or Windows Task Scheduler as appropriate.
 - Use `--dev` to install the latest dev build. Run `self-update` (without `--dev`) to return to the stable channel.
 - Homebrew users must `brew uninstall codex-switch` before using `--dev`.
 

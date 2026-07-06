@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- **Self-update restarts a running daemon** — `self-update` now stops a running Beta daemon before replacing the binary and restarts it afterward. Installed services use the native manager on all supported platforms: macOS LaunchAgent, Linux systemd user service, and Windows Task Scheduler.
 - **Device login polling compatibility** — `login --device` now handles OAuth standard polling errors such as `authorization_pending` and `slow_down` instead of failing early. Original fix contributed by @WhymustIhaveaname in PR #44; expanded on `dev` with OpenAI nested-error handling, unknown-error retry behavior, and tests.
 - **TUI OAuth output redraw** — TUI add/re-login flows now reset and clear the terminal before and after browser/device OAuth output, preventing long authorization URLs from leaving the TUI visually misaligned when control returns.
 

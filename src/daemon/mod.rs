@@ -36,7 +36,6 @@ async fn start(foreground: bool) -> Result<()> {
         if foreground {
             return run_foreground().await;
         }
-        #[cfg(target_os = "windows")]
         if service::is_installed() {
             return service::start_installed();
         }
@@ -87,19 +86,23 @@ fn start_detached() -> Result<()> {
 }
 
 fn stop() -> Result<()> {
-    #[cfg(target_os = "windows")]
     if service::is_installed() {
         match service::stop_installed() {
             Ok(()) => {
+                wait_until_stopped_or_kill(pidfile::read_pidfile())?;
                 let _ = pidfile::cleanup_pidfile();
                 return Ok(());
             }
             Err(err) => {
-                tracing::warn!("Failed to stop Windows scheduled task: {err}");
+                tracing::warn!("Failed to stop installed daemon service: {err}");
             }
         }
     }
 
+    stop_detached()
+}
+
+fn stop_detached() -> Result<()> {
     let pid = pidfile::read_pidfile()
         .ok_or_else(|| anyhow::anyhow!("No daemon PID file found; daemon may not be running"))?;
     if !pidfile::process_alive(pid) {
@@ -114,6 +117,90 @@ fn stop() -> Result<()> {
     }
     user_println(&format!("Sent stop signal to daemon (PID {pid})"));
     Ok(())
+}
+
+fn wait_until_stopped_or_kill(pid: Option<u32>) -> Result<()> {
+    match wait_until_stopped(pid) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            tracing::warn!(
+                "Daemon still running after service stop, falling back to PID stop: {err}"
+            );
+            stop_detached()?;
+            wait_until_stopped(pid)
+        }
+    }
+}
+
+fn wait_until_stopped(pid: Option<u32>) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let running = match pid.or_else(pidfile::read_pidfile) {
+            Some(pid) => pidfile::process_alive(pid),
+            None => false,
+        };
+        if !running {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("Daemon did not stop within 10s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+pub struct SelfUpdateDaemonRestart {
+    pid: Option<u32>,
+    service_installed: bool,
+    stopped: bool,
+}
+
+impl SelfUpdateDaemonRestart {
+    pub fn capture() -> Self {
+        let pid = pidfile::read_pidfile().filter(|pid| pidfile::process_alive(*pid));
+        Self {
+            pid,
+            service_installed: service::is_installed(),
+            stopped: false,
+        }
+    }
+
+    pub fn is_needed(&self) -> bool {
+        self.pid.is_some()
+    }
+
+    pub fn stop_before_update(&mut self) -> Result<()> {
+        if !self.is_needed() || self.stopped {
+            return Ok(());
+        }
+
+        user_println("Stopping daemon before self-update...");
+        if self.service_installed {
+            service::stop_installed()?;
+            wait_until_stopped_or_kill(self.pid)?;
+            let _ = pidfile::cleanup_pidfile();
+        } else {
+            stop_detached()?;
+            wait_until_stopped(self.pid)?;
+        }
+        self.stopped = true;
+        Ok(())
+    }
+
+    pub fn restart_after_update(&mut self) -> Result<()> {
+        if !self.stopped {
+            return Ok(());
+        }
+
+        user_println("Restarting daemon after self-update...");
+        if self.service_installed {
+            service::start_installed()?;
+        } else {
+            start_detached()?;
+        }
+        self.stopped = false;
+        Ok(())
+    }
 }
 
 fn status(json: bool) -> Result<()> {
