@@ -1358,6 +1358,27 @@ enum OAuthMode {
     Relogin(String),
 }
 
+fn reset_plain_terminal_view() {
+    let mut stdout = std::io::stdout();
+    let _ = crossterm::execute!(
+        stdout,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0),
+    );
+    let _ = std::io::Write::flush(&mut stdout);
+}
+
+fn suspend_tui_for_plain_output() {
+    ratatui::restore();
+    reset_plain_terminal_view();
+}
+
+fn resume_tui_after_plain_output(terminal: &mut DefaultTerminal) {
+    reset_plain_terminal_view();
+    *terminal = ratatui::init();
+    let _ = terminal.clear();
+}
+
 /// Suspend the TUI, run OAuth (browser PKCE or device code), persist the
 /// resulting auth.json to the appropriate profile, then restore the TUI.
 ///
@@ -1370,7 +1391,7 @@ async fn perform_oauth(
 ) {
     // Tear down TUI: restore cooked mode + clear screen so the OAuth output
     // (browser prompts, device user_code, polling progress) is visible.
-    ratatui::restore();
+    suspend_tui_for_plain_output();
     // TUI starts with MessageMode::Silent; switch to Stdout so login.rs
     // user_println calls (device code URL, user_code) are actually shown.
     crate::output::set_message_mode(crate::output::MessageMode::Stdout);
@@ -1404,7 +1425,7 @@ async fn perform_oauth(
 
     // Restore silent mode before reinitializing TUI.
     crate::output::set_message_mode(crate::output::MessageMode::Silent);
-    *terminal = ratatui::init();
+    resume_tui_after_plain_output(terminal);
 
     match result {
         Ok(msg) => {
@@ -1434,7 +1455,7 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
         return;
     }
 
-    ratatui::restore();
+    suspend_tui_for_plain_output();
     crate::output::set_message_mode(crate::output::MessageMode::Stdout);
 
     let total = aliases.len();
@@ -1471,7 +1492,7 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
     crate::output::set_message_mode(crate::output::MessageMode::Silent);
-    *terminal = ratatui::init();
+    resume_tui_after_plain_output(terminal);
 
     app.marked.clear();
     let summary = if failed.is_empty() {
