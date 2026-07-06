@@ -8,6 +8,11 @@
 - **Daemon background cache refresh** — The Beta daemon now refreshes all saved profile usage into `cache.json` on `daemon.cache_refresh_interval_secs` (default 300s), and can optionally warm up inactive quota windows when `daemon.auto_warmup = true`.
 - **Windows daemon service support** — `daemon install|uninstall` now uses Windows Task Scheduler (`schtasks.exe`) with an on-logon trigger, while `daemon start|stop|status` can manage Windows daemon processes through the shared PID file.
 
+### Fixed
+
+- **Device login polling compatibility** — `login --device` now handles OAuth standard polling errors such as `authorization_pending` and `slow_down` instead of failing early. Original fix contributed by @WhymustIhaveaname in PR #44; expanded on `dev` with OpenAI nested-error handling, unknown-error retry behavior, and tests.
+- **TUI OAuth output redraw** — TUI add/re-login flows now reset and clear the terminal before and after browser/device OAuth output, preventing long authorization URLs from leaving the TUI visually misaligned when control returns.
+
 ## v0.0.20 — 2026-07-02
 
 ### Added
