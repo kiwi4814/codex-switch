@@ -4,6 +4,8 @@
 
 [**中文文档 →**](README_CN.md)
 
+> Latest stable release: `v0.0.20`.
+
 ---
 
 ### TUI
@@ -19,8 +21,9 @@
 - **Profile Management** — Save, switch, rename, delete Codex accounts
 - **Auto-Detection** — Automatically discovers and tracks the current `auth.json`
 - **Usage Dashboard** — Live quota monitoring (5h and 7d windows) with status indicators and per-account refresh timestamps
+- **Reset Cards (v0.0.20)** — Show Codex reset card counts and expiry times, then consume the earliest-expiring available card from CLI or TUI after confirmation
 - **Adaptive Auto-Switch** — `codex-switch use` without arguments ranks accounts with a unified 5-component scoring algorithm, with Team accounts prioritized by default
-- **Background Daemon (Beta)** — Optional `daemon` command keeps the next session ready by monitoring usage and switching automatically when the current account crosses a threshold
+- **Background Daemon (Beta)** — Optional macOS/Linux `daemon` command keeps the next session ready by monitoring usage and switching automatically when the current account crosses a threshold
 - **Stale-Only Refresh** — `use`, `list`, and TUI refresh only accounts whose cached usage has expired
 - **Progress Display** — Long-running `use`, `list`, and directory `import` operations show a single-line cross-platform progress indicator
 - **Interactive TUI** — Full terminal UI with live usage data, color-coded status, and keyboard shortcuts
@@ -126,25 +129,28 @@ codex-switch login
 # 3. See all accounts with live usage
 codex-switch list
 
-# 4. Switch to a specific account
+# 4. Use the earliest-expiring reset card for an account (prompts first)
+codex-switch reset-card alice
+
+# 5. Switch to a specific account
 codex-switch use alice
 
-# 5. Auto-switch to the best available account
+# 6. Auto-switch to the best available account
 codex-switch use
 
-# 6. Launch interactive TUI
+# 7. Launch interactive TUI
 codex-switch tui
 
-# 7. Launch Codex with the best available account
+# 8. Launch Codex with the best available account
 codex-switch launch
 
-# 8. Launch Codex with a specific account
+# 9. Launch Codex with a specific account
 codex-switch launch alice -- --model gpt-4o
 
-# 9. Start the background daemon (Beta, optional)
+# 10. Start the macOS/Linux background daemon (Beta, optional)
 codex-switch daemon start
 
-# 10. Check for a new release manually
+# 11. Check for a new release manually
 codex-switch self-update --check
 ```
 
@@ -154,6 +160,7 @@ codex-switch self-update --check
 |---------|-------------|
 | `codex-switch use [alias] [--force]` | Switch to a profile. Omit alias to auto-select with the adaptive scoring algorithm. `--force` skips the running-process warning |
 | `codex-switch list [-f]` | List all profiles with account info, usage, and availability (`-f` force refresh) |
+| `codex-switch reset-card <alias> [--yes]` | Consume the earliest-expiring available Codex reset card for a profile. Prompts for confirmation unless `--yes` is used; JSON mode requires `--yes` |
 | `codex-switch launch [alias] [-- args...]` | Launch Codex CLI with a profile's auth. Omit alias to auto-select with adaptive scoring. All arguments after `--` are forwarded to codex |
 | `codex-switch warmup [alias]` | Send a minimal request to start the 5h/7d quota window countdown. Omit alias to warm up all profiles |
 | `codex-switch login [--device] [alias]` | Log in via OAuth (`--device` for headless servers). If alias exists, re-authorizes |
@@ -163,7 +170,7 @@ codex-switch self-update --check
 | `codex-switch daemon start [--foreground]` | Start the auto-switch daemon (Beta). Detached by default; use `--foreground` for service managers |
 | `codex-switch daemon stop` | Stop a running Beta daemon |
 | `codex-switch daemon status` | Show Beta daemon status and platform support details |
-| `codex-switch daemon install` | Install the Beta daemon as a user service (LaunchAgent on macOS, systemd user service on Linux, Task Scheduler on Windows) |
+| `codex-switch daemon install` | Install the Beta daemon as a user service (LaunchAgent on macOS, systemd user service on Linux) |
 | `codex-switch daemon uninstall` | Remove the Beta daemon user service |
 | `codex-switch self-update [--check] [--dev]` | Manually check GitHub Releases or update the current direct-install binary. `--dev` switches to the dev channel |
 | `codex-switch tui` | Launch the interactive terminal UI |
@@ -182,19 +189,27 @@ codex-switch self-update --check
 
 ## TUI Keyboard Shortcuts
 
+Press `Enter` to open the selected account menu. If accounts are marked, `Enter` opens the batch menu instead.
+
 | Key | Action |
 |-----|--------|
 | `j` / `k` or `Up` / `Down` | Navigate accounts |
-| `Enter` | Switch to selected account |
+| `Enter` | Open account or batch action menu |
 | `/` | Search / filter accounts |
-| `r` | Refresh usage data (marked accounts, or all if none marked) |
-| `a` | Toggle auto-refresh for all accounts (usage, active profile detection, warmup checks) |
+| `r` | Refresh visible accounts |
+| `a` | Add a new account |
+| `t` | Toggle auto-refresh |
+| `W` | Toggle auto-warmup for accounts whose 5h window has expired |
 | `s` | Cycle sort mode (name / quota / status) |
 | `Space` | Mark / unmark account for batch operations |
-| `w` | Warm up accounts (marked accounts, or all if none marked) |
-| `c` | Clear all marks |
-| `n` | Rename selected profile |
-| `d` | Delete selected profile (with confirmation) |
+| `u` (account menu) | Switch to selected account |
+| `c` (account menu) | Confirm and consume the earliest-expiring reset card |
+| `w` (account menu) | Warm up selected account |
+| `l` (account menu) | Re-login selected account |
+| `n` (account menu) | Rename selected profile |
+| `d` (account menu) | Delete selected profile (with confirmation) |
+| `r` / `w` / `l` / `d` (batch menu) | Refresh, warm up, re-login, or delete marked accounts |
+| `h` | Show help |
 | `q` / `Esc` | Quit |
 
 ## Updating
@@ -212,7 +227,6 @@ codex-switch self-update
 
 - Homebrew installs are not self-overwritten. Use `brew upgrade xjoker/tap/codex-switch`.
 - Direct installs verify the release `.sha256` before replacing the current executable.
-- If the Beta daemon is running, `self-update` stops it before replacing the binary and restarts it afterward. Installed services use LaunchAgent, systemd user service, or Windows Task Scheduler as appropriate.
 - Use `--dev` to install the latest dev build. Run `self-update` (without `--dev`) to return to the stable channel.
 - Homebrew users must `brew uninstall codex-switch` before using `--dev`.
 
@@ -260,9 +274,6 @@ team_priority = true        # Prefer Team accounts with a +500 tier bonus (defau
 [daemon]
 poll_interval_secs = 60         # Usage poll interval (default: 60)
 switch_threshold = 80           # Switch when current 5h usage >= this % (default: 80)
-cache_refresh_interval_secs = 300 # Refresh all profile usage cache in the background (default: 300)
-auto_warmup = false             # Warm up inactive quota windows during cache refresh (default: false)
-token_check_interval_secs = 300 # Background token refresh check interval (default: 300)
 notify = false                  # Desktop notification on switch (default: false)
 log_level = "error"             # Daemon log level (default: "error")
 
@@ -294,9 +305,9 @@ codex-switch list
 codex-switch use && codex
 ```
 
-### Keep the next session ready with the daemon (Beta)
+### Keep the next session ready with the daemon (Beta, macOS/Linux)
 
-Use the Beta daemon when you want `codex-switch` to monitor the current account continuously and prepare the next Codex launch in the background:
+Use the Beta daemon when you want `codex-switch` to monitor the current account continuously and prepare the next Codex launch in the background. In stable `v0.0.20`, service installation is supported on macOS and Linux.
 
 ```bash
 # Start a detached daemon
@@ -313,7 +324,7 @@ codex-switch daemon install
 codex-switch daemon uninstall
 ```
 
-The Beta daemon uses the same adaptive scoring logic as `codex-switch use`. It refreshes the current account on each poll, refreshes every saved profile into `cache.json` on `daemon.cache_refresh_interval_secs`, switches only when `daemon.switch_threshold` is met or exceeded and a better candidate exists, and refreshes expiring tokens on a separate timer. Set `daemon.auto_warmup = true` to also warm up inactive quota windows during cache refresh. macOS service install uses LaunchAgent; Linux service install uses a systemd user service; Windows service install uses Task Scheduler with an on-logon trigger. It prepares future Codex launches; an already-running Codex process still needs to be restarted after a switch.
+The Beta daemon uses the same adaptive scoring logic as `codex-switch use`. It refreshes the current account on each poll and switches only when `daemon.switch_threshold` is met or exceeded and a better candidate exists. macOS service install uses LaunchAgent; Linux service install uses a systemd user service. It prepares future Codex launches; an already-running Codex process still needs to be restarted after a switch.
 
 ### Scheduled token refresh via cron (optional)
 
@@ -465,7 +476,7 @@ When a usage query returns HTTP 401/403, the tool automatically attempts to refr
 - File manager opens via `explorer.exe`
 - Terminal: works with Windows Terminal, PowerShell, and cmd.exe
 - TUI rendering uses Windows Console API via `crossterm`
-- Background daemon service install uses Windows Task Scheduler (`schtasks.exe`) with an on-logon trigger
+- Background daemon service installation is not part of stable `v0.0.20` on Windows
 - **Recommended terminal: [Windows Terminal](https://aka.ms/terminal).** Git Bash (mintty) has known compatibility issues with TUI rendering — use Windows Terminal or PowerShell instead
 
 ## JSON Output
