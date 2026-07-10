@@ -23,7 +23,7 @@
 - **用量仪表盘** — 实时监控配额（5 小时和 7 天窗口），包含每个账号自己的刷新时间
 - **重置卡（v0.0.20）** — 展示 Codex reset card 数量和过期时间，并可在 CLI 或 TUI 中确认后消耗最早过期的可用重置卡
 - **自适应智能切换** — `codex-switch use` 不带参数时通过统一的 5 组件自适应评分算法自动选择最优账号，Team 账号默认优先
-- **后台守护进程（Beta）** — 可选的 macOS/Linux `daemon` 命令在后台监控当前账号的用量，当超过阈值时自动切换
+- **后台守护进程（Beta）** — 可选的 `daemon` 命令在 macOS 使用 LaunchAgent、Linux 使用 systemd 用户服务、Windows 使用任务计划程序（Task Scheduler）
 - **仅刷新过期账号** — `use`、`list` 和 TUI 默认只刷新缓存已过期的账号
 - **进度展示** — 大批量 `use`、`list`、目录 `import` 统一显示单行跨平台进度条
 - **交互式 TUI** — 完整的终端界面，实时用量数据、颜色状态、键盘快捷键
@@ -102,6 +102,8 @@ $env:CS_UNINSTALL="1"; irm https://raw.githubusercontent.com/xjoker/codex-switch
 | Windows | x86_64 | `cs-windows-amd64.zip` |
 | Windows | ARM64 | `cs-windows-arm64.zip` |
 
+安装脚本会下载匹配的 `.sha256` 文件，并在解压归档前完成校验。
+
 ### 从源码编译
 
 需要 [Rust](https://rustup.rs/) 1.88+：
@@ -114,6 +116,12 @@ sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 ```
 
 ## 快速开始
+
+### Codex 认证前提
+
+`codex-switch` 通过切换 Codex 的文件型 `auth.json` 工作。因此 Codex 必须使用默认的 file credential store，或在 `$CODEX_HOME/config.toml`（通常为 `~/.codex/config.toml`）中显式配置 `cli_auth_credentials_store = "file"`。显式的 `keyring`、`auto` 或 `ephemeral` 模式可能绕过实时认证文件，程序会直接拒绝。空的 `CODEX_HOME` 会回退到 `~/.codex`；非空值同时决定 `auth.json` 与 `config.toml` 的 Codex 主目录。
+
+本工具要求 ChatGPT 登录。如果受管 Codex 配置设置了 `forced_login_method = "api"`，程序会给出可操作错误并停止，不会修改认证状态。
 
 ```bash
 # 1. 登录第一个 Codex 账号
@@ -146,7 +154,7 @@ codex-switch launch
 # 9. 用指定账号启动 Codex
 codex-switch launch alice -- --model gpt-4o
 
-# 10. 启动 macOS/Linux 后台守护进程（Beta，可选）
+# 10. 启动后台守护进程（Beta，可选）
 codex-switch daemon start
 
 # 11. 手动检查新版本
@@ -157,7 +165,7 @@ codex-switch self-update --check
 
 | 命令 | 说明 |
 |------|------|
-| `codex-switch use [别名] [--force]` | 切换账号。不带别名则用自适应评分算法自动选择最优账号。`--force` 跳过运行中 Codex 进程的警告 |
+| `codex-switch use [别名]` | 切换账号。不带别名则用自适应评分算法自动选择最优账号 |
 | `codex-switch list [-f]` | 显示所有账号信息、用量和可用状态（`-f` 强制刷新，忽略缓存） |
 | `codex-switch reset-card <别名> [--yes]` | 消耗该账号最早过期的可用 Codex reset card。默认会先确认；JSON 模式需要 `--yes` |
 | `codex-switch launch [别名] [-- 参数...]` | 用指定账号的认证启动 Codex CLI。不带别名则自适应评分自动选择。`--` 后的参数透传给 codex |
@@ -169,9 +177,9 @@ codex-switch self-update --check
 | `codex-switch daemon start [--foreground]` | 启动自动切换守护进程（Beta）。默认后台运行；`--foreground` 用于服务管理器 |
 | `codex-switch daemon stop` | 停止运行的 Beta 守护进程 |
 | `codex-switch daemon status` | 显示 Beta 守护进程状态和平台支持信息 |
-| `codex-switch daemon install` | 安装 Beta 守护进程作为用户服务（macOS LaunchAgent / Linux systemd 用户服务） |
+| `codex-switch daemon install` | 安装 Beta 守护进程作为用户服务（macOS LaunchAgent / Linux systemd 用户服务 / Windows 任务计划程序） |
 | `codex-switch daemon uninstall` | 卸载 Beta 守护进程系统服务 |
-| `codex-switch self-update [--check] [--dev]` | 手动检查 GitHub Releases，或更新当前直装版本。`--dev` 切换到开发通道 |
+| `codex-switch self-update [--check] [--dev\|--stable] [--version <VERSION>]` | 检查或更新直装版本；不带通道参数时保持当前 stable/dev 通道，`--version` 安装指定正式版本 |
 | `codex-switch tui` | 启动交互式终端界面 |
 | `codex-switch open` | 在文件管理器中打开配置目录 |
 
@@ -222,11 +230,17 @@ codex-switch self-update --check
 # 将直装版本更新到最新 release
 codex-switch self-update
 
+# 显式切换通道
+codex-switch self-update --dev
+codex-switch self-update --stable
+
+# 安装指定正式版本（不支持降级）
+codex-switch self-update --version 0.0.22
 ```
 
 - Homebrew 安装不会被程序自行覆盖，请使用 `brew upgrade xjoker/tap/codex-switch`
 - 直装版本会先校验 release 对应的 `.sha256`，再替换当前二进制
-- 使用 `--dev` 安装最新开发版，运行 `self-update`（不带 `--dev`）可退回稳定版
+- 不带参数的 `self-update` 会保持当前二进制所属的通道；使用 `--dev` 或 `--stable` 显式切换通道
 - Homebrew 用户需先 `brew uninstall codex-switch` 才能使用 `--dev`
 
 ## 代理支持
@@ -273,6 +287,8 @@ team_priority = true        # 优先使用 Team 账号，+500 层级加成（默
 [daemon]
 poll_interval_secs = 60         # 用量轮询间隔（秒，默认：60）
 switch_threshold = 80           # 触发切换的 5h 用量百分比（默认：80）
+cache_refresh_interval_secs = 300 # 刷新全部已保存账号缓存（秒，默认：300）
+auto_warmup = false             # 刷新缓存时预热未激活窗口（默认：false）
 token_check_interval_secs = 300 # Token 刷新检查间隔（秒，默认：300）
 notify = false                  # 切换时桌面通知（默认：false）
 log_level = "error"             # 守护进程日志级别（默认："error"）
@@ -280,6 +296,8 @@ log_level = "error"             # 守护进程日志级别（默认："error"）
 [launch]
 restore_delay_secs = 3          # codex 启动后多少秒还原 auth.json（默认：3）
 ```
+
+三个 daemon 间隔字段若设为 `0`，会按“未设置”处理并归一化为文档默认值：轮询 `60` 秒、缓存刷新 `300` 秒、Token 检查 `300` 秒。
 
 ### 示例
 
@@ -305,9 +323,9 @@ codex-switch list
 codex-switch use && codex
 ```
 
-### 使用守护进程保持下一次会话就绪（Beta，macOS/Linux）
+### 使用守护进程保持下一次会话就绪（Beta）
 
-当你希望 `codex-switch` 持续监控当前账号并在后台准备好下一次 Codex 启动时，可使用 Beta 守护进程。稳定版 `v0.0.21` 支持 macOS 和 Linux 的服务安装。
+当你希望 `codex-switch` 持续监控当前账号并在后台准备好下一次 Codex 启动时，可使用 Beta 守护进程。0.0.22 实现在 macOS 安装 LaunchAgent、在 Linux 安装 systemd 用户服务、在 Windows 安装登录时触发的任务计划程序（Task Scheduler）任务。
 
 ```bash
 # 启动后台守护进程
@@ -324,7 +342,7 @@ codex-switch daemon install
 codex-switch daemon uninstall
 ```
 
-Beta 守护进程使用与 `codex-switch use` 相同的自适应评分逻辑。它在每次轮询时刷新当前账号，仅在 `daemon.switch_threshold` 达到或超过阈值且存在更好的候选账号时才切换，并在单独的定时器上刷新即将过期的 Token。macOS 服务安装使用 LaunchAgent；Linux 服务安装使用 systemd user service。守护进程为未来的 Codex 启动做准备；已运行的 Codex 进程在切换后仍需重启。
+Beta 守护进程使用与 `codex-switch use` 相同的自适应评分逻辑。它在每次轮询时刷新当前账号，仅在 `daemon.switch_threshold` 达到或超过阈值且存在更好的候选账号时才切换；按 `daemon.cache_refresh_interval_secs` 刷新所有已保存账号的缓存，并在独立定时器上刷新即将过期的 Token。`daemon.auto_warmup = true` 还会预热未激活的配额窗口，默认关闭。守护进程为未来的 Codex 启动做准备；已运行的 Codex 进程在切换后仍需重启。
 
 ### 定时刷新 Token（可选）
 
@@ -343,8 +361,8 @@ crontab -e
 ### CI / 自动化场景
 
 ```bash
-# 一行命令：切换到最佳账号并启动 Codex
-codex-switch use --json && codex --quiet ...
+# 选择最佳账号，并把参数直接传给 Codex
+codex-switch launch -- --model gpt-5.4
 ```
 
 ## 故障排查
@@ -476,7 +494,7 @@ v0.0.13+ 不再有模式选择。此统一算法替代了之前的 `max-remainin
 - 文件管理器通过 `explorer.exe` 打开
 - 终端：支持 Windows Terminal、PowerShell 和 cmd.exe
 - TUI 通过 `crossterm` 使用 Windows Console API 渲染
-- 稳定版 `v0.0.21` 的 Windows 后台 daemon 服务安装尚未正式支持
+- `daemon install` 使用登录时触发的 Windows 任务计划程序；可用 `daemon status` 检查安装和运行状态
 - **推荐终端：[Windows Terminal](https://aka.ms/terminal)。** Git Bash（mintty）与 TUI 渲染存在已知兼容性问题，请使用 Windows Terminal 或 PowerShell
 
 ## JSON 输出

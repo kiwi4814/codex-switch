@@ -7,7 +7,7 @@ on:
       - "dev"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -140,6 +140,8 @@ jobs:
   release:
     needs: [meta, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
 
@@ -151,6 +153,30 @@ jobs:
 
       - name: List artifacts
         run: find artifacts -type f | sort
+
+      - name: Verify release checksums
+        shell: bash
+        run: |
+          archives=(
+            cs-linux-amd64.tar.gz
+            cs-linux-arm64.tar.gz
+            cs-darwin-amd64.tar.gz
+            cs-darwin-arm64.tar.gz
+            cs-windows-amd64.zip
+            cs-windows-arm64.zip
+          )
+          for name in "${archives[@]}"; do
+            archive="artifacts/${name}"
+            checksum="${archive}.sha256"
+            if [[ ! -s "$archive" || ! -s "$checksum" ]]; then
+              echo "Missing or empty release archive/checksum: $archive / $checksum" >&2
+              exit 1
+            fi
+            (
+              cd artifacts
+              sha256sum --check "$(basename "$checksum")"
+            )
+          done
 
       - name: Generate install script body
         run: |

@@ -173,21 +173,44 @@ fi
 info "Detected: ${PLATFORM}/${ARCH_NAME}"
 info "Downloading: ${DOWNLOAD_URL}"
 
-# Download and extract
+# Download, verify, and extract
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 curl -fsSL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ASSET_NAME}" || error "Download failed. Check the URL or your network."
+CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+CHECKSUM_FILE="${TMP_DIR}/${ASSET_NAME}.sha256"
+curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE" || error "Checksum download failed. The release is incomplete or your network is unavailable."
+
+EXPECTED_SHA256="$(awk -v filename="$ASSET_NAME" '
+  NF != 2 { exit 1 }
+  length($1) != 64 || $1 !~ /^[[:xdigit:]]+$/ { exit 1 }
+  $2 != filename && $2 != "*" filename { exit 1 }
+  NR > 1 { exit 1 }
+  { print tolower($1) }
+  END { if (NR != 1) exit 1 }
+' "$CHECKSUM_FILE")" || error "Invalid checksum file for ${ASSET_NAME}."
+[ -n "$EXPECTED_SHA256" ] || error "Checksum file for ${ASSET_NAME} is empty."
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_SHA256="$(sha256sum "${TMP_DIR}/${ASSET_NAME}" | awk '{print tolower($1)}')"
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL_SHA256="$(shasum -a 256 "${TMP_DIR}/${ASSET_NAME}" | awk '{print tolower($1)}')"
+else
+  error "Neither sha256sum nor shasum is available to verify the download."
+fi
+
+[ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] || error "Checksum mismatch for ${ASSET_NAME}; refusing to extract it."
+info "Checksum verified: ${ASSET_NAME}"
 tar xzf "${TMP_DIR}/${ASSET_NAME}" -C "$TMP_DIR"
 
 # Install
 if [ -w "$INSTALL_DIR" ]; then
-  mv "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+  install -m 0755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 else
   info "Installing to ${INSTALL_DIR} (requires sudo)"
-  sudo mv "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+  sudo install -m 0755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 fi
 
-chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 info "Installed: $(${INSTALL_DIR}/${BINARY_NAME} --version)"
 info "Run 'codex-switch --help' to get started"

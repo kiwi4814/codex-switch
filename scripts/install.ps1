@@ -105,13 +105,35 @@ Write-Host "[info]  Downloading: $DownloadUrl" -ForegroundColor Blue
 $TmpDir = Join-Path $env:TEMP "cs-install-$(Get-Random)"
 New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 $ZipPath = Join-Path $TmpDir $AssetName
+$ChecksumUrl = "$DownloadUrl.sha256"
+$ChecksumPath = "$ZipPath.sha256"
 
 try {
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $ZipPath -UseBasicParsing
+    Invoke-WebRequest -Uri $ChecksumUrl -OutFile $ChecksumPath -UseBasicParsing
 } catch {
-    Write-Host "[error] Download failed: $_" -ForegroundColor Red
+    Write-Host "[error] Archive or checksum download failed: $_" -ForegroundColor Red
+    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
     exit 1
 }
+
+# Verify checksum before extracting any downloaded content
+$ChecksumText = (Get-Content -LiteralPath $ChecksumPath -Raw).Trim()
+$ChecksumPattern = '^(?<hash>[0-9A-Fa-f]{64})\s+\*?(?<file>\S+)$'
+if ($ChecksumText -notmatch $ChecksumPattern -or (Split-Path -Leaf $Matches.file) -ne $AssetName) {
+    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+    Write-Error "Invalid or empty checksum file for $AssetName."
+    exit 1
+}
+
+$ExpectedSha256 = $Matches.hash.ToUpperInvariant()
+$ActualSha256 = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToUpperInvariant()
+if ($ActualSha256 -ne $ExpectedSha256) {
+    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+    Write-Error "Checksum mismatch for $AssetName; refusing to extract it."
+    exit 1
+}
+Write-Host "[info]  Checksum verified: $AssetName" -ForegroundColor Blue
 
 # Extract
 Expand-Archive -Path $ZipPath -DestinationPath $TmpDir -Force

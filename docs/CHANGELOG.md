@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.0.22 — Unreleased
+
+### Added
+
+- **Three-host CI quality gate** — A dedicated CI workflow now runs tests, Clippy, and debug builds on Linux, macOS, and Windows for `dev` pushes and pull requests. Linux additionally checks formatting, dependency advisories, and shell syntax; Windows parses the PowerShell installer.
+- **Verified installers** — Unix and PowerShell installers now download the matching `.sha256` asset and reject malformed or mismatched checksums before extracting release content.
+
+### Changed
+
+- **Codex 0.144.1 authentication alignment** — Browser and device login follow the current Codex callback and polling contracts, refresh responses preserve omitted tokens, managed authentication policy is enforced, custom CA settings are honored, and `CODEX_HOME` uses the same empty-value fallback as Codex.
+- **File credential store requirement** — `codex-switch` now requires Codex's file-backed credential store and rejects explicit `keyring`, `auto`, or `ephemeral` modes because reliable profile switching depends on the live `auth.json`.
+- **Usage and reset-credit alignment** — Usage, models, and warmup requests carry workspace/FedRAMP routing headers; empty or structurally drifted usage responses are rejected; account-limited state is persisted; reset credits support no-expiry entries; consume retries reuse one redemption request ID and only `code=reset` is success.
+- **Cross-platform daemon lifecycle** — launchd, systemd user services, and Windows Task Scheduler preserve `CODEX_HOME`; PID files include executable identity and an active OS lock; stale or legacy PID data is never trusted for signaling; zero daemon intervals normalize to 60/300/300 seconds.
+
+### Fixed
+
+- **Cross-process auth transactions** — Switch, launch staging/restoration, refresh, warmup, re-login, import, rename, and delete paths serialize through stable OS file locks. Lock timeout reports the holder without unlinking a live lock, launch does not hold the auth write lock while the Codex child runs, and refreshed tokens cannot be written into another account after a concurrent switch.
+- **Cross-process cache writes** — Cache read/modify/write operations now use an OS file lock and unique temporary files; auth, current-profile, and cache replacements use a cross-platform atomic replace path that can overwrite existing files on Windows.
+- **Windows daemon detection** — Task Scheduler installation checks now honor the command exit status, and `tasklist` PID parsing reads the correct CSV column.
+- **Safe uninstall order** — Installers stop and remove the daemon service before deleting the binary, PATH entry, or data; service cleanup failures abort removal so a running daemon is not orphaned.
+- **Documentation drift** — Removed nonexistent `use --force` and `codex --quiet` examples; documented self-update channel preservation, Windows `.zip` artifacts, Windows Task Scheduler support, daemon cache/warmup settings, and the file-auth prerequisite.
+
 ## v0.0.21 — 2026-07-10
 
 ### Added
