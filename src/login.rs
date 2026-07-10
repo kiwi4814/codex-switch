@@ -1,7 +1,7 @@
 /// Codex OAuth login flows
 ///
 /// Two supported flows:
-/// - PKCE Authorization Code Flow — browser-based, local HTTP callback on port 1455
+/// - PKCE Authorization Code Flow — browser-based, local HTTP callback on port 1455 or 1457
 /// - Device Code Flow (`--device`) — for headless servers without a browser
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ const ORIGINATOR: &str = "codex_cli_rs";
 const SCOPE: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const CALLBACK_TIMEOUT_SECS: u64 = 300;
 const CALLBACK_PORT: u16 = 1455;
+const CALLBACK_FALLBACK_PORT: u16 = 1457;
 const CALLBACK_HOST: &str = "127.0.0.1";
 /// OAuth redirect_uri must use "localhost" to match OpenAI's registered URI.
 const REDIRECT_HOST: &str = "localhost";
@@ -80,6 +81,7 @@ fn redacted_device_poll_log_body(body: &serde_json::Value) -> String {
 
 /// Run PKCE OAuth flow: open browser → wait for callback → exchange tokens
 pub async fn run_device_auth() -> Result<LoginTokens> {
+    crate::auth::ensure_file_credentials_store()?;
     let pkce = generate_pkce();
     let state = generate_state();
 
@@ -120,6 +122,7 @@ pub async fn run_device_auth() -> Result<LoginTokens> {
 
     let tokens =
         exchange_code(&callback_result.code, &pkce.code_verifier, &actual_redirect).await?;
+    crate::auth::validate_managed_chatgpt_account(&tokens.id_token)?;
     Ok(tokens)
 }
 
@@ -308,9 +311,26 @@ struct DeviceCodeResponse {
 /// We then exchange the code for actual tokens via /oauth/token.
 #[derive(Debug, Deserialize)]
 struct DeviceTokenResponse {
-    authorization_code: Option<String>,
-    code_verifier: Option<String>,
-    status: Option<String>,
+    authorization_code: String,
+    code_challenge: String,
+    code_verifier: String,
+}
+
+fn parse_device_poll_success(body: serde_json::Value) -> Result<(String, String)> {
+    let response: DeviceTokenResponse = serde_json::from_value(body)
+        .map_err(|e| anyhow::anyhow!("Invalid device authorization response: {e}"))?;
+
+    if response.authorization_code.trim().is_empty() {
+        bail!("Invalid device authorization response: authorization_code is empty");
+    }
+    if response.code_challenge.trim().is_empty() {
+        bail!("Invalid device authorization response: code_challenge is empty");
+    }
+    if response.code_verifier.trim().is_empty() {
+        bail!("Invalid device authorization response: code_verifier is empty");
+    }
+
+    Ok((response.authorization_code, response.code_verifier))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -357,6 +377,7 @@ fn device_poll_error_action(body: &serde_json::Value) -> Option<DevicePollErrorA
 
 /// Run Device Code Flow: request code → display to user → poll for token
 pub async fn run_device_code_auth() -> Result<LoginTokens> {
+    crate::auth::ensure_file_credentials_store()?;
     let client = crate::auth::build_http_client()?;
 
     // Step 1: Request device code
@@ -485,34 +506,8 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
             }
         }
 
-        // Success — got authorization_code, need to exchange for tokens
-        let dt: DeviceTokenResponse = match serde_json::from_value(body) {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("Device poll parse into DeviceTokenResponse failed: {e}");
-                continue;
-            }
-        };
-
-        if dt.status.as_deref() != Some("success") {
-            debug!("Device poll status: {:?}", dt.status);
-            continue;
-        }
-
-        let auth_code = match dt.authorization_code {
-            Some(c) => c,
-            None => {
-                debug!("No authorization_code in success response");
-                continue;
-            }
-        };
-        let verifier = match dt.code_verifier {
-            Some(v) => v,
-            None => {
-                debug!("No code_verifier in success response");
-                continue;
-            }
-        };
+        // Success — got authorization_code, need to exchange for tokens.
+        let (auth_code, verifier) = parse_device_poll_success(body)?;
 
         eprint!("\r                          \r");
         info!("Device authorization successful, exchanging code for tokens");
@@ -522,6 +517,7 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
         // The redirect_uri for device flow is the OpenAI deviceauth callback
         let device_redirect = format!("{ISSUER}/deviceauth/callback");
         let tokens = exchange_code_with_redirect(&auth_code, &verifier, &device_redirect).await?;
+        crate::auth::validate_managed_chatgpt_account(&tokens.id_token)?;
         return Ok(tokens);
     }
 }
@@ -570,55 +566,50 @@ pub fn build_auth_json(tokens: &LoginTokens, account_id: &str) -> serde_json::Va
 ///
 /// Preference order:
 /// 1. `127.0.0.1:1455` — the port OpenAI registers as the primary redirect URI.
-/// 2. `[::1]:1455` — Windows IPv4-only port exclusions don't block IPv6; browsers
-///    use Happy Eyeballs and reach the IPv6 socket.
-/// 3. Error with remediation hint (Windows: net stop/start winnat + hns).
+/// 2. `127.0.0.1:1457` — Codex's registered fallback redirect port.
+/// 3. Error with remediation hint.
 async fn bind_callback_listener() -> Result<(TcpListener, u16)> {
-    match TcpListener::bind(format!("{CALLBACK_HOST}:{CALLBACK_PORT}")).await {
-        Ok(l) => Ok((l, CALLBACK_PORT)),
+    let [primary_port, _] = callback_ports();
+    match TcpListener::bind(format!("{CALLBACK_HOST}:{primary_port}")).await {
+        Ok(l) => Ok((l, primary_port)),
         Err(e) => {
-            debug!("IPv4 bind on {CALLBACK_PORT} failed: {e}");
+            debug!("IPv4 bind on {primary_port} failed: {e}");
             bind_callback_listener_fallback(e).await
         }
     }
 }
 
+fn callback_ports() -> [u16; 2] {
+    [CALLBACK_PORT, CALLBACK_FALLBACK_PORT]
+}
+
 #[cfg(target_os = "windows")]
 async fn bind_callback_listener_fallback(ipv4_err: std::io::Error) -> Result<(TcpListener, u16)> {
-    if ipv4_err.raw_os_error() == Some(10013) {
-        // WSAEACCES (10013): port blocked by Windows (excluded range, WinNAT, HNS, etc.)
-        // Try IPv6 loopback — Windows port exclusions are IPv4-only.
-        match TcpListener::bind(format!("[::1]:{CALLBACK_PORT}")).await {
-            Ok(l) => {
-                user_println(&format!(
-                    "Note: port {CALLBACK_PORT} blocked on IPv4 (Windows); \
-                    using IPv6 loopback."
-                ));
-                return Ok((l, CALLBACK_PORT));
-            }
-            Err(e6) => {
-                debug!("IPv6 bind on {CALLBACK_PORT} failed: {e6}");
-            }
-        }
-
-        return Err(anyhow::anyhow!(
-            "Cannot bind port {CALLBACK_PORT}: blocked by Windows (WinNAT / HNS port reservation).\n\
+    match TcpListener::bind(format!("{CALLBACK_HOST}:{CALLBACK_FALLBACK_PORT}")).await {
+        Ok(listener) => Ok((listener, CALLBACK_FALLBACK_PORT)),
+        Err(fallback_err) if ipv4_err.raw_os_error() == Some(10013) => Err(anyhow::anyhow!(
+            "Cannot bind OAuth callback ports {CALLBACK_PORT} or {CALLBACK_FALLBACK_PORT}: \
+             {ipv4_err}; fallback error: {fallback_err}.\n\
             \nRun the following as Administrator to release reserved ports, then retry:\n\
             \n  net stop winnat\n  net stop hns\n  net start winnat\n  net start hns\
             \n\nOr use device code flow (no port needed):\n  codex-switch login --device"
-        ));
+        )),
+        Err(fallback_err) => Err(anyhow::anyhow!(
+            "Cannot bind OAuth callback ports {CALLBACK_PORT} or {CALLBACK_FALLBACK_PORT}: \
+             {ipv4_err}; fallback error: {fallback_err}"
+        )),
     }
-
-    Err(anyhow::anyhow!(
-        "Cannot bind port {CALLBACK_PORT} (already in use?): {ipv4_err}"
-    ))
 }
 
 #[cfg(not(target_os = "windows"))]
 async fn bind_callback_listener_fallback(ipv4_err: std::io::Error) -> Result<(TcpListener, u16)> {
-    Err(anyhow::anyhow!(
-        "Cannot bind port {CALLBACK_PORT} (already in use?): {ipv4_err}"
-    ))
+    match TcpListener::bind(format!("{CALLBACK_HOST}:{CALLBACK_FALLBACK_PORT}")).await {
+        Ok(listener) => Ok((listener, CALLBACK_FALLBACK_PORT)),
+        Err(fallback_err) => Err(anyhow::anyhow!(
+            "Cannot bind OAuth callback ports {CALLBACK_PORT} or {CALLBACK_FALLBACK_PORT}: \
+             {ipv4_err}; fallback error: {fallback_err}"
+        )),
+    }
 }
 
 // ── Browser open ──────────────────────────────────────────
@@ -763,5 +754,36 @@ mod tests {
                 message: "try again later".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn test_device_poll_success_accepts_current_codex_shape_without_status() {
+        let body = serde_json::json!({
+            "authorization_code": "auth-code",
+            "code_challenge": "challenge",
+            "code_verifier": "verifier",
+        });
+
+        let (authorization_code, code_verifier) = parse_device_poll_success(body).unwrap();
+
+        assert_eq!(authorization_code, "auth-code");
+        assert_eq!(code_verifier, "verifier");
+    }
+
+    #[test]
+    fn test_device_poll_success_rejects_incomplete_shape() {
+        let body = serde_json::json!({
+            "authorization_code": "auth-code",
+            "code_verifier": "verifier",
+        });
+
+        let err = parse_device_poll_success(body).unwrap_err();
+
+        assert!(err.to_string().contains("code_challenge"));
+    }
+
+    #[test]
+    fn test_callback_ports_match_current_codex_fallback_order() {
+        assert_eq!(callback_ports(), [1455, 1457]);
     }
 }
