@@ -401,14 +401,15 @@ mod tests {
         let err =
             with_cache_file_lock_at(&lock_path, Duration::from_millis(25), || Ok(())).unwrap_err();
         assert!(err.to_string().contains("cache lock"));
-        assert_eq!(
-            std::fs::read_to_string(&lock_path).unwrap(),
-            "holder-marker"
-        );
         let reopened = open_cache_lock_file(&lock_path).unwrap();
         assert!(matches!(
             FileExt::try_lock(&reopened),
             Err(fs4::TryLockError::WouldBlock)
         ));
+        FileExt::unlock(&holder).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            "holder-marker"
+        );
     }
 }

@@ -1310,11 +1310,11 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
 
     let primary_raw = body
         .pointer("/rate_limit/primary_window")
-        .and_then(|v| if v.is_null() { None } else { Some(v) });
+        .filter(|v| !v.is_null());
 
     let secondary_raw = body
         .pointer("/rate_limit/secondary_window")
-        .and_then(|v| if v.is_null() { None } else { Some(v) });
+        .filter(|v| !v.is_null());
 
     let primary_window_secs = primary_raw
         .and_then(|v| v.get("limit_window_seconds"))

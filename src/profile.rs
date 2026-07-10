@@ -1046,13 +1046,14 @@ mod tests {
             message.contains(&lock_path.display().to_string()),
             "{message}"
         );
-        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), holder_text);
 
         let reopened = super::open_lock_file(&lock_path).unwrap();
         assert!(matches!(
             FileExt::try_lock(&reopened),
             Err(fs4::TryLockError::WouldBlock)
         ));
+        FileExt::unlock(&holder).unwrap();
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), holder_text);
     }
 
     #[test]
