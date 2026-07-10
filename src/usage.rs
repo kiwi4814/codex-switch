@@ -311,37 +311,16 @@ pub async fn fetch_usage_retried_force(
 }
 
 fn persist_refreshed_tokens(alias: &str, profile_path: &Path, new_tokens: &RefreshedTokens) {
-    if let Err(err) = auth::update_tokens(
-        profile_path,
+    if let Err(err) = crate::profile::update_profile_tokens_and_live_if_current(
+        alias,
         &new_tokens.id_token,
         &new_tokens.access_token,
         &new_tokens.refresh_token,
     ) {
         warn!(
-            "[{alias}] Failed to persist refreshed tokens to {}: {err}",
+            "[{alias}] Failed to atomically persist refreshed tokens to {} and live auth: {err}",
             profile_path.display()
         );
-    }
-
-    if crate::profile::read_current() == alias {
-        match auth::codex_auth_path() {
-            Ok(live) => {
-                if let Err(err) = auth::update_tokens(
-                    &live,
-                    &new_tokens.id_token,
-                    &new_tokens.access_token,
-                    &new_tokens.refresh_token,
-                ) {
-                    warn!(
-                        "[{alias}] Failed to persist refreshed tokens to {}: {err}",
-                        live.display()
-                    );
-                }
-            }
-            Err(err) => {
-                warn!("[{alias}] Failed to determine codex auth path: {err}");
-            }
-        }
     }
 }
 

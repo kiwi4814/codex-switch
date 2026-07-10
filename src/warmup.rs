@@ -190,24 +190,13 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
         .await
         {
             Ok(refreshed) => {
-                if let Err(e) = crate::auth::update_tokens(
-                    profile_path,
+                if let Err(e) = crate::profile::update_profile_tokens_and_live_if_current(
+                    alias,
                     &refreshed.id_token,
                     &refreshed.access_token,
                     &refreshed.refresh_token,
                 ) {
-                    warn!("[{alias}] failed to persist refreshed tokens: {e}");
-                }
-                if crate::profile::read_current() == alias
-                    && let Ok(live) = crate::auth::codex_auth_path()
-                    && let Err(e) = crate::auth::update_tokens(
-                        &live,
-                        &refreshed.id_token,
-                        &refreshed.access_token,
-                        &refreshed.refresh_token,
-                    )
-                {
-                    warn!("[{alias}] failed to persist refreshed tokens to live auth: {e}");
+                    warn!("[{alias}] failed to atomically persist refreshed tokens: {e}");
                 }
                 access_token = refreshed.access_token;
                 id_token = Some(refreshed.id_token);
@@ -290,24 +279,13 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                 .await
                 {
                     Ok(refreshed) => {
-                        if let Err(e) = crate::auth::update_tokens(
-                            profile_path,
+                        if let Err(e) = crate::profile::update_profile_tokens_and_live_if_current(
+                            alias,
                             &refreshed.id_token,
                             &refreshed.access_token,
                             &refreshed.refresh_token,
                         ) {
-                            warn!("[{alias}] failed to persist refreshed tokens: {e}");
-                        }
-                        if crate::profile::read_current() == alias
-                            && let Ok(live) = crate::auth::codex_auth_path()
-                            && let Err(e) = crate::auth::update_tokens(
-                                &live,
-                                &refreshed.id_token,
-                                &refreshed.access_token,
-                                &refreshed.refresh_token,
-                            )
-                        {
-                            warn!("[{alias}] failed to persist refreshed tokens to live auth: {e}");
+                            warn!("[{alias}] failed to atomically persist refreshed tokens: {e}");
                         }
                         let mut retry_resp = make_request(
                             &client,

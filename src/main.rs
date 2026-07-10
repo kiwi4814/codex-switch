@@ -628,13 +628,7 @@ async fn reauth_profile(alias: &str, device: bool, json: bool) -> Result<()> {
         login::run_device_auth().await?
     };
     let (auth_val, new_info) = login::build_auth_from_tokens(&tokens);
-    auth::write_auth(&dst, &auth_val)?;
-
-    if profile::read_current() == alias {
-        let live = auth::codex_auth_path()?;
-        auth::backup_auth(&live)?;
-        auth::write_auth(&live, &auth_val)?;
-    }
+    profile::replace_profile_auth_and_live_if_current(alias, &auth_val)?;
 
     if json {
         print_json(&output::JsonOk {
@@ -860,12 +854,22 @@ async fn launch_cmd(alias: Option<&str>, args: Vec<String>, json: bool) -> Resul
         std::process::id(),
         auth::now_unix_secs()
     ));
+
+    // The dedicated launch lease covers only stage -> process start -> short
+    // read window -> restore. It does not hold the auth write lock or wait for
+    // the interactive child to exit.
+    let launch_lease = tokio::task::spawn_blocking(profile::lock_launch_session)
+        .await
+        .context("launch lease task panicked")?
+        .context("acquiring launch session lease")?;
+    // All codex-switch writers acquire this lease before mutating live auth,
+    // so the existence snapshot cannot race a concurrent switch.
     let had_original = codex_auth.exists();
 
     // Swap auth.json → start codex → wait for it to read auth → restore.
     // Codex CLI reads auth.json only at startup, so we only need to hold
     // the swapped state for a few seconds, not the entire session.
-    {
+    let stage_result = {
         let codex_auth2 = codex_auth.clone();
         let backup2 = backup.clone();
         let target_alias2 = target_alias.clone();
@@ -887,21 +891,49 @@ async fn launch_cmd(alias: Option<&str>, args: Vec<String>, json: bool) -> Resul
             Ok(())
         })
         .await
-        .context("lock task panicked")??;
+        .context("lock task panicked")?
+    };
+    if let Err(stage_err) = stage_result {
+        if backup.exists() || !had_original {
+            let codex_auth2 = codex_auth.clone();
+            let backup2 = backup.clone();
+            tokio::task::spawn_blocking(move || {
+                restore_launch_auth(&codex_auth2, &backup2, had_original)
+            })
+            .await
+            .context("restore task panicked after launch staging failure")??;
+        }
+        drop(launch_lease);
+        return Err(stage_err).context("staging launch auth");
     }
-    // Lock released here — other commands can proceed while codex runs.
+    // The auth lock is released here; the launch lease keeps other live-auth
+    // writers out until the staged file is restored.
 
     if !json {
         user_println(&format!("Launching codex with profile '{target_alias}'..."));
     }
 
-    let mut child = std::process::Command::new("codex")
+    let child_result = std::process::Command::new("codex")
         .args(&args)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .context("Failed to start codex")?;
+        .spawn();
+
+    let mut child = match child_result {
+        Ok(child) => child,
+        Err(spawn_err) => {
+            let codex_auth2 = codex_auth.clone();
+            let backup2 = backup.clone();
+            tokio::task::spawn_blocking(move || {
+                restore_launch_auth(&codex_auth2, &backup2, had_original)
+            })
+            .await
+            .context("restore task panicked after Codex spawn failure")??;
+            drop(launch_lease);
+            return Err(spawn_err).context("Failed to start codex");
+        }
+    };
 
     // Give codex time to read auth.json, then restore immediately.
     // Configurable via [launch] restore_delay_secs (default: 3).
@@ -922,20 +954,13 @@ async fn launch_cmd(alias: Option<&str>, args: Vec<String>, json: bool) -> Resul
     {
         let codex_auth2 = codex_auth.clone();
         let backup2 = backup.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let _lock = profile::lock_live_auth().context("acquiring auth lock for restore")?;
-            if had_original {
-                if std::fs::copy(&backup2, &codex_auth2).is_ok() {
-                    let _ = std::fs::remove_file(&backup2);
-                }
-            } else {
-                let _ = std::fs::remove_file(&codex_auth2);
-            }
-            Ok(())
+        tokio::task::spawn_blocking(move || {
+            restore_launch_auth(&codex_auth2, &backup2, had_original)
         })
         .await
         .context("lock task panicked")??;
     }
+    drop(launch_lease);
 
     // Wait for codex to exit
     let status = child.wait().context("waiting for codex")?;
@@ -969,6 +994,29 @@ async fn launch_cmd(alias: Option<&str>, args: Vec<String>, json: bool) -> Resul
         std::process::exit(exit_code);
     }
 
+    Ok(())
+}
+
+fn restore_launch_auth(
+    codex_auth: &std::path::Path,
+    backup: &std::path::Path,
+    had_original: bool,
+) -> Result<()> {
+    let _lock = profile::lock_live_auth().context("acquiring auth lock for restore")?;
+    if had_original {
+        std::fs::copy(backup, codex_auth).with_context(|| {
+            format!(
+                "restoring launch auth backup {} -> {}",
+                backup.display(),
+                codex_auth.display()
+            )
+        })?;
+        std::fs::remove_file(backup)
+            .with_context(|| format!("removing launch auth backup {}", backup.display()))?;
+    } else if codex_auth.exists() {
+        std::fs::remove_file(codex_auth)
+            .with_context(|| format!("removing staged launch auth {}", codex_auth.display()))?;
+    }
     Ok(())
 }
 

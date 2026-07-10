@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
 use crate::usage::{ResetCredit, UsageInfo};
 
 static CACHE_LOCK: Mutex<()> = Mutex::new(());
+const CACHE_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const CACHE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Serialize, Deserialize)]
 struct CacheEntry {
@@ -46,6 +49,66 @@ fn cache_path() -> Result<PathBuf> {
     Ok(auth::app_home()?.join("cache.json"))
 }
 
+fn cache_lock_path() -> Result<PathBuf> {
+    Ok(auth::app_home()?.join("cache.lock"))
+}
+
+fn open_cache_lock_file(path: &std::path::Path) -> Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating cache directory {}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("setting permissions on {}", parent.display()))?;
+        }
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("opening cache lock {}", path.display()))
+}
+
+fn with_cache_file_lock_at<T>(
+    path: &std::path::Path,
+    timeout: Duration,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let file = open_cache_lock_file(path)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match FileExt::try_lock(&file) {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(CACHE_LOCK_POLL_INTERVAL);
+            }
+            Err(TryLockError::WouldBlock) => {
+                anyhow::bail!(
+                    "cache lock {} remained held for {:.3}s; refusing to replace the live lock file",
+                    path.display(),
+                    timeout.as_secs_f64()
+                );
+            }
+            Err(TryLockError::Error(err)) => {
+                return Err(anyhow::Error::from(err))
+                    .with_context(|| format!("locking cache file {}", path.display()));
+            }
+        }
+    }
+    operation()
+}
+
+fn with_cache_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _process_lock = CACHE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("cache process lock poisoned"))?;
+    with_cache_file_lock_at(&cache_lock_path()?, CACHE_LOCK_WAIT_TIMEOUT, operation)
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -70,20 +133,13 @@ fn load_cache() -> CacheFile {
 
 fn save_cache(cache: &CacheFile) -> Result<()> {
     let path = cache_path()?;
-    let json = serde_json::to_string(cache).context("serializing cache")?;
+    save_cache_at(&path, cache)
+}
 
-    // Atomic write: write to temp file then rename.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json)
-        .with_context(|| format!("writing cache temp file {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| {
-        format!(
-            "renaming cache temp file {} -> {}",
-            tmp.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
+fn save_cache_at(path: &std::path::Path, cache: &CacheFile) -> Result<()> {
+    let json = serde_json::to_string(cache).context("serializing cache")?;
+    auth::atomic_write_private(path, json.as_bytes())
+        .with_context(|| format!("writing cache file {}", path.display()))
 }
 
 fn to_entry(u: &UsageInfo) -> CacheEntry {
@@ -137,47 +193,44 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
 
 /// Get cached usage for an alias if within TTL.
 pub fn get(alias: &str) -> Option<UsageInfo> {
-    let _lock = match CACHE_LOCK.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            tracing::warn!("cache lock poisoned in get()");
-            return None;
+    match with_cache_lock(|| {
+        let cache = load_cache();
+        let Some(entry) = cache.entries.get(alias) else {
+            return Ok(None);
+        };
+        if now_secs().saturating_sub(entry.ts) > ttl() {
+            return Ok(None);
         }
-    };
-    let cache = load_cache();
-    let entry = cache.entries.get(alias)?;
-    if now_secs() - entry.ts > ttl() {
-        return None;
+        Ok(Some(from_entry(entry)))
+    }) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("Failed to read cache for {alias}: {err}");
+            None
+        }
     }
-    Some(from_entry(entry))
 }
 
 /// Store usage result in cache.
 pub fn put(alias: &str, usage: &UsageInfo) {
-    let _lock = match CACHE_LOCK.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            tracing::warn!("cache lock poisoned in put()");
-            return;
-        }
-    };
-    let mut cache = load_cache();
-    cache.entries.insert(alias.to_string(), to_entry(usage));
-    if let Err(err) = save_cache(&cache) {
+    if let Err(err) = with_cache_lock(|| {
+        let mut cache = load_cache();
+        cache.entries.insert(alias.to_string(), to_entry(usage));
+        save_cache(&cache)
+    }) {
         tracing::warn!("Failed to write cache: {err}");
     }
 }
 
 /// Remove cached usage for an alias while preserving last-used metadata.
 pub fn invalidate(alias: &str) -> Result<()> {
-    let _lock = CACHE_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("cache lock poisoned"))?;
-    let mut cache = load_cache();
-    if cache.entries.remove(alias).is_some() {
-        save_cache(&cache).context("writing usage cache invalidation")?;
-    }
-    Ok(())
+    with_cache_lock(|| {
+        let mut cache = load_cache();
+        if cache.entries.remove(alias).is_some() {
+            save_cache(&cache).context("writing usage cache invalidation")?;
+        }
+        Ok(())
+    })
 }
 
 /// Async wrapper around [`get`]: runs the blocking lock + file read on a
@@ -201,55 +254,52 @@ pub async fn put_async(alias: &str, usage: &UsageInfo) {
 
 /// Get the last-used timestamp for an alias (0 if never used).
 pub fn get_last_used(alias: &str) -> i64 {
-    let _lock = match CACHE_LOCK.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            tracing::warn!("cache lock poisoned in get_last_used()");
-            return 0;
+    match with_cache_lock(|| Ok(load_cache().last_used.get(alias).copied().unwrap_or(0))) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("Failed to read last-used cache for {alias}: {err}");
+            0
         }
-    };
-    let cache = load_cache();
-    cache.last_used.get(alias).copied().unwrap_or(0)
+    }
 }
 
 /// Record that an alias was just selected by `use`.
 pub fn set_last_used(alias: &str) -> Result<()> {
-    let _lock = CACHE_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("cache lock poisoned"))?;
-    let mut cache = load_cache();
-    cache
-        .last_used
-        .insert(alias.to_string(), crate::auth::now_unix_secs());
-    save_cache(&cache).context("writing last_used cache")?;
-    Ok(())
+    with_cache_lock(|| {
+        let mut cache = load_cache();
+        cache
+            .last_used
+            .insert(alias.to_string(), crate::auth::now_unix_secs());
+        save_cache(&cache).context("writing last_used cache")
+    })
 }
 
 pub fn rename(old: &str, new: &str) -> Result<()> {
-    let _lock = CACHE_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("cache lock poisoned"))?;
-    let mut cache = load_cache();
-    // Migrate entries and last_used independently — either may exist without the other.
-    let mut changed = false;
-    if let Some(entry) = cache.entries.remove(old) {
-        cache.entries.insert(new.to_string(), entry);
-        changed = true;
-    }
-    if let Some(ts) = cache.last_used.remove(old) {
-        cache.last_used.insert(new.to_string(), ts);
-        changed = true;
-    }
-    if changed {
-        save_cache(&cache)?;
-    }
-    Ok(())
+    with_cache_lock(|| {
+        let mut cache = load_cache();
+        // Migrate entries and last_used independently — either may exist without the other.
+        let mut changed = false;
+        if let Some(entry) = cache.entries.remove(old) {
+            cache.entries.insert(new.to_string(), entry);
+            changed = true;
+        }
+        if let Some(ts) = cache.last_used.remove(old) {
+            cache.last_used.insert(new.to_string(), ts);
+            changed = true;
+        }
+        if changed {
+            save_cache(&cache)?;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs4::FileExt;
     use serde_json::json;
+    use std::time::Duration;
 
     #[test]
     fn test_cache_entry_deserialize_without_credits() {
@@ -287,5 +337,78 @@ mod tests {
         let entry = to_entry(&usage);
         assert!(entry.account_limited);
         assert!(from_entry(&entry).account_limited);
+    }
+
+    #[test]
+    fn cache_mutation_waits_for_cross_process_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("cache.lock");
+        let holder = open_cache_lock_file(&lock_path).unwrap();
+        FileExt::lock(&holder).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_path = lock_path.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(with_cache_file_lock_at(
+                    &worker_path,
+                    Duration::from_secs(1),
+                    || Ok(()),
+                ))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "cache mutation must wait for an independently-held OS lock"
+        );
+
+        drop(holder);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cache_atomic_write_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        let mut first = CacheFile::default();
+        first.last_used.insert("alice".into(), 1);
+        save_cache_at(&path, &first).unwrap();
+
+        let mut second = CacheFile::default();
+        second.last_used.insert("bob".into(), 2);
+        save_cache_at(&path, &second).unwrap();
+
+        let saved: CacheFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.last_used.get("bob"), Some(&2));
+        assert!(!saved.last_used.contains_key("alice"));
+    }
+
+    #[test]
+    fn cache_lock_timeout_preserves_live_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("cache.lock");
+        let holder = open_cache_lock_file(&lock_path).unwrap();
+        std::fs::write(&lock_path, "holder-marker").unwrap();
+        FileExt::lock(&holder).unwrap();
+
+        let err =
+            with_cache_file_lock_at(&lock_path, Duration::from_millis(25), || Ok(())).unwrap_err();
+        assert!(err.to_string().contains("cache lock"));
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            "holder-marker"
+        );
+        let reopened = open_cache_lock_file(&lock_path).unwrap();
+        assert!(matches!(
+            FileExt::try_lock(&reopened),
+            Err(fs4::TryLockError::WouldBlock)
+        ));
     }
 }

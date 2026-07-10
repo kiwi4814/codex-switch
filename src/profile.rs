@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use fs4::{FileExt, TryLockError};
 
 use crate::auth::{
-    app_home, backup_auth, codex_auth_path, current_file, profiles_dir, read_auth, write_auth,
+    app_home, atomic_write_private, backup_auth, codex_auth_path, current_file, profiles_dir,
+    read_auth, write_auth,
 };
 use crate::error::CsError;
 use crate::jwt::parse_account_info;
@@ -85,21 +86,51 @@ fn auth_lock_path() -> Result<PathBuf> {
     Ok(app_home()?.join("auth.lock"))
 }
 
-/// Maximum time to wait for the auth lock before treating the holder as stale
-/// and forcibly taking over by recreating the lock file (new inode = new lock).
-/// Normal hold time is < 7s (see `restore_delay_secs`), so 15s is comfortable.
-const LOCK_STALE_AFTER: Duration = Duration::from_secs(15);
+fn launch_lock_path() -> Result<PathBuf> {
+    Ok(app_home()?.join("launch.lock"))
+}
+
+/// Maximum time to wait for an auth-related lock. A timeout is reported rather
+/// than replacing the inode because an OS lock is the only reliable liveness signal.
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub fn lock_live_auth() -> Result<File> {
     let path = auth_lock_path()?;
+    acquire_file_lock(&path, LOCK_WAIT_TIMEOUT, "auth")
+}
+
+/// Serialize the short launch staging window without holding the auth write
+/// lock while Codex starts and reads the staged credentials.
+pub fn lock_launch_session() -> Result<File> {
+    let path = launch_lock_path()?;
+    acquire_file_lock(&path, LOCK_WAIT_TIMEOUT, "launch session")
+}
+
+struct AuthTransaction {
+    _launch: File,
+    _auth: File,
+}
+
+fn lock_auth_transaction() -> Result<AuthTransaction> {
+    // Every writer uses this order. Launch holds the first lock across its
+    // stage/start/restore window and only takes the auth lock for each write.
+    let launch = lock_launch_session()?;
+    let auth = lock_live_auth()?;
+    Ok(AuthTransaction {
+        _launch: launch,
+        _auth: auth,
+    })
+}
+
+fn acquire_file_lock(path: &Path, timeout: Duration, label: &str) -> Result<File> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
     }
 
-    let file = open_lock_file(&path)?;
+    let file = open_lock_file(path)?;
 
-    let deadline = Instant::now() + LOCK_STALE_AFTER;
+    let deadline = Instant::now() + timeout;
     loop {
         match FileExt::try_lock(&file) {
             Ok(()) => {
@@ -108,27 +139,13 @@ pub fn lock_live_auth() -> Result<File> {
             }
             Err(TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
-                    // Holder didn't release within the stale window.
-                    // Force takeover: unlink the old lock file (parent dir is user-owned,
-                    // so unlink succeeds even if the lock file itself is owned by root).
-                    // Any process still holding the old fd keeps its lock on the now-orphan
-                    // inode, but new acquirers race on the freshly created inode instead.
-                    drop(file);
-                    let prev_holder = read_lock_holder(&path);
-                    std::fs::remove_file(&path)
-                        .with_context(|| format!("removing stale auth lock {}", path.display()))?;
-                    let new_file = open_lock_file(&path)?;
-                    FileExt::lock(&new_file).with_context(|| {
-                        format!("locking recreated auth lock {}", path.display())
-                    })?;
-                    tracing::warn!(
-                        "auth lock at {} held >{}s by {}; took over",
+                    let holder =
+                        read_lock_holder(path).unwrap_or_else(|| "unknown holder".to_string());
+                    anyhow::bail!(
+                        "{label} lock {} remained held for {:.3}s by {holder}; refusing to replace the live lock file",
                         path.display(),
-                        LOCK_STALE_AFTER.as_secs(),
-                        prev_holder.as_deref().unwrap_or("unknown holder"),
+                        timeout.as_secs_f64(),
                     );
-                    write_lock_holder(&new_file);
-                    return Ok(new_file);
                 }
                 std::thread::sleep(LOCK_POLL_INTERVAL);
             }
@@ -140,33 +157,15 @@ pub fn lock_live_auth() -> Result<File> {
     }
 }
 
-/// Open the lock file; if the open fails because of a permission/ownership
-/// issue (e.g. a stale file left behind by a previous `sudo` invocation),
-/// unlink it and retry once. Removing the file only needs write+execute on
-/// the parent dir — which is owned by the current user — so this self-heals
-/// without requiring `sudo`.
+/// Open a stable lock inode. Permission/ownership errors are reported rather
+/// than recovered by unlinking because another process may still hold it.
 fn open_lock_file(path: &Path) -> Result<File> {
-    match try_open_lock_file(path) {
-        Ok(f) => Ok(f),
-        Err(e) if matches!(e.kind(), io::ErrorKind::PermissionDenied) => {
-            std::fs::remove_file(path).with_context(|| {
-                format!(
-                    "auth lock {} not openable (permission denied) and could not be removed; \
-                     check ownership of {} and its parent directory",
-                    path.display(),
-                    path.display(),
-                )
-            })?;
-            tracing::warn!(
-                "auth lock {} was not openable; removed and recreating",
-                path.display()
-            );
-            try_open_lock_file(path)
-                .with_context(|| format!("opening auth lock {} after recovery", path.display()))
-        }
-        Err(e) => Err(anyhow::Error::from(e))
-            .with_context(|| format!("opening auth lock {}", path.display())),
-    }
+    try_open_lock_file(path).with_context(|| {
+        format!(
+            "opening auth lock {}; check the file and parent directory ownership",
+            path.display()
+        )
+    })
 }
 
 fn try_open_lock_file(path: &Path) -> io::Result<File> {
@@ -203,10 +202,7 @@ fn read_lock_holder(path: &Path) -> Option<String> {
 
 fn write_current(alias: &str) -> Result<()> {
     let path = current_file()?;
-    if let Some(p) = path.parent() {
-        ensure_private_dir(p)?;
-    }
-    std::fs::write(&path, alias)
+    atomic_write_private(&path, alias.as_bytes())
         .with_context(|| format!("writing current profile marker {}", path.display()))?;
     Ok(())
 }
@@ -218,12 +214,51 @@ fn switch_live_auth(alias: &str) -> Result<()> {
         return Err(CsError::NotFound(alias.to_string()).into());
     }
 
+    let _transaction = lock_auth_transaction()?;
     let val = read_auth(&src)?;
-    let _lock = lock_live_auth()?;
     let dst = codex_auth_path()?;
     backup_auth(&dst)?;
     write_auth(&dst, &val)?;
     write_current(alias)?;
+    Ok(())
+}
+
+/// Persist refreshed tokens and, if this alias is current, update the live
+/// Codex credentials under the same cross-process transaction.
+pub fn update_profile_tokens_and_live_if_current(
+    alias: &str,
+    id_token: &str,
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<()> {
+    validate_alias(alias)?;
+    let profile_path = profile_auth_path(alias)?;
+    let _transaction = lock_auth_transaction()?;
+    crate::auth::update_tokens(&profile_path, id_token, access_token, refresh_token)
+        .with_context(|| format!("updating refreshed tokens for profile {alias}"))?;
+    if read_current() == alias {
+        let live = codex_auth_path()?;
+        crate::auth::update_tokens(&live, id_token, access_token, refresh_token)
+            .with_context(|| format!("updating live auth for current profile {alias}"))?;
+    }
+    Ok(())
+}
+
+/// Replace a saved profile and its live copy, when current, as one serialized
+/// transaction. Used by CLI/TUI re-login paths.
+pub fn replace_profile_auth_and_live_if_current(
+    alias: &str,
+    val: &serde_json::Value,
+) -> Result<()> {
+    validate_alias(alias)?;
+    let profile_path = profile_auth_path(alias)?;
+    let _transaction = lock_auth_transaction()?;
+    write_auth(&profile_path, val)?;
+    if read_current() == alias {
+        let live = codex_auth_path()?;
+        backup_auth(&live)?;
+        write_auth(&live, val)?;
+    }
     Ok(())
 }
 
@@ -255,6 +290,7 @@ pub fn active_profile_from_live() -> Option<String> {
 }
 
 pub fn sync_current_from_live() -> Option<String> {
+    let _transaction = lock_auth_transaction().ok()?;
     let alias = active_profile_from_live()?;
     if read_current() != alias
         && let Err(e) = write_current(&alias)
@@ -461,6 +497,8 @@ pub fn detect_auth_change() -> AuthChange {
 /// The profile is written in canonical format. The live file is also normalized
 /// (best-effort) to ensure SHA256 consistency; failure to normalize live is non-fatal.
 pub fn update_profile_from_live(alias: &str) -> Result<()> {
+    validate_alias(alias)?;
+    let _transaction = lock_auth_transaction()?;
     let src = codex_auth_path()?;
     let val = read_auth(&src)?;
     let dst = profile_auth_path(alias)?;
@@ -492,14 +530,9 @@ pub fn auto_track_current() -> bool {
     };
     let identity = extract_identity(&val);
 
-    if let Some(matching) = find_profile_by_identity_exact(&identity) {
+    if find_profile_by_identity_exact(&identity).is_some() {
         // Exact match (account_id + email) — safe to sync the current pointer.
-        let current = read_current();
-        if current != matching
-            && let Err(e) = write_current(&matching)
-        {
-            tracing::debug!("auto_track_current: could not sync current pointer: {e}");
-        }
+        let _ = sync_current_from_live();
         return false;
     }
     // Email-only matches are ambiguous (same email, different workspace) —
@@ -523,6 +556,7 @@ pub fn cmd_save(alias: Option<&str>) -> Result<SaveAction> {
         return Err(CsError::NoAuthFile(src.display().to_string()).into());
     }
 
+    let _transaction = lock_auth_transaction()?;
     let val = read_auth(&src)?;
     // Best-effort: normalize live file to canonical formatting for SHA256 consistency
     if let Err(e) = write_auth(&src, &val) {
@@ -659,6 +693,7 @@ pub fn stage_profile_auth(alias: &str) -> Result<()> {
 
 pub fn cmd_delete(alias: &str) -> Result<()> {
     validate_alias(alias)?;
+    let _transaction = lock_auth_transaction()?;
     let dir = profiles_dir()?.join(alias);
     if !dir.exists() {
         return Err(CsError::NotFound(alias.to_string()).into());
@@ -716,6 +751,7 @@ pub fn save_imported_auth_value(
     val: serde_json::Value,
     hint_alias: Option<&str>,
 ) -> Result<SaveAction> {
+    let _transaction = lock_auth_transaction()?;
     let identity = extract_identity(&val);
 
     if let Some(existing) = find_profile_by_identity(&identity) {
@@ -754,6 +790,7 @@ pub fn rename_profile(old_alias: &str, new_alias: &str) -> Result<()> {
     if new_dir.exists() {
         anyhow::bail!("profile '{new_alias}' already exists");
     }
+    let _transaction = lock_auth_transaction()?;
     std::fs::rename(&old_dir, &new_dir).with_context(|| {
         format!(
             "renaming profile {} -> {}",
@@ -772,6 +809,7 @@ pub fn rename_profile(old_alias: &str, new_alias: &str) -> Result<()> {
 }
 
 pub fn save_auth_value(val: serde_json::Value, hint_alias: Option<&str>) -> Result<SaveAction> {
+    let _transaction = lock_auth_transaction()?;
     let identity = extract_identity(&val);
 
     if let Some(existing) = find_profile_by_identity(&identity) {
@@ -988,6 +1026,129 @@ mod tests {
             Some("acc_new")
         );
         assert_eq!(super::read_current(), "next-profile");
+    }
+
+    #[test]
+    fn auth_lock_timeout_preserves_live_lock_inode() {
+        let _env = TestEnv::new();
+        let lock_path = super::auth_lock_path().unwrap();
+        super::ensure_private_dir(lock_path.parent().unwrap()).unwrap();
+        let holder = super::open_lock_file(&lock_path).unwrap();
+        FileExt::lock(&holder).unwrap();
+        super::write_lock_holder(&holder);
+        let holder_text = std::fs::read_to_string(&lock_path).unwrap();
+
+        let err =
+            super::acquire_file_lock(&lock_path, Duration::from_millis(25), "auth").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("auth lock"), "{message}");
+        assert!(
+            message.contains(&lock_path.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), holder_text);
+
+        let reopened = super::open_lock_file(&lock_path).unwrap();
+        assert!(matches!(
+            FileExt::try_lock(&reopened),
+            Err(fs4::TryLockError::WouldBlock)
+        ));
+    }
+
+    #[test]
+    fn switch_profile_waits_for_launch_session_lease() {
+        let _env = TestEnv::new();
+        let next = realistic_auth_json("next@example.com", "acct_next", "acc_new", "ref_new");
+        let profile_path = super::profile_auth_path("next-profile").unwrap();
+        super::ensure_profile_parent(&profile_path).unwrap();
+        crate::auth::write_auth(&profile_path, &next).unwrap();
+
+        let lease = super::lock_launch_session().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(super::switch_profile("next-profile").is_ok())
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "switch must wait while the launch session lease is held"
+        );
+
+        drop(lease);
+        assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn refreshed_profile_and_live_auth_update_are_one_transaction() {
+        let _env = TestEnv::new();
+        let alice = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
+        let bob = realistic_auth_json("bob@example.com", "acct_b", "b-old", "b-ref");
+        let alice_path = super::profile_auth_path("alice").unwrap();
+        let bob_path = super::profile_auth_path("bob").unwrap();
+        super::ensure_profile_parent(&alice_path).unwrap();
+        super::ensure_profile_parent(&bob_path).unwrap();
+        crate::auth::write_auth(&alice_path, &alice).unwrap();
+        crate::auth::write_auth(&bob_path, &bob).unwrap();
+        super::switch_profile("alice").unwrap();
+
+        let auth_gate = super::lock_live_auth().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let updater = std::thread::spawn(move || {
+            done_tx
+                .send(super::update_profile_tokens_and_live_if_current(
+                    "alice",
+                    "a-id-new",
+                    "a-new",
+                    "a-ref-new",
+                ))
+                .unwrap();
+        });
+
+        let lease_path = super::launch_lock_path().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let probe = super::open_lock_file(&lease_path).unwrap();
+            if matches!(
+                FileExt::try_lock(&probe),
+                Err(fs4::TryLockError::WouldBlock)
+            ) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "updater never acquired launch lease"
+            );
+            std::thread::yield_now();
+        }
+
+        let switcher = std::thread::spawn(|| super::switch_profile("bob"));
+        drop(auth_gate);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        updater.join().unwrap();
+        switcher.join().unwrap().unwrap();
+
+        assert_eq!(super::read_current(), "bob");
+        let live = crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap();
+        assert_eq!(
+            live.pointer("/tokens/access_token")
+                .and_then(|v| v.as_str()),
+            Some("b-old")
+        );
+        let alice_updated = crate::auth::read_auth(&alice_path).unwrap();
+        assert_eq!(
+            alice_updated
+                .pointer("/tokens/access_token")
+                .and_then(|v| v.as_str()),
+            Some("a-new")
+        );
     }
 
     #[test]

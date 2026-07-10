@@ -1544,14 +1544,7 @@ async fn run_oauth_inner(mode: OAuthMode, device: bool) -> Result<String> {
             Ok(format!("Account {verb}: {alias}"))
         }
         OAuthMode::Relogin(alias) => {
-            let dst = profile::profile_auth_path(&alias)?;
-            auth::write_auth(&dst, &auth_val)?;
-            // If this profile is currently active, also refresh the live auth.json.
-            if profile::read_current() == alias {
-                let live = auth::codex_auth_path()?;
-                let _ = auth::backup_auth(&live);
-                auth::write_auth(&live, &auth_val)?;
-            }
+            profile::replace_profile_auth_and_live_if_current(&alias, &auth_val)?;
             let email_disp = info.email.as_deref().unwrap_or("unknown");
             println!("[ok] Re-logged in: {alias} ({email_disp})");
             Ok(format!("Re-logged in: {alias}"))

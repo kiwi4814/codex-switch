@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -169,38 +170,41 @@ pub fn read_auth(path: &Path) -> Result<serde_json::Value> {
     Ok(val)
 }
 
-pub fn write_auth(path: &Path, val: &serde_json::Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating directory {}", parent.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            {
-                tracing::warn!(
-                    "Failed to set directory permissions on {}: {e}",
-                    parent.display()
-                );
-            }
-        }
-    }
-    let raw = serde_json::to_string_pretty(val)?;
-    // Atomic write: write to a temp file, set restrictive perms, then rename.
-    // A direct `fs::write` is non-atomic — a crash mid-write would leave a
-    // truncated auth.json that Codex cannot parse. Permissions are applied to
-    // the temp file before rename so the final file is never world-readable.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &raw).with_context(|| format!("writing {}", tmp.display()))?;
+pub(crate) fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating directory {}", parent.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("setting permissions on {}", tmp.display()))?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("setting permissions on {}", parent.display()))?;
     }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating temporary file in {}", parent.display()))?;
+    tmp.write_all(contents)
+        .with_context(|| format!("writing temporary file for {}", path.display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("syncing temporary file for {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on {}", tmp.path().display()))?;
+    }
+    tmp.persist(path)
+        .map_err(|err| err.error)
+        .with_context(|| format!("atomically replacing {}", path.display()))?;
     Ok(())
+}
+
+pub fn write_auth(path: &Path, val: &serde_json::Value) -> Result<()> {
+    let raw = serde_json::to_string_pretty(val)?;
+    atomic_write_private(path, raw.as_bytes())
 }
 
 /// Mask sensitive token/credential fields in a JSON body before logging.
