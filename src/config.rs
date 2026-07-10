@@ -43,6 +43,16 @@ impl AppConfig {
             );
             self.daemon.cache_refresh_interval_secs = 300;
         }
+        if self.daemon.poll_interval_secs == 0 {
+            tracing::warn!("config.daemon.poll_interval_secs=0 is invalid; using 60 instead");
+            self.daemon.poll_interval_secs = 60;
+        }
+        if self.daemon.token_check_interval_secs == 0 {
+            tracing::warn!(
+                "config.daemon.token_check_interval_secs=0 is invalid; using 300 instead"
+            );
+            self.daemon.token_check_interval_secs = 300;
+        }
         self
     }
 }
@@ -312,5 +322,27 @@ pub fn daemon_log_level() -> String {
         "error".to_string()
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_from_str;
+
+    #[test]
+    fn daemon_zero_intervals_use_defaults() {
+        let config = load_from_str(
+            r#"
+[daemon]
+poll_interval_secs = 0
+token_check_interval_secs = 0
+cache_refresh_interval_secs = 0
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.daemon.poll_interval_secs, 60);
+        assert_eq!(config.daemon.token_check_interval_secs, 300);
+        assert_eq!(config.daemon.cache_refresh_interval_secs, 300);
     }
 }

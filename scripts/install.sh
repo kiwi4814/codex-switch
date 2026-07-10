@@ -14,6 +14,7 @@ BINARY_NAME="codex-switch"
 DATA_DIR="${HOME}/.codex-switch"
 
 info()  { printf '\033[0;34m[info]\033[0m  %s\n' "$*"; }
+warn()  { printf '\033[0;33m[warn]\033[0m  %s\n' "$*" >&2; }
 error() { printf '\033[0;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # Parse arguments
@@ -30,6 +31,52 @@ done
 # ── Uninstall ────────────────────────────────────────────
 if [ "$UNINSTALL" = true ]; then
   info "Uninstalling codex-switch..."
+
+  SERVICE_UNINSTALL_FAILED=false
+  DAEMON_BIN="$(command -v codex-switch 2>/dev/null || true)"
+  if [ -z "$DAEMON_BIN" ] && [ -x "${INSTALL_DIR}/${BINARY_NAME}" ]; then
+    DAEMON_BIN="${INSTALL_DIR}/${BINARY_NAME}"
+  fi
+  if [ -n "$DAEMON_BIN" ]; then
+    if "$DAEMON_BIN" daemon uninstall; then
+      info "Removed daemon service."
+    else
+      warn "Failed to remove daemon service with '${DAEMON_BIN} daemon uninstall'."
+      SERVICE_UNINSTALL_FAILED=true
+    fi
+  else
+    case "$(uname -s)" in
+      Darwin)
+        PLIST_PATH="${HOME}/Library/LaunchAgents/com.codex-switch.daemon.plist"
+        if [ -f "$PLIST_PATH" ]; then
+          if ! launchctl unload "$PLIST_PATH"; then
+            warn "Failed to unload LaunchAgent ${PLIST_PATH}."
+            SERVICE_UNINSTALL_FAILED=true
+          else
+            rm -f "$PLIST_PATH"
+            info "Removed LaunchAgent ${PLIST_PATH}."
+          fi
+        fi
+        ;;
+      Linux)
+        UNIT_PATH="${HOME}/.config/systemd/user/codex-switch-daemon.service"
+        if [ -f "$UNIT_PATH" ]; then
+          if ! systemctl --user disable --now codex-switch-daemon; then
+            warn "Failed to disable systemd user service codex-switch-daemon."
+            SERVICE_UNINSTALL_FAILED=true
+          else
+            rm -f "$UNIT_PATH"
+            systemctl --user daemon-reload || warn "Failed to reload systemd user units."
+            info "Removed systemd user service ${UNIT_PATH}."
+          fi
+        fi
+        ;;
+    esac
+  fi
+
+  if [ "$SERVICE_UNINSTALL_FAILED" = true ]; then
+    error "Daemon service cleanup failed; binary and data were kept. Resolve the service error and retry uninstall."
+  fi
 
   # Check for Homebrew install
   BREW_BIN="$(command -v codex-switch 2>/dev/null || true)"

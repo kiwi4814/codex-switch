@@ -15,8 +15,36 @@ $DataDir = Join-Path $env:USERPROFILE ".codex-switch"
 if ($env:CS_UNINSTALL -eq "1") {
     Write-Host "[info]  Uninstalling codex-switch..." -ForegroundColor Blue
 
-    # Remove binary
     $BinPath = Join-Path $InstallDir $BinaryName
+    $ServiceUninstallFailed = $false
+    if (Test-Path $BinPath) {
+        & $BinPath daemon uninstall
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[info]  Removed daemon scheduled task." -ForegroundColor Blue
+        } else {
+            Write-Warning "Failed to remove daemon scheduled task with '$BinPath daemon uninstall'."
+            $ServiceUninstallFailed = $true
+        }
+    } else {
+        & schtasks.exe /Query /TN "\codex-switch-daemon" 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            & schtasks.exe /End /TN "\codex-switch-daemon" 2>$null | Out-Null
+            & schtasks.exe /Delete /TN "\codex-switch-daemon" /F
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Failed to delete Windows scheduled task \codex-switch-daemon."
+                $ServiceUninstallFailed = $true
+            } else {
+                Write-Host "[info]  Removed daemon scheduled task." -ForegroundColor Blue
+            }
+        }
+    }
+
+    if ($ServiceUninstallFailed) {
+        Write-Error "Daemon service cleanup failed; binary and data were kept. Resolve the service error and retry uninstall."
+        exit 1
+    }
+
+    # Remove binary
     if (Test-Path $BinPath) {
         Remove-Item -Force $BinPath
         Write-Host "[info]  Removed $BinPath" -ForegroundColor Blue

@@ -44,12 +44,49 @@ pub fn is_installed() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        schtasks_status(&["/Query", "/TN", WINDOWS_TASK_NAME]).is_ok()
+        schtasks_status(&["/Query", "/TN", WINDOWS_TASK_NAME])
+            .is_ok_and(|status| exit_code_indicates_installed(status.code()))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         false
     }
+}
+
+fn effective_codex_home() -> Result<PathBuf> {
+    crate::auth::codex_auth_path()?
+        .parent()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("Codex auth path has no parent directory"))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn systemd_quote(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn exit_code_indicates_installed(code: Option<i32>) -> bool {
+    code == Some(0)
+}
+
+fn uninstall_may_continue(stop_succeeded: bool, daemon_running: bool) -> bool {
+    stop_succeeded || !daemon_running
 }
 
 pub fn start_installed() -> Result<()> {
@@ -98,7 +135,10 @@ fn plist_path() -> Result<PathBuf> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn launchd_plist(exe: &str, home: &str) -> String {
+fn launchd_plist(exe: &str, home: &str, codex_home: &str) -> String {
+    let exe = xml_escape(exe);
+    let home = xml_escape(home);
+    let codex_home = xml_escape(codex_home);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -122,11 +162,14 @@ fn launchd_plist(exe: &str, home: &str) -> String {
     <dict>
         <key>HOME</key>
         <string>{home}</string>
+        <key>CODEX_HOME</key>
+        <string>{codex_home}</string>
     </dict>
 </dict>
 </plist>"#,
         exe = exe,
         home = home,
+        codex_home = codex_home,
         label = LAUNCHD_LABEL,
     )
 }
@@ -138,7 +181,8 @@ fn install_launchd() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
         .display()
         .to_string();
-    let plist = launchd_plist(&exe, &home);
+    let codex_home = effective_codex_home()?.display().to_string();
+    let plist = launchd_plist(&exe, &home, &codex_home);
 
     let path = plist_path()?;
     if path.exists() {
@@ -216,9 +260,13 @@ fn uninstall_launchd() -> Result<()> {
         user_println("LaunchAgent not installed");
         return Ok(());
     }
-    let _ = std::process::Command::new("launchctl")
+    let stopped = std::process::Command::new("launchctl")
         .args(["unload", &path.display().to_string()])
-        .status();
+        .status()
+        .is_ok_and(|status| status.success());
+    if !uninstall_may_continue(stopped, crate::daemon::pidfile::is_daemon_running()) {
+        anyhow::bail!("launchctl unload failed while the daemon is still running");
+    }
     std::fs::remove_file(&path)?;
     user_println("Uninstalled LaunchAgent");
     Ok(())
@@ -234,7 +282,10 @@ fn unit_path() -> Result<PathBuf> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn systemd_unit(exe: &str, home: &str) -> String {
+fn systemd_unit(exe: &str, home: &str, codex_home: &str) -> String {
+    let exe = systemd_quote(exe);
+    let home = systemd_quote(&format!("HOME={home}"));
+    let codex_home = systemd_quote(&format!("CODEX_HOME={codex_home}"));
     format!(
         r#"[Unit]
 Description=codex-switch auto-switching daemon
@@ -245,13 +296,15 @@ Type=simple
 ExecStart={exe} daemon start --foreground
 Restart=on-failure
 RestartSec=10
-Environment=HOME={home}
+Environment={home}
+Environment={codex_home}
 
 [Install]
 WantedBy=default.target
 "#,
         exe = exe,
         home = home,
+        codex_home = codex_home,
     )
 }
 
@@ -262,8 +315,9 @@ fn install_systemd() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
         .display()
         .to_string();
+    let codex_home = effective_codex_home()?.display().to_string();
 
-    let unit = systemd_unit(&exe, &home);
+    let unit = systemd_unit(&exe, &home, &codex_home);
 
     let path = unit_path()?;
     if path.exists() {
@@ -330,9 +384,13 @@ fn uninstall_systemd() -> Result<()> {
         user_println("systemd service not installed");
         return Ok(());
     }
-    let _ = std::process::Command::new("systemctl")
+    let stopped = std::process::Command::new("systemctl")
         .args(["--user", "disable", "--now", "codex-switch-daemon"])
-        .status();
+        .status()
+        .is_ok_and(|status| status.success());
+    if !uninstall_may_continue(stopped, crate::daemon::pidfile::is_daemon_running()) {
+        anyhow::bail!("systemctl disable --now failed while the daemon is still running");
+    }
     std::fs::remove_file(&path)?;
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
@@ -344,9 +402,10 @@ fn uninstall_systemd() -> Result<()> {
 // -- Windows Task Scheduler --
 
 #[cfg(any(target_os = "windows", test))]
-fn task_scheduler_command(exe: &Path) -> String {
+fn task_scheduler_command(exe: &Path, codex_home: &Path) -> String {
     format!(
-        "\"{}\" daemon start --foreground",
+        "cmd.exe /D /S /C \"\"set \"CODEX_HOME={}\" && \"{}\" daemon start --foreground\"\"",
+        codex_home.display().to_string().replace('"', ""),
         exe.display().to_string().replace('"', "")
     )
 }
@@ -376,7 +435,8 @@ fn schtasks(args: &[&str], action: &str) -> Result<std::process::Output> {
 #[cfg(target_os = "windows")]
 fn install_task_scheduler() -> Result<()> {
     let exe = std::env::current_exe()?;
-    let task_run = task_scheduler_command(&exe);
+    let codex_home = effective_codex_home()?;
+    let task_run = task_scheduler_command(&exe, &codex_home);
 
     schtasks(
         &[
@@ -404,7 +464,10 @@ fn install_task_scheduler() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn uninstall_task_scheduler() -> Result<()> {
-    let _ = schtasks(&["/End", "/TN", WINDOWS_TASK_NAME], "stop scheduled task");
+    let stopped = schtasks(&["/End", "/TN", WINDOWS_TASK_NAME], "stop scheduled task").is_ok();
+    if !uninstall_may_continue(stopped, crate::daemon::pidfile::is_daemon_running()) {
+        anyhow::bail!("failed to stop scheduled task while the daemon is still running");
+    }
     if !is_installed() {
         user_println("Windows scheduled task not installed");
         return Ok(());
@@ -419,33 +482,92 @@ fn uninstall_task_scheduler() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{launchd_plist, systemd_unit, task_scheduler_command};
+    use super::{
+        exit_code_indicates_installed, launchd_plist, systemd_unit, task_scheduler_command,
+        uninstall_may_continue,
+    };
     use std::path::Path;
 
     #[test]
     fn launchd_plist_runs_foreground_daemon() {
-        let plist = launchd_plist("/usr/local/bin/codex-switch", "/Users/alice");
+        let plist = launchd_plist(
+            "/usr/local/bin/codex-switch",
+            "/Users/alice",
+            "/Users/alice/.codex",
+        );
         assert!(plist.contains("<string>/usr/local/bin/codex-switch</string>"));
         assert!(plist.contains("<string>daemon</string>"));
         assert!(plist.contains("<string>start</string>"));
         assert!(plist.contains("<string>--foreground</string>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(plist.contains("<key>CODEX_HOME</key>"));
+        assert!(plist.contains("<string>/Users/alice/.codex</string>"));
+    }
+
+    #[test]
+    fn launchd_plist_escapes_paths() {
+        let plist = launchd_plist(
+            "/Applications/A & B/codex-switch",
+            "/Users/a<b",
+            "/Users/a&b/.codex",
+        );
+        assert!(plist.contains("/Applications/A &amp; B/codex-switch"));
+        assert!(plist.contains("/Users/a&lt;b"));
+        assert!(plist.contains("/Users/a&amp;b/.codex"));
     }
 
     #[test]
     fn systemd_unit_runs_foreground_daemon() {
-        let unit = systemd_unit("/usr/local/bin/codex-switch", "/home/alice");
-        assert!(unit.contains("ExecStart=/usr/local/bin/codex-switch daemon start --foreground"));
+        let unit = systemd_unit(
+            "/usr/local/bin/codex-switch",
+            "/home/alice",
+            "/home/alice/.codex",
+        );
+        assert!(
+            unit.contains("ExecStart=\"/usr/local/bin/codex-switch\" daemon start --foreground")
+        );
         assert!(unit.contains("Restart=on-failure"));
-        assert!(unit.contains("Environment=HOME=/home/alice"));
+        assert!(unit.contains("Environment=\"HOME=/home/alice\""));
+        assert!(unit.contains("Environment=\"CODEX_HOME=/home/alice/.codex\""));
+    }
+
+    #[test]
+    fn systemd_unit_quotes_special_paths() {
+        let unit = systemd_unit(
+            r#"/opt/Codex & Tools\\codex-switch"#,
+            "/home/a & b",
+            r#"/home/a & b/.codex\\custom"#,
+        );
+        assert!(unit.contains(
+            r#"ExecStart="/opt/Codex & Tools\\\\codex-switch" daemon start --foreground"#
+        ));
+        assert!(unit.contains(r#"Environment="HOME=/home/a & b""#));
+        assert!(unit.contains(r#"Environment="CODEX_HOME=/home/a & b/.codex\\\\custom""#));
     }
 
     #[test]
     fn windows_task_scheduler_command_quotes_exe_path() {
-        let cmd = task_scheduler_command(Path::new(r"C:\Program Files\codex-switch.exe"));
+        let cmd = task_scheduler_command(
+            Path::new(r"C:\Program Files\codex-switch.exe"),
+            Path::new(r"C:\Users\A & B\.codex"),
+        );
         assert_eq!(
             cmd,
-            r#""C:\Program Files\codex-switch.exe" daemon start --foreground"#
+            r#"cmd.exe /D /S /C ""set "CODEX_HOME=C:\Users\A & B\.codex" && "C:\Program Files\codex-switch.exe" daemon start --foreground"""#
         );
+    }
+
+    #[test]
+    fn windows_task_exists_only_for_success_exit_code() {
+        assert!(exit_code_indicates_installed(Some(0)));
+        assert!(!exit_code_indicates_installed(Some(1)));
+        assert!(!exit_code_indicates_installed(None));
+    }
+
+    #[test]
+    fn uninstall_stops_when_service_command_failed_and_daemon_is_running() {
+        assert!(!uninstall_may_continue(false, true));
+        assert!(uninstall_may_continue(false, false));
+        assert!(uninstall_may_continue(true, true));
     }
 }
