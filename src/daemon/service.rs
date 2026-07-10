@@ -60,6 +60,7 @@ fn effective_codex_home() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("Codex auth path has no parent directory"))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
