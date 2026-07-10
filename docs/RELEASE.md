@@ -29,34 +29,36 @@ error: src refspec dev matches more than one
 前置：`dev` 分支已合入待发布的所有 commit；本地工作树干净。
 
 ```bash
-# 1) 跑全量测试（最低保证）
+# 1) 跑全量测试（本地预检，不作为发布产物依据）
 cargo test --all
 
-# 2) 本地 release 构建一次，验证可编译且 --version 正确
-cargo build --release
-./target/release/codex-switch --version
-
-# 3) 推送 dev 分支到远端（必须完整 refspec）
+# 2) 推送 dev 分支到远端（必须完整 refspec）
 git push origin refs/heads/dev:refs/heads/dev
 
-# 4) 删除远端旧 dev tag（指向旧 commit，需要先删才能"移动"）
+# 3) 删除远端旧 dev tag（指向旧 commit，需要先删才能"移动"）
 git push origin :refs/tags/dev
 
-# 5) 在本地把 dev tag 重打到 HEAD
+# 4) 在本地把 dev tag 重打到 HEAD
 git tag -d dev && git tag dev
 
-# 6) 推送新 dev tag —— 触发 CI 构建 6 平台二进制 + 覆盖 GitHub Release `dev`
+# 5) 推送新 dev tag —— 触发 CI 构建 6 平台二进制 + 覆盖 GitHub Release `dev`
 git push origin refs/tags/dev:refs/tags/dev
 ```
 
-> 第 6 步**不能写 `git push origin dev`**：歧义错误（分支 + tag 同名）。必须用 `refs/tags/dev:refs/tags/dev`。
+> 第 5 步**不能写 `git push origin dev`**：歧义错误（分支 + tag 同名）。必须用 `refs/tags/dev:refs/tags/dev`。
 >
-> 第 3 步同理：必须 `refs/heads/dev:refs/heads/dev`。
+> 第 2 步同理：必须 `refs/heads/dev:refs/heads/dev`。
 
-CI 完成后产物：
+发布产物以 GitHub Actions `Release` workflow 构建为准，不用本地 `target/release` 作为发布依据。CI 完成后产物：
 - 6 平台 tarball：`cs-{linux,darwin,windows}-{amd64,arm64}.tar.gz` + `.sha256`
 - `install.sh` / `install.ps1`
 - 用户侧：`codex-switch self-update --dev` 立即可拉取
+
+发布后复测至少确认：
+- GitHub Actions `Release` run 成功，6 平台 build 和 release job 通过
+- 从 GitHub Release 下载对应平台 tarball 与 `.sha256`，校验 sha256
+- 解包后的 release 产物 `codex-switch --version` 输出 CI 注入版本
+- 原触发路径可用，例如 `codex-switch self-update --check --dev`
 
 ## 发布 stable
 

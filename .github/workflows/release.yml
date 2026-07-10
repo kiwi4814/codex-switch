@@ -191,7 +191,7 @@ jobs:
         id: dev_body
         run: |
           cat > dev_body.md << EOF
-          Development build from \`master\` at ${{ github.sha }}.
+          Development build from \`${{ github.ref }}\` at ${{ github.sha }}.
 
           **This is a pre-release build for testing.** Use \`codex-switch self-update --dev\` to install, or \`codex-switch self-update --stable\` to return to the latest stable release.
 
