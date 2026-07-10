@@ -4,7 +4,7 @@
 
 [**中文文档 →**](README_CN.md)
 
-> Latest stable release: `v0.0.20`.
+> Latest stable release: `v0.0.21`.
 
 ---
 
@@ -308,7 +308,7 @@ codex-switch use && codex
 
 ### Keep the next session ready with the daemon (Beta, macOS/Linux)
 
-Use the Beta daemon when you want `codex-switch` to monitor the current account continuously and prepare the next Codex launch in the background. In stable `v0.0.20`, service installation is supported on macOS and Linux.
+Use the Beta daemon when you want `codex-switch` to monitor the current account continuously and prepare the next Codex launch in the background. In stable `v0.0.21`, service installation is supported on macOS and Linux.
 
 ```bash
 # Start a detached daemon
@@ -477,7 +477,7 @@ When a usage query returns HTTP 401/403, the tool automatically attempts to refr
 - File manager opens via `explorer.exe`
 - Terminal: works with Windows Terminal, PowerShell, and cmd.exe
 - TUI rendering uses Windows Console API via `crossterm`
-- Background daemon service installation is not part of stable `v0.0.20` on Windows
+- Background daemon service installation on Windows is not officially supported in stable `v0.0.21` yet
 - **Recommended terminal: [Windows Terminal](https://aka.ms/terminal).** Git Bash (mintty) has known compatibility issues with TUI rendering — use Windows Terminal or PowerShell instead
 
 ## JSON Output

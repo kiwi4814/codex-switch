@@ -4,7 +4,7 @@
 
 [**English Documentation →**](README.md)
 
-> 当前正式版：`v0.0.20`。
+> 当前正式版：`v0.0.21`。
 
 ---
 
@@ -307,7 +307,7 @@ codex-switch use && codex
 
 ### 使用守护进程保持下一次会话就绪（Beta，macOS/Linux）
 
-当你希望 `codex-switch` 持续监控当前账号并在后台准备好下一次 Codex 启动时，可使用 Beta 守护进程。稳定版 `v0.0.20` 支持 macOS 和 Linux 的服务安装。
+当你希望 `codex-switch` 持续监控当前账号并在后台准备好下一次 Codex 启动时，可使用 Beta 守护进程。稳定版 `v0.0.21` 支持 macOS 和 Linux 的服务安装。
 
 ```bash
 # 启动后台守护进程
@@ -476,7 +476,7 @@ v0.0.13+ 不再有模式选择。此统一算法替代了之前的 `max-remainin
 - 文件管理器通过 `explorer.exe` 打开
 - 终端：支持 Windows Terminal、PowerShell 和 cmd.exe
 - TUI 通过 `crossterm` 使用 Windows Console API 渲染
-- 稳定版 `v0.0.20` 不包含 Windows 后台 daemon 服务安装
+- 稳定版 `v0.0.21` 的 Windows 后台 daemon 服务安装尚未正式支持
 - **推荐终端：[Windows Terminal](https://aka.ms/terminal)。** Git Bash（mintty）与 TUI 渲染存在已知兼容性问题，请使用 Windows Terminal 或 PowerShell
 
 ## JSON 输出
