@@ -602,7 +602,11 @@ fn reset_credits_lines(u: &UsageInfo) -> Vec<Line<'static>> {
         spans.extend([
             Span::styled("  |  earliest expiry ", base().fg(DIM)),
             Span::styled(
-                format_local_datetime(&credit.expires_at),
+                credit
+                    .expires_at
+                    .as_deref()
+                    .map(format_local_datetime)
+                    .unwrap_or_else(|| "no expiry".to_string()),
                 base().fg(C_CYAN).add_modifier(Modifier::BOLD),
             ),
         ]);

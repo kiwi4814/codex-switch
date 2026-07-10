@@ -30,6 +30,8 @@ struct CacheEntry {
     reset_credits: Vec<ResetCredit>,
     #[serde(default)]
     reset_credits_error: Option<String>,
+    #[serde(default)]
+    account_limited: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -97,6 +99,7 @@ fn to_entry(u: &UsageInfo) -> CacheEntry {
         reset_credits_available_count: u.reset_credits_available_count,
         reset_credits: u.reset_credits.clone(),
         reset_credits_error: u.reset_credits_error.clone(),
+        account_limited: u.account_limited,
     }
 }
 
@@ -128,6 +131,7 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         reset_credits_available_count: e.reset_credits_available_count,
         reset_credits: e.reset_credits.clone(),
         reset_credits_error: e.reset_credits_error.clone(),
+        account_limited: e.account_limited,
     }
 }
 
@@ -263,11 +267,25 @@ mod tests {
         assert_eq!(entry.reset_credits_available_count, None);
         assert!(entry.reset_credits.is_empty());
         assert_eq!(entry.reset_credits_error, None);
+        assert!(!entry.account_limited);
 
         let usage = from_entry(&entry);
         assert_eq!(usage.credits_balance, None);
         assert_eq!(usage.unlimited_credits, None);
         assert_eq!(usage.reset_credits_available_count, None);
         assert!(usage.reset_credits.is_empty());
+        assert!(!usage.account_limited);
+    }
+
+    #[test]
+    fn test_cache_round_trip_preserves_account_limited() {
+        let usage = UsageInfo {
+            account_limited: true,
+            ..Default::default()
+        };
+
+        let entry = to_entry(&usage);
+        assert!(entry.account_limited);
+        assert!(from_entry(&entry).account_limited);
     }
 }

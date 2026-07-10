@@ -387,7 +387,7 @@ async fn http_reset_card_consume_uses_earliest_expiry() {
 
     assert_eq!(result.credit.id, "reset_credit_1");
     assert_eq!(result.windows_reset, Some(2));
-    assert_eq!(result.code.as_deref(), Some("success"));
+    assert_eq!(result.code.as_deref(), Some("reset"));
 
     server.shutdown();
 }

@@ -17,6 +17,7 @@ pub struct AccountInfo {
     pub email: Option<String>,
     pub plan_type: Option<String>,
     pub account_id: Option<String>,
+    pub is_fedramp: bool,
     #[allow(dead_code)]
     pub user_id: Option<String>,
     pub workspace_name: Option<String>,
@@ -94,6 +95,11 @@ pub fn parse_account_info(auth: &Value) -> AccountInfo {
         .map(|s| s.to_string())
         .or(account_id_from_tokens);
 
+    let is_fedramp = auth_claims
+        .and_then(|a| a.get("chatgpt_account_is_fedramp"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let workspace_name = extract_workspace_name(&claims);
     let organizations = extract_organizations(&claims);
 
@@ -101,6 +107,7 @@ pub fn parse_account_info(auth: &Value) -> AccountInfo {
         email,
         plan_type,
         account_id,
+        is_fedramp,
         user_id,
         workspace_name,
         organizations,
@@ -251,6 +258,24 @@ mod tests {
         assert_eq!(info.email.as_deref(), Some("user@example.com"));
         assert_eq!(info.plan_type.as_deref(), Some("pro"));
         assert_eq!(info.account_id.as_deref(), Some("acct-from-claim"));
+    }
+
+    #[test]
+    fn test_parse_account_info_extracts_fedramp_routing_claim() {
+        let auth = json!({
+            "tokens": {
+                "id_token": make_jwt(&json!({
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "acct-fedramp",
+                        "chatgpt_account_is_fedramp": true,
+                    }
+                }))
+            }
+        });
+
+        let info = parse_account_info(&auth);
+
+        assert!(info.is_fedramp);
     }
 
     #[test]

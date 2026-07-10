@@ -25,15 +25,39 @@ fn detect_codex_version() -> &'static str {
     })
 }
 
-async fn fetch_warmup_model(client: &reqwest::Client, access_token: &str) -> Result<String> {
-    let version = detect_codex_version();
-    let resp = client
-        .get(MODELS_URL)
-        .query(&[("client_version", version)])
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .map_err(|e| crate::auth::format_reqwest_error("models fetch failed", &e))?;
+fn build_models_request(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+    version: &str,
+) -> reqwest::RequestBuilder {
+    crate::usage::apply_account_routing_headers(
+        client
+            .get(MODELS_URL)
+            .query(&[("client_version", version)])
+            .bearer_auth(access_token),
+        account_id,
+        is_fedramp,
+    )
+}
+
+async fn fetch_warmup_model(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+) -> Result<String> {
+    let resp = build_models_request(
+        client,
+        access_token,
+        account_id,
+        is_fedramp,
+        detect_codex_version(),
+    )
+    .send()
+    .await
+    .map_err(|e| crate::auth::format_reqwest_error("models fetch failed", &e))?;
 
     if !resp.status().is_success() {
         bail!("models endpoint returned {}", resp.status());
@@ -69,14 +93,19 @@ async fn fetch_warmup_model(client: &reqwest::Client, access_token: &str) -> Res
     Ok(selected.to_string())
 }
 
-async fn resolve_model(client: &reqwest::Client, access_token: &str) -> String {
+async fn resolve_model(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+) -> String {
     let mut guard = MODEL_CACHE.lock().await;
     if let Some(ref model) = *guard {
         return model.clone();
     }
     // Hold the lock across the fetch so concurrent callers wait here instead of
     // each issuing a redundant request.
-    match fetch_warmup_model(client, access_token).await {
+    match fetch_warmup_model(client, access_token, account_id, is_fedramp).await {
         Ok(model) => {
             *guard = Some(model.clone());
             model
@@ -109,17 +138,19 @@ fn build_body(model: &str) -> serde_json::Value {
 fn make_request(
     client: &reqwest::Client,
     access_token: &str,
-    account_id: &Option<String>,
+    account_id: Option<&str>,
+    is_fedramp: bool,
     body: &serde_json::Value,
 ) -> reqwest::RequestBuilder {
-    let mut builder = client
-        .post(RESPONSES_URL)
-        .bearer_auth(access_token)
-        .header("Content-Type", "application/json");
-    if let Some(acct_id) = account_id {
-        builder = builder.header("ChatGPT-Account-Id", acct_id);
-    }
-    builder.json(body)
+    crate::usage::apply_account_routing_headers(
+        client
+            .post(RESPONSES_URL)
+            .bearer_auth(access_token)
+            .header("Content-Type", "application/json"),
+        account_id,
+        is_fedramp,
+    )
+    .json(body)
 }
 
 /// Send a minimal completion request to trigger the quota window countdown for a profile.
@@ -132,6 +163,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{alias}: cannot read auth: {e}"))?;
 
     let (at, rt) = crate::auth::extract_tokens(&val);
+    let mut id_token = crate::auth::extract_id_token(&val);
     let mut access_token = at
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{alias}: no access_token in profile"))?;
@@ -139,6 +171,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
 
     let info = crate::auth::read_account_info(profile_path);
     let account_id = info.account_id;
+    let is_fedramp = info.is_fedramp;
 
     let client = crate::auth::build_http_client()?;
 
@@ -147,7 +180,15 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
         && crate::jwt::is_token_expiring(&access_token, 60) == Some(true)
     {
         debug!("[{alias}] access_token expiring soon, refreshing before warmup");
-        match crate::usage::do_refresh_token(alias, &client, rt).await {
+        match crate::usage::do_refresh_token(
+            alias,
+            &client,
+            id_token.as_deref(),
+            Some(&access_token),
+            rt,
+        )
+        .await
+        {
             Ok(refreshed) => {
                 if let Err(e) = crate::auth::update_tokens(
                     profile_path,
@@ -169,21 +210,28 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                     warn!("[{alias}] failed to persist refreshed tokens to live auth: {e}");
                 }
                 access_token = refreshed.access_token;
+                id_token = Some(refreshed.id_token);
                 refresh_token = Some(refreshed.refresh_token);
             }
             Err(e) => warn!("[{alias}] pre-warmup token refresh failed: {e}"),
         }
     }
 
-    let model = resolve_model(&client, &access_token).await;
+    let model = resolve_model(&client, &access_token, account_id.as_deref(), is_fedramp).await;
     let body = build_body(&model);
 
     debug!("[{alias}] warmup POST → {RESPONSES_URL} (model={model})");
 
-    let mut resp = make_request(&client, &access_token, &account_id, &body)
-        .send()
-        .await
-        .map_err(|e| crate::auth::format_reqwest_error("warmup request failed", &e))?;
+    let mut resp = make_request(
+        &client,
+        &access_token,
+        account_id.as_deref(),
+        is_fedramp,
+        &body,
+    )
+    .send()
+    .await
+    .map_err(|e| crate::auth::format_reqwest_error("warmup request failed", &e))?;
 
     let status = resp.status();
     debug!("[{alias}] warmup status: {status}");
@@ -203,12 +251,19 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                     "[{alias}] model {model:?} not supported, refreshing model cache and retrying"
                 );
                 *MODEL_CACHE.lock().await = None;
-                let new_model = resolve_model(&client, &access_token).await;
+                let new_model =
+                    resolve_model(&client, &access_token, account_id.as_deref(), is_fedramp).await;
                 let retry_body = build_body(&new_model);
-                let mut retry_resp = make_request(&client, &access_token, &account_id, &retry_body)
-                    .send()
-                    .await
-                    .map_err(|e| crate::auth::format_reqwest_error("warmup retry failed", &e))?;
+                let mut retry_resp = make_request(
+                    &client,
+                    &access_token,
+                    account_id.as_deref(),
+                    is_fedramp,
+                    &retry_body,
+                )
+                .send()
+                .await
+                .map_err(|e| crate::auth::format_reqwest_error("warmup retry failed", &e))?;
                 let retry_status = retry_resp.status();
                 if retry_status.is_success() {
                     let _ = retry_resp.chunk().await;
@@ -225,7 +280,15 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
             // Retry once with refreshed token
             if let Some(ref rt) = refresh_token {
                 debug!("[{alias}] got {status}, attempting token refresh and retry");
-                match crate::usage::do_refresh_token(alias, &client, rt).await {
+                match crate::usage::do_refresh_token(
+                    alias,
+                    &client,
+                    id_token.as_deref(),
+                    Some(&access_token),
+                    rt,
+                )
+                .await
+                {
                     Ok(refreshed) => {
                         if let Err(e) = crate::auth::update_tokens(
                             profile_path,
@@ -246,13 +309,18 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                         {
                             warn!("[{alias}] failed to persist refreshed tokens to live auth: {e}");
                         }
-                        let mut retry_resp =
-                            make_request(&client, &refreshed.access_token, &account_id, &body)
-                                .send()
-                                .await
-                                .map_err(|e| {
-                                    crate::auth::format_reqwest_error("warmup retry failed", &e)
-                                })?;
+                        let mut retry_resp = make_request(
+                            &client,
+                            &refreshed.access_token,
+                            account_id.as_deref(),
+                            is_fedramp,
+                            &body,
+                        )
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            crate::auth::format_reqwest_error("warmup retry failed", &e)
+                        })?;
                         let retry_status = retry_resp.status();
                         if retry_status.is_success() {
                             let _ = retry_resp.chunk().await;
@@ -273,5 +341,66 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
             let snippet: String = text.chars().take(160).collect();
             bail!("{alias}: HTTP {code} — {snippet}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_models_request_includes_workspace_and_fedramp_headers() {
+        let request = build_models_request(
+            &reqwest::Client::new(),
+            "access-token",
+            Some("workspace-123"),
+            true,
+            "0.144.1",
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("ChatGPT-Account-ID")
+                .and_then(|value| value.to_str().ok()),
+            Some("workspace-123")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("X-OpenAI-Fedramp")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn test_responses_request_includes_workspace_and_fedramp_headers() {
+        let request = make_request(
+            &reqwest::Client::new(),
+            "access-token",
+            Some("workspace-123"),
+            true,
+            &build_body("gpt-test"),
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("ChatGPT-Account-ID")
+                .and_then(|value| value.to_str().ok()),
+            Some("workspace-123")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("X-OpenAI-Fedramp")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
     }
 }

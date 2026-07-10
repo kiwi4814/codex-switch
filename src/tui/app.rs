@@ -171,13 +171,22 @@ impl App {
             .map(|u| {
                 let mut credits: Vec<_> = u.reset_credits.iter().collect();
                 credits.sort_by_key(|credit| {
-                    chrono::DateTime::parse_from_rfc3339(&credit.expires_at)
+                    credit
+                        .expires_at
+                        .as_deref()
+                        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
                         .map(|dt| dt.timestamp())
                         .unwrap_or(i64::MAX)
                 });
                 credits
                     .into_iter()
-                    .map(|credit| format_local_datetime(&credit.expires_at))
+                    .map(|credit| {
+                        credit
+                            .expires_at
+                            .as_deref()
+                            .map(format_local_datetime)
+                            .unwrap_or_else(|| "no expiry".to_string())
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -260,7 +269,11 @@ impl App {
         };
         self.confirm = Some(ConfirmAction::ConsumeResetCard {
             alias: alias.to_string(),
-            expires_at: format_local_datetime(&credit.expires_at),
+            expires_at: credit
+                .expires_at
+                .as_deref()
+                .map(format_local_datetime)
+                .unwrap_or_else(|| "no expiry".to_string()),
         });
     }
 
@@ -610,7 +623,12 @@ impl App {
                     self.set_status(
                         format!(
                             "Used reset card for {alias} (was expiring {})",
-                            format_local_datetime(&consumed.credit.expires_at)
+                            consumed
+                                .credit
+                                .expires_at
+                                .as_deref()
+                                .map(format_local_datetime)
+                                .unwrap_or_else(|| "no expiry".to_string())
                         ),
                         6,
                     );

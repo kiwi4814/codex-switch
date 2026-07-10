@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,7 +19,7 @@ pub struct WindowUsage {
 pub struct ResetCredit {
     pub id: String,
     pub granted_at: Option<String>,
-    pub expires_at: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +42,8 @@ pub struct UsageInfo {
     pub reset_credits_available_count: Option<u64>,
     pub reset_credits: Vec<ResetCredit>,
     pub reset_credits_error: Option<String>,
+    /// Explicit account/workspace-level restriction reported by the API.
+    pub account_limited: bool,
 }
 
 /// All data needed to score an account. Pure data, no I/O.
@@ -74,22 +76,33 @@ impl Candidate {
         last_used: i64,
         now: i64,
     ) -> Self {
+        let force_exhausted = u.account_limited;
         Self {
             alias,
-            used_5h: u
-                .primary
-                .as_ref()
-                .and_then(|w| w.used_percent)
-                .unwrap_or(0.0),
-            resets_at_5h: u.primary.as_ref().and_then(|w| w.resets_at),
-            used_7d: u
-                .secondary
-                .as_ref()
-                .and_then(|w| w.used_percent)
-                .unwrap_or(0.0),
-            resets_at_7d: u.secondary.as_ref().and_then(|w| w.resets_at),
-            has_5h_data: u.primary.is_some(),
-            has_7d_data: u.secondary.is_some(),
+            used_5h: if force_exhausted {
+                100.0
+            } else {
+                u.primary
+                    .as_ref()
+                    .and_then(|w| w.used_percent)
+                    .unwrap_or(0.0)
+            },
+            resets_at_5h: (!force_exhausted)
+                .then(|| u.primary.as_ref().and_then(|w| w.resets_at))
+                .flatten(),
+            used_7d: if force_exhausted {
+                100.0
+            } else {
+                u.secondary
+                    .as_ref()
+                    .and_then(|w| w.used_percent)
+                    .unwrap_or(0.0)
+            },
+            resets_at_7d: (!force_exhausted)
+                .then(|| u.secondary.as_ref().and_then(|w| w.resets_at))
+                .flatten(),
+            has_5h_data: u.primary.is_some() || force_exhausted,
+            has_7d_data: u.secondary.is_some() || force_exhausted,
             is_team,
             is_free,
             last_used,
@@ -187,6 +200,20 @@ const RESET_CREDITS_CONSUME_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+pub(crate) fn apply_account_routing_headers(
+    mut builder: reqwest::RequestBuilder,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+) -> reqwest::RequestBuilder {
+    if let Some(account_id) = account_id.filter(|value| !value.trim().is_empty()) {
+        builder = builder.header("ChatGPT-Account-ID", account_id);
+    }
+    if is_fedramp {
+        builder = builder.header("X-OpenAI-Fedramp", "true");
+    }
+    builder
+}
 
 #[derive(Debug, Deserialize)]
 struct RefreshResponse {
@@ -318,6 +345,39 @@ fn persist_refreshed_tokens(alias: &str, profile_path: &Path, new_tokens: &Refre
     }
 }
 
+fn resolve_refreshed_tokens(
+    response: RefreshResponse,
+    current_id_token: Option<&str>,
+    current_access_token: Option<&str>,
+    current_refresh_token: &str,
+) -> Result<RefreshedTokens> {
+    if let Some(err) = response.error {
+        anyhow::bail!("token refresh failed: {err}");
+    }
+
+    let id_token = response
+        .id_token
+        .or_else(|| current_id_token.map(str::to_string))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "token refresh response omitted id_token and no existing id_token is available"
+            )
+        })?;
+    let access_token = response
+        .access_token
+        .or_else(|| current_access_token.map(str::to_string))
+        .ok_or_else(|| anyhow::anyhow!("token refresh response omitted access_token and no existing access_token is available"))?;
+    let refresh_token = response
+        .refresh_token
+        .unwrap_or_else(|| current_refresh_token.to_string());
+
+    Ok(RefreshedTokens {
+        id_token,
+        access_token,
+        refresh_token,
+    })
+}
+
 async fn fetch_usage_retried_inner(
     alias: &str,
     profile_path: &Path,
@@ -341,7 +401,10 @@ async fn fetch_usage_retried_inner(
             detail,
         }
     })?;
-    let account_id = crate::jwt::parse_account_info(&val).account_id;
+    let account_info = crate::jwt::parse_account_info(&val);
+    let account_id = account_info.account_id;
+    let is_fedramp = account_info.is_fedramp;
+    let id_token = auth::extract_id_token(&val);
     let (access_token, refresh_token) = auth::extract_tokens(&val);
 
     let at = match access_token {
@@ -361,8 +424,15 @@ async fn fetch_usage_retried_inner(
             debug!("[{alias}] retry attempt {}/{MAX_RETRIES}", attempt + 1);
             tokio::time::sleep(RETRY_DELAY).await;
         }
-        match fetch_usage_with_refresh(alias, &at, refresh_token.as_deref(), account_id.as_deref())
-            .await
+        match fetch_usage_with_refresh(
+            alias,
+            &at,
+            id_token.as_deref(),
+            refresh_token.as_deref(),
+            account_id.as_deref(),
+            is_fedramp,
+        )
+        .await
         {
             Ok((usage, refreshed)) => {
                 if let Some(new_tokens) = refreshed {
@@ -392,8 +462,10 @@ async fn fetch_usage_retried_inner(
 pub async fn fetch_usage_with_refresh(
     alias: &str,
     access_token: &str,
+    id_token: Option<&str>,
     refresh_token: Option<&str>,
     account_id: Option<&str>,
+    is_fedramp: bool,
 ) -> Result<(UsageInfo, Option<RefreshedTokens>)> {
     let client = auth::build_http_client()?;
     let usage_url = usage_url();
@@ -404,17 +476,19 @@ pub async fn fetch_usage_with_refresh(
     {
         info!("[{alias}] access token expiring soon, proactively refreshing");
 
-        match do_refresh_token(alias, &client, rt).await {
+        match do_refresh_token(alias, &client, id_token, Some(access_token), rt).await {
             Ok(new_tokens) => {
-                let resp = client
-                    .get(&usage_url)
-                    .header(
+                let resp = apply_account_routing_headers(
+                    client.get(&usage_url).header(
                         "Authorization",
                         format!("Bearer {}", new_tokens.access_token),
-                    )
-                    .send()
-                    .await
-                    .map_err(|e| format_reqwest_error("Usage API request failed", &e))?;
+                    ),
+                    account_id,
+                    is_fedramp,
+                )
+                .send()
+                .await
+                .map_err(|e| format_reqwest_error("Usage API request failed", &e))?;
 
                 let status = resp.status();
                 debug!("[{alias}] Usage API (after proactive refresh): HTTP {status}");
@@ -426,7 +500,7 @@ pub async fn fetch_usage_with_refresh(
                         "[{alias}] Usage API raw body (proactive): {}",
                         crate::auth::redact_sensitive_log_body(&body)
                     );
-                    let mut usage = parse_usage(&body);
+                    let mut usage = parse_usage_checked(&body)?;
                     enrich_reset_credits(
                         alias,
                         &client,
@@ -445,12 +519,16 @@ pub async fn fetch_usage_with_refresh(
         }
     }
 
-    let resp = client
-        .get(&usage_url)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .send()
-        .await
-        .map_err(|e| format_reqwest_error("Usage API request failed", &e))?;
+    let resp = apply_account_routing_headers(
+        client
+            .get(&usage_url)
+            .header("Authorization", format!("Bearer {access_token}")),
+        account_id,
+        is_fedramp,
+    )
+    .send()
+    .await
+    .map_err(|e| format_reqwest_error("Usage API request failed", &e))?;
 
     let status = resp.status();
     debug!("[{alias}] Usage API: HTTP {status}");
@@ -463,7 +541,7 @@ pub async fn fetch_usage_with_refresh(
             "[{alias}] Usage API raw body: {}",
             crate::auth::redact_sensitive_log_body(&body)
         );
-        let mut usage = parse_usage(&body);
+        let mut usage = parse_usage_checked(&body)?;
         enrich_reset_credits(alias, &client, access_token, account_id, &mut usage).await;
         return Ok((usage, None));
     }
@@ -474,17 +552,19 @@ pub async fn fetch_usage_with_refresh(
     {
         info!("[{alias}] got HTTP {status}, attempting token refresh");
 
-        match do_refresh_token(alias, &client, rt).await {
+        match do_refresh_token(alias, &client, id_token, Some(access_token), rt).await {
             Ok(new_tokens) => {
-                let resp2 = client
-                    .get(&usage_url)
-                    .header(
+                let resp2 = apply_account_routing_headers(
+                    client.get(&usage_url).header(
                         "Authorization",
                         format!("Bearer {}", new_tokens.access_token),
-                    )
-                    .send()
-                    .await
-                    .map_err(|e| format_reqwest_error("Usage API retry request failed", &e))?;
+                    ),
+                    account_id,
+                    is_fedramp,
+                )
+                .send()
+                .await
+                .map_err(|e| format_reqwest_error("Usage API retry request failed", &e))?;
 
                 let status2 = resp2.status();
                 debug!("[{alias}] Usage API (after token refresh): HTTP {status2}");
@@ -494,7 +574,7 @@ pub async fn fetch_usage_with_refresh(
                             "failed to parse usage response after refresh (HTTP {status2}): {e}"
                         )
                     })?;
-                    let mut usage = parse_usage(&body);
+                    let mut usage = parse_usage_checked(&body)?;
                     enrich_reset_credits(
                         alias,
                         &client,
@@ -529,13 +609,23 @@ pub async fn validate_import_auth(
     }
 
     let (access_token, refresh_token) = auth::extract_tokens(val);
-    let account_id = crate::jwt::parse_account_info(val).account_id;
+    let id_token = auth::extract_id_token(val);
+    let account_info = crate::jwt::parse_account_info(val);
+    let account_id = account_info.account_id;
+    let is_fedramp = account_info.is_fedramp;
 
     let alias = "import";
     match (access_token, refresh_token) {
         (Some(at), rt) => {
-            let (usage, refreshed) =
-                fetch_usage_with_refresh(alias, &at, rt.as_deref(), account_id.as_deref()).await?;
+            let (usage, refreshed) = fetch_usage_with_refresh(
+                alias,
+                &at,
+                id_token.as_deref(),
+                rt.as_deref(),
+                account_id.as_deref(),
+                is_fedramp,
+            )
+            .await?;
             if let Some(tokens) = &refreshed {
                 auth::apply_tokens(
                     val,
@@ -548,7 +638,8 @@ pub async fn validate_import_auth(
         }
         (None, Some(rt)) => {
             let client = auth::build_http_client()?;
-            let refreshed = do_refresh_token(alias, &client, &rt).await?;
+            let refreshed =
+                do_refresh_token(alias, &client, id_token.as_deref(), None, &rt).await?;
             auth::apply_tokens(
                 val,
                 &refreshed.id_token,
@@ -559,8 +650,10 @@ pub async fn validate_import_auth(
             let (usage, refreshed_again) = fetch_usage_with_refresh(
                 alias,
                 &refreshed.access_token,
+                Some(&refreshed.id_token),
                 Some(&refreshed.refresh_token),
                 account_id.as_deref(),
+                is_fedramp,
             )
             .await?;
             if let Some(tokens) = &refreshed_again {
@@ -580,6 +673,8 @@ pub async fn validate_import_auth(
 pub(crate) async fn do_refresh_token(
     alias: &str,
     client: &reqwest::Client,
+    current_id_token: Option<&str>,
+    current_access_token: Option<&str>,
     refresh_token: &str,
 ) -> Result<RefreshedTokens> {
     let body = format!(
@@ -617,36 +712,11 @@ pub(crate) async fn do_refresh_token(
         anyhow::anyhow!("Failed to parse token refresh response (HTTP {status}): {e}")
     })?;
 
-    if let Some(err) = &r.error {
-        anyhow::bail!("[{alias}] token refresh failed: {err}");
-    }
-
-    match (r.access_token, r.id_token, r.refresh_token) {
-        (Some(at), Some(id), Some(rt)) => {
-            info!("[{alias}] token refresh succeeded");
-            Ok(RefreshedTokens {
-                id_token: id,
-                access_token: at,
-                refresh_token: rt,
-            })
-        }
-        (Some(at), Some(id), None) => {
-            debug!("[{alias}] token refresh succeeded (no new refresh_token, reusing old one)");
-            Ok(RefreshedTokens {
-                id_token: id,
-                access_token: at,
-                refresh_token: refresh_token.to_string(),
-            })
-        }
-        (at, id, rt) => {
-            anyhow::bail!(
-                "token refresh HTTP {status}: missing required fields (access_token: {}, id_token: {}, refresh_token: {})",
-                at.is_some(),
-                id.is_some(),
-                rt.is_some(),
-            )
-        }
-    }
+    let refreshed =
+        resolve_refreshed_tokens(r, current_id_token, current_access_token, refresh_token)
+            .with_context(|| format!("[{alias}] token refresh HTTP {status}"))?;
+    info!("[{alias}] token refresh succeeded");
+    Ok(refreshed)
 }
 
 async fn enrich_reset_credits(
@@ -712,7 +782,10 @@ async fn fetch_reset_credits(
 
 pub fn earliest_reset_credit(credits: &[ResetCredit]) -> Option<&ResetCredit> {
     credits.iter().min_by_key(|credit| {
-        chrono::DateTime::parse_from_rfc3339(&credit.expires_at)
+        credit
+            .expires_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
             .map(|dt| dt.timestamp())
             .unwrap_or(i64::MAX)
     })
@@ -744,40 +817,108 @@ async fn consume_reset_credit(
     account_id: Option<&str>,
     credit: ResetCredit,
 ) -> Result<ConsumedResetCredit> {
-    let mut req = client
-        .post(reset_credits_consume_url())
-        .bearer_auth(access_token)
-        .header("Accept", "application/json")
-        .header("OpenAI-Beta", "codex-1")
-        .header("Originator", "Codex Desktop")
-        .json(&serde_json::json!({
-            "credit_id": &credit.id,
-            "redeem_request_id": redeem_request_id(),
-        }));
+    consume_reset_credit_at_url(
+        client,
+        access_token,
+        account_id,
+        credit,
+        &reset_credits_consume_url(),
+    )
+    .await
+}
 
-    if let Some(account_id) = account_id.filter(|s| !s.trim().is_empty()) {
-        req = req.header("Chatgpt-Account-Id", account_id);
+async fn consume_reset_credit_at_url(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    credit: ResetCredit,
+    url: &str,
+) -> Result<ConsumedResetCredit> {
+    // Generate once per user action. Any retry after an ambiguous transport/server
+    // failure must identify the same logical redemption to the backend.
+    let request_id = redeem_request_id();
+    for attempt in 0..MAX_RETRIES {
+        let mut req = client
+            .post(url)
+            .bearer_auth(access_token)
+            .header("Accept", "application/json")
+            .header("OpenAI-Beta", "codex-1")
+            .header("Originator", "Codex Desktop")
+            .json(&serde_json::json!({
+                "credit_id": &credit.id,
+                "redeem_request_id": &request_id,
+            }));
+
+        if let Some(account_id) = account_id.filter(|s| !s.trim().is_empty()) {
+            req = req.header("Chatgpt-Account-Id", account_id);
+        }
+
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(error) if attempt + 1 < MAX_RETRIES => {
+                debug!(
+                    "reset credit consume attempt {}/{} failed before response: {}",
+                    attempt + 1,
+                    MAX_RETRIES,
+                    format_reqwest_error("request failed", &error)
+                );
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(format_reqwest_error(
+                    "reset credit consume request failed",
+                    &error,
+                ));
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            if (status.is_server_error() || status.as_u16() == 429) && attempt + 1 < MAX_RETRIES {
+                debug!(
+                    "reset credit consume attempt {}/{} returned HTTP {status}",
+                    attempt + 1,
+                    MAX_RETRIES
+                );
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
+            anyhow::bail!("reset credit consume request failed (HTTP {status})");
+        }
+
+        match resp.json::<Value>().await {
+            Ok(body) => return parse_consumed_reset_credit(&body, credit),
+            Err(error) if attempt + 1 < MAX_RETRIES => {
+                debug!(
+                    "reset credit consume attempt {}/{} returned invalid JSON: {error}",
+                    attempt + 1,
+                    MAX_RETRIES
+                );
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "failed to parse reset credit consume response: {error}"
+                ));
+            }
+        }
     }
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format_reqwest_error("reset credit consume request failed", &e))?;
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!("reset credit consume request failed (HTTP {status})");
+    unreachable!("reset credit retry loop always returns on its final attempt")
+}
+
+fn parse_consumed_reset_credit(body: &Value, credit: ResetCredit) -> Result<ConsumedResetCredit> {
+    let code = body
+        .get("code")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("reset credit consume response missing code"))?;
+    if code != "reset" {
+        anyhow::bail!("reset credit was not consumed: {code}");
     }
 
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to parse reset credit consume response: {e}"))?;
     Ok(ConsumedResetCredit {
         credit,
-        code: body
-            .get("code")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        code: Some(code.to_string()),
         windows_reset: parse_optional_u64(body.get("windows_reset")),
         redeemed_at: body
             .get("credit")
@@ -842,8 +983,8 @@ fn parse_reset_credit(value: &Value) -> Option<ResetCredit> {
         .or_else(|| obj.get("expiresAt"))
         .and_then(|v| v.as_str())
         .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_string();
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     let id = obj
         .get("id")
@@ -903,6 +1044,9 @@ fn parse_window(val: &Value) -> Option<WindowUsage> {
 
 /// Whether an account is currently usable (both windows have remaining quota).
 pub fn is_available(u: &UsageInfo) -> bool {
+    if u.account_limited || (u.primary.is_none() && u.secondary.is_none()) {
+        return false;
+    }
     if let Some(w) = &u.secondary
         && w.used_percent.unwrap_or(0.0) >= 100.0
     {
@@ -918,6 +1062,9 @@ pub fn is_available(u: &UsageInfo) -> bool {
 
 /// Eligibility check on a Candidate (reset-aware).
 pub fn is_candidate_eligible(c: &Candidate, safety_margin_7d: f64) -> bool {
+    if !c.has_5h_data && !c.has_7d_data {
+        return false;
+    }
     let used_5h = c.effective_used_5h();
     let used_7d = c.effective_used_7d();
 
@@ -1132,6 +1279,53 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
     tier_bonus + headroom + sustain + drain_value + recency
 }
 
+fn known_rate_limit_reached_type(body: &Value) -> bool {
+    let kind = body.get("rate_limit_reached_type").and_then(|value| {
+        value
+            .get("type")
+            .and_then(Value::as_str)
+            .or_else(|| value.as_str())
+    });
+    matches!(
+        kind,
+        Some(
+            "rate_limit_reached"
+                | "workspace_owner_credits_depleted"
+                | "workspace_member_credits_depleted"
+                | "workspace_owner_usage_limit_reached"
+                | "workspace_member_usage_limit_reached"
+        )
+    )
+}
+
+fn parse_usage_checked(body: &Value) -> Result<UsageInfo> {
+    let usage = parse_usage(body);
+    let credits_has_data = body
+        .get("credits")
+        .and_then(Value::as_object)
+        .is_some_and(|credits| {
+            credits
+                .get("has_credits")
+                .and_then(Value::as_bool)
+                .is_some()
+                || credits.get("unlimited").and_then(Value::as_bool).is_some()
+                || credits.get("balance").is_some_and(|balance| {
+                    balance.as_f64().is_some()
+                        || balance
+                            .as_str()
+                            .is_some_and(|value| value.parse::<f64>().is_ok())
+                })
+        });
+    if usage.primary.is_none()
+        && usage.secondary.is_none()
+        && !usage.account_limited
+        && !credits_has_data
+    {
+        anyhow::bail!("usage response missing recognized quota fields");
+    }
+    Ok(usage)
+}
+
 pub fn parse_usage(body: &Value) -> UsageInfo {
     const SECS_7D: i64 = 7 * 86400; // 604800
 
@@ -1197,6 +1391,15 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
         .get("plan_type")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let account_limited = known_rate_limit_reached_type(body)
+        || body
+            .pointer("/spend_control/reached")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || body
+            .pointer("/rate_limit/limit_reached")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let reset_credits_raw = body
         .get("rate_limit_reset_credits")
         .or_else(|| body.get("rateLimitResetCredits"));
@@ -1214,6 +1417,7 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
         reset_credits_available_count,
         reset_credits,
         reset_credits_error: None,
+        account_limited,
     }
 }
 
@@ -1235,8 +1439,15 @@ pub async fn refresh_expiring_tokens() {
 
     let now = auth::now_unix_secs();
 
-    // Collect (alias, profile_path, refresh_token, expires_at) for tokens expiring soon
-    let mut candidates: Vec<(String, std::path::PathBuf, String, i64)> = Vec::new();
+    // Collect current tokens for profiles expiring soon.
+    let mut candidates: Vec<(
+        String,
+        std::path::PathBuf,
+        Option<String>,
+        String,
+        String,
+        i64,
+    )> = Vec::new();
     for alias in &profiles {
         let path = match crate::profile::profile_auth_path(alias) {
             Ok(p) => p,
@@ -1247,6 +1458,7 @@ pub async fn refresh_expiring_tokens() {
             Err(_) => continue,
         };
         let (access_token, refresh_token) = auth::extract_tokens(&val);
+        let id_token = auth::extract_id_token(&val);
         let Some(at) = access_token else { continue };
         let Some(rt) = refresh_token else { continue };
         let Some(exp) = crate::jwt::token_expires_at(&at) else {
@@ -1254,7 +1466,7 @@ pub async fn refresh_expiring_tokens() {
         };
         let remaining = exp - now;
         if remaining < OPPORTUNISTIC_REFRESH_MARGIN {
-            candidates.push((alias.clone(), path, rt, exp));
+            candidates.push((alias.clone(), path, id_token, at, rt, exp));
         }
     }
 
@@ -1263,7 +1475,7 @@ pub async fn refresh_expiring_tokens() {
     }
 
     // Sort by expiration: soonest first
-    candidates.sort_by_key(|c| c.3);
+    candidates.sort_by_key(|c| c.5);
     candidates.truncate(OPPORTUNISTIC_REFRESH_LIMIT);
 
     let count = candidates.len();
@@ -1274,7 +1486,7 @@ pub async fn refresh_expiring_tokens() {
 
     // Spawn all refreshes concurrently, bounded by total timeout
     let mut tasks = tokio::task::JoinSet::new();
-    for (alias, path, rt, exp) in candidates {
+    for (alias, path, id_token, access_token, rt, exp) in candidates {
         tasks.spawn(async move {
             let remaining = exp - auth::now_unix_secs();
             debug!("[{alias}] token expires in {remaining}s, refreshing");
@@ -1287,7 +1499,15 @@ pub async fn refresh_expiring_tokens() {
                 }
             };
 
-            match do_refresh_token(&alias, &client, &rt).await {
+            match do_refresh_token(
+                &alias,
+                &client,
+                id_token.as_deref(),
+                Some(&access_token),
+                &rt,
+            )
+            .await
+            {
                 Ok(new_tokens) => {
                     persist_refreshed_tokens(&alias, &path, &new_tokens);
                     info!("[{alias}] opportunistic token refresh succeeded");
@@ -1309,8 +1529,59 @@ pub async fn refresh_expiring_tokens() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Json;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
     use chrono::DateTime;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_account_routing_headers_include_workspace_and_fedramp() {
+        let request = apply_account_routing_headers(
+            reqwest::Client::new().get("https://example.invalid/usage"),
+            Some("workspace-123"),
+            true,
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("ChatGPT-Account-ID")
+                .and_then(|value| value.to_str().ok()),
+            Some("workspace-123")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("X-OpenAI-Fedramp")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn test_refresh_without_id_token_preserves_existing_id_token() {
+        let refreshed = resolve_refreshed_tokens(
+            RefreshResponse {
+                id_token: None,
+                access_token: Some("new-access".to_string()),
+                refresh_token: None,
+                error: None,
+            },
+            Some("existing-id"),
+            Some("existing-access"),
+            "existing-refresh",
+        )
+        .unwrap();
+
+        assert_eq!(refreshed.id_token, "existing-id");
+        assert_eq!(refreshed.access_token, "new-access");
+        assert_eq!(refreshed.refresh_token, "existing-refresh");
+    }
 
     fn usage_with(primary: Option<WindowUsage>, secondary: Option<WindowUsage>) -> UsageInfo {
         UsageInfo {
@@ -1323,6 +1594,7 @@ mod tests {
             reset_credits_available_count: None,
             reset_credits: vec![],
             reset_credits_error: None,
+            account_limited: false,
         }
     }
 
@@ -1421,7 +1693,105 @@ mod tests {
         assert_eq!(usage.reset_credits_available_count, Some(2));
         assert_eq!(usage.reset_credits.len(), 1);
         assert_eq!(usage.reset_credits[0].id, "cred_1");
-        assert_eq!(usage.reset_credits[0].expires_at, "2026-07-08T00:00:00Z");
+        assert_eq!(
+            usage.reset_credits[0].expires_at.as_deref(),
+            Some("2026-07-08T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn test_reset_credit_without_expiry_is_preserved_and_sorted_last() {
+        let expiring = parse_reset_credit(&json!({
+            "id": "expiring",
+            "status": "available",
+            "expires_at": "2026-07-08T00:00:00Z"
+        }))
+        .unwrap();
+        let no_expiry = parse_reset_credit(&json!({
+            "id": "no-expiry",
+            "status": "available",
+            "expires_at": null
+        }))
+        .unwrap();
+        let credits = vec![no_expiry, expiring];
+
+        assert_eq!(credits[0].expires_at, None);
+        assert_eq!(earliest_reset_credit(&credits).unwrap().id, "expiring");
+    }
+
+    #[test]
+    fn test_consume_outcome_only_accepts_reset() {
+        let credit = ResetCredit {
+            id: "credit-1".to_string(),
+            granted_at: None,
+            expires_at: None,
+        };
+
+        let consumed = parse_consumed_reset_credit(
+            &json!({"code": "reset", "windows_reset": 2}),
+            credit.clone(),
+        )
+        .unwrap();
+        assert_eq!(consumed.code.as_deref(), Some("reset"));
+
+        for code in ["nothing_to_reset", "no_credit", "already_redeemed"] {
+            let error =
+                parse_consumed_reset_credit(&json!({"code": code}), credit.clone()).unwrap_err();
+            assert!(error.to_string().contains(code));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_consume_retry_reuses_redeem_request_id() {
+        let request_ids = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = Arc::clone(&request_ids);
+        let app = axum::Router::new().route(
+            "/consume",
+            post(move |Json(body): Json<Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let request_id = body
+                        .get("redeem_request_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let attempt = {
+                        let mut ids = captured.lock().unwrap();
+                        ids.push(request_id);
+                        ids.len()
+                    };
+                    if attempt == 1 {
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    } else {
+                        Json(json!({"code": "reset", "windows_reset": 2})).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let result = consume_reset_credit_at_url(
+            &reqwest::Client::new(),
+            "access-token",
+            Some("workspace-123"),
+            ResetCredit {
+                id: "credit-1".to_string(),
+                granted_at: None,
+                expires_at: None,
+            },
+            &format!("http://{address}/consume"),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(result.code.as_deref(), Some("reset"));
+        let ids = request_ids.lock().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(!ids[0].is_empty());
+        assert_eq!(ids[0], ids[1]);
     }
 
     #[test]
@@ -1544,6 +1914,75 @@ mod tests {
     }
 
     #[test]
+    fn test_checked_usage_rejects_empty_or_drifted_response() {
+        assert!(parse_usage_checked(&json!({})).is_err());
+        assert!(parse_usage_checked(&json!({"unexpected": true})).is_err());
+        assert!(parse_usage_checked(&json!({"credits": {"balance": null}})).is_err());
+    }
+
+    #[test]
+    fn test_default_usage_is_not_available() {
+        assert!(!is_available(&UsageInfo::default()));
+        let candidate = Candidate::from_usage(
+            "empty".to_string(),
+            &UsageInfo::default(),
+            false,
+            false,
+            0,
+            1,
+        );
+        assert!(!is_candidate_eligible(&candidate, 20.0));
+    }
+
+    #[test]
+    fn test_parse_usage_marks_known_rate_limit_reached_type_as_limited() {
+        let usage = parse_usage(&json!({
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {"used_percent": 10.0}
+            },
+            "rate_limit_reached_type": {
+                "type": "workspace_member_usage_limit_reached"
+            }
+        }));
+
+        assert!(usage.account_limited);
+        assert!(!is_available(&usage));
+    }
+
+    #[test]
+    fn test_parse_usage_marks_reached_spend_control_as_limited() {
+        let usage = parse_usage(&json!({
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {"used_percent": 10.0}
+            },
+            "spend_control": {"reached": true}
+        }));
+
+        assert!(usage.account_limited);
+        assert!(!is_available(&usage));
+    }
+
+    #[test]
+    fn test_parse_usage_ignores_unknown_limit_reason() {
+        let usage = parse_usage(&json!({
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {"used_percent": 10.0}
+            },
+            "rate_limit_reached_type": {"type": "future_reason"},
+            "spend_control": {"reached": false}
+        }));
+
+        assert!(!usage.account_limited);
+        assert!(is_available(&usage));
+    }
+
+    #[test]
     fn test_is_available_both_under_100() {
         let usage = usage_with(
             Some(window(50.0, Some(1_000))),
@@ -1575,7 +2014,7 @@ mod tests {
 
     #[test]
     fn test_is_available_no_data() {
-        assert!(is_available(&UsageInfo::default()));
+        assert!(!is_available(&UsageInfo::default()));
     }
 
     // ── adaptive scoring tests ──

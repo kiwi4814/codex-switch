@@ -491,7 +491,11 @@ async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("{alias}: no available reset cards"))?;
 
     if !yes {
-        let expires = format_local_datetime(&credit.expires_at);
+        let expires = credit
+            .expires_at
+            .as_deref()
+            .map(format_local_datetime)
+            .unwrap_or_else(|| "no expiry".to_string());
         if !confirm_reset_card(alias, &expires) {
             anyhow::bail!("aborted");
         }
@@ -517,7 +521,12 @@ async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result<()> {
             "{}",
             color::success(&format!(
                 "[ok] Consumed reset card for {alias} (was expiring at {})",
-                format_local_datetime(&result.credit.expires_at)
+                result
+                    .credit
+                    .expires_at
+                    .as_deref()
+                    .map(format_local_datetime)
+                    .unwrap_or_else(|| "no expiry".to_string())
             ))
         );
         if let Some(windows_reset) = result.windows_reset {

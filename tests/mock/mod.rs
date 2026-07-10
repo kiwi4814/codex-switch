@@ -180,7 +180,7 @@ async fn reset_credits_consume_handler(
     }
 
     axum::Json(json!({
-        "code": "success",
+        "code": "reset",
         "credit": {
             "id": "reset_credit_1",
             "status": "redeemed",

@@ -35,7 +35,7 @@ pub struct JsonResetCredit {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub granted_at: Option<String>,
-    pub expires_at: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -275,11 +275,14 @@ pub fn reset_credits_next_expiry(u: &UsageInfo) -> Option<&str> {
     u.reset_credits
         .iter()
         .min_by_key(|credit| {
-            DateTime::parse_from_rfc3339(&credit.expires_at)
+            credit
+                .expires_at
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|dt| dt.timestamp())
                 .unwrap_or(i64::MAX)
         })
-        .map(|credit| credit.expires_at.as_str())
+        .and_then(|credit| credit.expires_at.as_deref())
 }
 
 pub fn reset_credits_compact(u: &UsageInfo) -> Option<String> {
@@ -293,6 +296,8 @@ pub fn reset_credits_compact(u: &UsageInfo) -> Option<String> {
         if u.reset_credits.len() > 1 {
             text.push_str(&format!(" (+{})", u.reset_credits.len() - 1));
         }
+    } else if !u.reset_credits.is_empty() {
+        text.push_str("  next expiry: no expiry");
     } else if let Some(err) = &u.reset_credits_error {
         text.push_str(&format!("  expiry unavailable: {err}"));
     }
@@ -312,7 +317,11 @@ pub fn reset_credits_detail_lines(u: &UsageInfo, max_lines: usize) -> Vec<String
         lines.push(format!(
             "  card #{} expires {}",
             idx + 1,
-            format_local_datetime(&credit.expires_at)
+            credit
+                .expires_at
+                .as_deref()
+                .map(format_local_datetime)
+                .unwrap_or_else(|| "no expiry".to_string())
         ));
     }
     if u.reset_credits.len() > detail_budget {
@@ -474,4 +483,34 @@ fn progress_enabled() -> bool {
         return true;
     }
     io::stderr().is_terminal()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn test_reset_credit_without_expiry_uses_explicit_text_and_json_null() {
+        let usage = UsageInfo {
+            reset_credits_available_count: Some(1),
+            reset_credits: vec![ResetCredit {
+                id: "credit-1".to_string(),
+                granted_at: None,
+                expires_at: None,
+            }],
+            ..Default::default()
+        };
+
+        assert!(
+            reset_credits_detail_lines(&usage, 2)
+                .iter()
+                .any(|line| line.contains("no expiry"))
+        );
+        let json = serde_json::to_value(usage_to_json(Ok(&usage))).unwrap();
+        assert_eq!(
+            json.pointer("/reset_credits/0/expires_at"),
+            Some(&Value::Null)
+        );
+    }
 }
