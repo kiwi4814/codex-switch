@@ -274,6 +274,7 @@ team_priority = true        # Prefer Team accounts with a +500 tier bonus (defau
 [daemon]
 poll_interval_secs = 60         # Usage poll interval (default: 60)
 switch_threshold = 80           # Switch when current 5h usage >= this % (default: 80)
+token_check_interval_secs = 300 # Background token refresh check interval (default: 300)
 notify = false                  # Desktop notification on switch (default: false)
 log_level = "error"             # Daemon log level (default: "error")
 
@@ -324,7 +325,7 @@ codex-switch daemon install
 codex-switch daemon uninstall
 ```
 
-The Beta daemon uses the same adaptive scoring logic as `codex-switch use`. It refreshes the current account on each poll and switches only when `daemon.switch_threshold` is met or exceeded and a better candidate exists. macOS service install uses LaunchAgent; Linux service install uses a systemd user service. It prepares future Codex launches; an already-running Codex process still needs to be restarted after a switch.
+The Beta daemon uses the same adaptive scoring logic as `codex-switch use`. It refreshes the current account on each poll, switches only when `daemon.switch_threshold` is met or exceeded and a better candidate exists, and refreshes expiring tokens on a separate timer. macOS service install uses LaunchAgent; Linux service install uses a systemd user service. It prepares future Codex launches; an already-running Codex process still needs to be restarted after a switch.
 
 ### Scheduled token refresh via cron (optional)
 

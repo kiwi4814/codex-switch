@@ -273,6 +273,7 @@ team_priority = true        # 优先使用 Team 账号，+500 层级加成（默
 [daemon]
 poll_interval_secs = 60         # 用量轮询间隔（秒，默认：60）
 switch_threshold = 80           # 触发切换的 5h 用量百分比（默认：80）
+token_check_interval_secs = 300 # Token 刷新检查间隔（秒，默认：300）
 notify = false                  # 切换时桌面通知（默认：false）
 log_level = "error"             # 守护进程日志级别（默认："error"）
 
@@ -323,7 +324,7 @@ codex-switch daemon install
 codex-switch daemon uninstall
 ```
 
-Beta 守护进程使用与 `codex-switch use` 相同的自适应评分逻辑。它在每次轮询时刷新当前账号，仅在 `daemon.switch_threshold` 达到或超过阈值且存在更好的候选账号时才切换。macOS 服务安装使用 LaunchAgent；Linux 服务安装使用 systemd user service。守护进程为未来的 Codex 启动做准备；已运行的 Codex 进程在切换后仍需重启。
+Beta 守护进程使用与 `codex-switch use` 相同的自适应评分逻辑。它在每次轮询时刷新当前账号，仅在 `daemon.switch_threshold` 达到或超过阈值且存在更好的候选账号时才切换，并在单独的定时器上刷新即将过期的 Token。macOS 服务安装使用 LaunchAgent；Linux 服务安装使用 systemd user service。守护进程为未来的 Codex 启动做准备；已运行的 Codex 进程在切换后仍需重启。
 
 ### 定时刷新 Token（可选）
 
