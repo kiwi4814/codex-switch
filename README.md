@@ -239,7 +239,7 @@ codex-switch self-update --version 0.0.22
 ```
 
 - Homebrew installs are not self-overwritten. Use `brew upgrade xjoker/tap/codex-switch`.
-- Direct installs verify the release `.sha256` before replacing the current executable.
+- Direct installs verify the release `.sha256` before replacing the current executable. The checksum ships in the same GitHub Release as the binary, so this guards against corrupted downloads — not against a compromised Release. The trust anchor is GitHub Releases over TLS; there is no independent code signature yet.
 - Without flags, `self-update` stays on the channel encoded by the current binary. Use `--dev` or `--stable` to change channels explicitly.
 - Homebrew users must `brew uninstall codex-switch` before using `--dev`.
 

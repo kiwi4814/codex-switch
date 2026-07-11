@@ -397,7 +397,7 @@ async fn verify_checksum(client: &reqwest::Client, url: &str, archive_path: &Pat
         hex::encode(Sha256::digest(&bytes))
     };
 
-    if actual != expected {
+    if !checksum_matches(expected, &actual) {
         anyhow::bail!(
             "SHA256 mismatch for {} (expected {}, got {})",
             archive_path.display(),
@@ -407,6 +407,10 @@ async fn verify_checksum(client: &reqwest::Client, url: &str, archive_path: &Pat
     }
 
     Ok(())
+}
+
+fn checksum_matches(expected: &str, actual: &str) -> bool {
+    expected.eq_ignore_ascii_case(actual)
 }
 
 fn extract_binary(archive_path: &Path, output_path: &Path) -> Result<()> {
@@ -720,5 +724,29 @@ mod tests {
         let message = super::homebrew_dev_install_error();
         assert!(message.contains("To switch to dev, run `brew uninstall codex-switch`"));
         assert!(!message.contains("run `run `"));
+    }
+
+    #[test]
+    fn checksum_matches_lowercase_expected() {
+        assert!(checksum_matches(
+            "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2",
+            "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2"
+        ));
+    }
+
+    #[test]
+    fn checksum_matches_uppercase_expected() {
+        assert!(checksum_matches(
+            "D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2",
+            "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2"
+        ));
+    }
+
+    #[test]
+    fn checksum_matches_rejects_mismatch() {
+        assert!(!checksum_matches(
+            "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2",
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ));
     }
 }

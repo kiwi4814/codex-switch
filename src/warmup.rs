@@ -1,28 +1,51 @@
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use anyhow::{Result, bail};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, warn};
 
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 const FALLBACK_MODEL: &str = "gpt-5.3-codex";
 
-static CODEX_VERSION: OnceLock<String> = OnceLock::new();
+static CODEX_VERSION: OnceCell<String> = OnceCell::const_new();
 // tokio Mutex held across the await in resolve_model, ensuring only one fetch per process.
-static MODEL_CACHE: Mutex<Option<String>> = Mutex::const_new(None);
+// Keyed by account (alias) so one account's resolved model never leaks into another's warmup.
+static MODEL_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn detect_codex_version() -> &'static str {
-    CODEX_VERSION.get_or_init(|| {
-        std::process::Command::new("codex")
-            .arg("--version")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| parse_codex_version(&s))
-            .unwrap_or_else(|| crate::auth::ALIGNED_CODEX_VERSION.to_string())
-    })
+fn model_cache_get(cache: &HashMap<String, String>, key: &str) -> Option<String> {
+    cache.get(key).cloned()
+}
+
+fn model_cache_set(cache: &mut HashMap<String, String>, key: &str, model: String) {
+    cache.insert(key.to_string(), model);
+}
+
+fn model_cache_invalidate(cache: &mut HashMap<String, String>, key: &str) {
+    cache.remove(key);
+}
+
+/// Detects the local `codex` CLI version. Runs the subprocess probe on a
+/// blocking thread pool so it never stalls a tokio worker thread.
+async fn detect_codex_version() -> &'static str {
+    CODEX_VERSION
+        .get_or_init(|| async {
+            tokio::task::spawn_blocking(|| {
+                std::process::Command::new("codex")
+                    .arg("--version")
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .and_then(|s| parse_codex_version(&s))
+                    .unwrap_or_else(|| crate::auth::ALIGNED_CODEX_VERSION.to_string())
+            })
+            .await
+            .unwrap_or_else(|_| crate::auth::ALIGNED_CODEX_VERSION.to_string())
+        })
+        .await
 }
 
 /// Pick the version token out of `codex --version` output. Output shapes vary
@@ -63,7 +86,7 @@ async fn fetch_warmup_model(
         access_token,
         account_id,
         is_fedramp,
-        detect_codex_version(),
+        detect_codex_version().await,
     )
     .send()
     .await
@@ -104,20 +127,21 @@ async fn fetch_warmup_model(
 }
 
 async fn resolve_model(
+    cache_key: &str,
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
 ) -> String {
     let mut guard = MODEL_CACHE.lock().await;
-    if let Some(ref model) = *guard {
-        return model.clone();
+    if let Some(model) = model_cache_get(&guard, cache_key) {
+        return model;
     }
     // Hold the lock across the fetch so concurrent callers wait here instead of
     // each issuing a redundant request.
     match fetch_warmup_model(client, access_token, account_id, is_fedramp).await {
         Ok(model) => {
-            *guard = Some(model.clone());
+            model_cache_set(&mut guard, cache_key, model.clone());
             model
         }
         Err(e) => {
@@ -216,7 +240,14 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
         }
     }
 
-    let model = resolve_model(&client, &access_token, account_id.as_deref(), is_fedramp).await;
+    let model = resolve_model(
+        alias,
+        &client,
+        &access_token,
+        account_id.as_deref(),
+        is_fedramp,
+    )
+    .await;
     let body = build_body(&model);
 
     debug!("[{alias}] warmup POST → {RESPONSES_URL} (model={model})");
@@ -249,9 +280,15 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                 debug!(
                     "[{alias}] model {model:?} not supported, refreshing model cache and retrying"
                 );
-                *MODEL_CACHE.lock().await = None;
-                let new_model =
-                    resolve_model(&client, &access_token, account_id.as_deref(), is_fedramp).await;
+                model_cache_invalidate(&mut *MODEL_CACHE.lock().await, alias);
+                let new_model = resolve_model(
+                    alias,
+                    &client,
+                    &access_token,
+                    account_id.as_deref(),
+                    is_fedramp,
+                )
+                .await;
                 let retry_body = build_body(&new_model);
                 let mut retry_resp = make_request(
                     &client,
@@ -335,6 +372,33 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_model_cache_keys_are_isolated_per_account() {
+        let mut cache: HashMap<String, String> = HashMap::new();
+        model_cache_set(&mut cache, "account-a", "model-a".to_string());
+
+        assert_eq!(
+            model_cache_get(&cache, "account-a"),
+            Some("model-a".to_string())
+        );
+        assert_eq!(model_cache_get(&cache, "account-b"), None);
+    }
+
+    #[test]
+    fn test_model_cache_invalidation_only_affects_target_key() {
+        let mut cache: HashMap<String, String> = HashMap::new();
+        model_cache_set(&mut cache, "account-a", "model-a".to_string());
+        model_cache_set(&mut cache, "account-b", "model-b".to_string());
+
+        model_cache_invalidate(&mut cache, "account-a");
+
+        assert_eq!(model_cache_get(&cache, "account-a"), None);
+        assert_eq!(
+            model_cache_get(&cache, "account-b"),
+            Some("model-b".to_string())
+        );
+    }
 
     #[test]
     fn test_parse_codex_version_picks_semver_token() {

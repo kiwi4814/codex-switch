@@ -2030,6 +2030,28 @@ mod tests {
     }
 
     #[test]
+    fn test_checked_usage_empty_object_error_message_names_missing_fields() {
+        let err = parse_usage_checked(&json!({})).expect_err("empty body must be rejected");
+        assert!(
+            err.to_string().contains("missing recognized quota fields"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_checked_usage_drifted_response_is_rejected() {
+        let err = parse_usage_checked(&json!({
+            "some_new_field": "unrecognized",
+            "another": { "nested": 1 }
+        }))
+        .expect_err("structurally drifted body must be rejected");
+        assert!(
+            err.to_string().contains("missing recognized quota fields"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
     fn test_default_usage_is_not_available() {
         assert!(!is_available(&UsageInfo::default()));
         let candidate = Candidate::from_usage(

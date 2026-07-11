@@ -245,21 +245,40 @@ pub fn write_auth(path: &Path, val: &serde_json::Value) -> Result<()> {
 /// Used by debug-level logs that may otherwise leak access/refresh/id tokens
 /// when users share `--debug` output (e.g. in a bug report).
 pub(crate) fn redact_sensitive_log_body(body: &serde_json::Value) -> String {
-    let mut value = body.clone();
-    if let Some(obj) = value.as_object_mut() {
-        for key in &[
-            "authorization_code",
-            "code_verifier",
-            "access_token",
-            "refresh_token",
-            "id_token",
-            "client_secret",
-        ] {
-            if obj.contains_key(*key) {
-                obj.insert((*key).to_string(), serde_json::json!("***"));
+    const SENSITIVE_KEYS: &[&str] = &[
+        "authorization_code",
+        "code_verifier",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "client_secret",
+    ];
+
+    fn redact(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(obj) => {
+                for key in SENSITIVE_KEYS {
+                    if obj.contains_key(*key) {
+                        obj.insert((*key).to_string(), serde_json::json!("***"));
+                    }
+                }
+                for (key, v) in obj.iter_mut() {
+                    if !SENSITIVE_KEYS.contains(&key.as_str()) {
+                        redact(v);
+                    }
+                }
             }
+            serde_json::Value::Array(arr) => {
+                for v in arr.iter_mut() {
+                    redact(v);
+                }
+            }
+            _ => {}
         }
     }
+
+    let mut value = body.clone();
+    redact(&mut value);
     serde_json::to_string(&value).unwrap_or_default()
 }
 
@@ -737,5 +756,29 @@ mod tests {
             Some(OsString::from("/certs/ssl.pem")),
         );
         assert_eq!(fallback, Some(PathBuf::from("/certs/ssl.pem")));
+    }
+
+    #[test]
+    fn test_redact_sensitive_log_body_masks_nested_keys() {
+        let body = json!({
+            "data": {
+                "access_token": "secret",
+                "items": [
+                    { "refresh_token": "r" },
+                    { "keep": "value" }
+                ]
+            },
+            "access_token": "top",
+            "keep_top": "value"
+        });
+
+        let redacted: serde_json::Value =
+            serde_json::from_str(&redact_sensitive_log_body(&body)).unwrap();
+
+        assert_eq!(redacted["access_token"], "***");
+        assert_eq!(redacted["data"]["access_token"], "***");
+        assert_eq!(redacted["data"]["items"][0]["refresh_token"], "***");
+        assert_eq!(redacted["data"]["items"][1]["keep"], "value");
+        assert_eq!(redacted["keep_top"], "value");
     }
 }
