@@ -96,7 +96,34 @@ fn release_pidfile_handle() {
 pub fn cleanup_pidfile() -> Result<()> {
     release_pidfile_handle();
     let path = pidfile_path()?;
-    match std::fs::remove_file(&path) {
+    cleanup_pidfile_at(&path)
+}
+
+fn cleanup_pidfile_at(path: &Path) -> Result<()> {
+    if pidfile_lock_is_held(path) {
+        anyhow::bail!(
+            "Refusing to remove PID file {}: locked by a running daemon",
+            path.display()
+        );
+    }
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    match FileExt::try_lock(&file) {
+        Err(TryLockError::WouldBlock) => anyhow::bail!(
+            "Refusing to remove PID file {}: locked by a running daemon",
+            path.display()
+        ),
+        Err(TryLockError::Error(e)) => return Err(e.into()),
+        Ok(()) => {}
+    }
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
@@ -232,7 +259,8 @@ pub fn is_daemon_running() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_pid_identity, pidfile_lock_is_held, read_pid_from_raw, tasklist_contains_pid,
+        cleanup_pidfile_at, parse_pid_identity, pidfile_lock_is_held, read_pid_from_raw,
+        tasklist_contains_pid,
     };
     use fs4::FileExt;
 
@@ -273,5 +301,34 @@ mod tests {
 
         FileExt::unlock(&file).unwrap();
         assert!(!pidfile_lock_is_held(&path));
+    }
+
+    #[test]
+    fn concurrent_start_cannot_replace_a_locked_pidfile_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        FileExt::lock(&file).unwrap();
+
+        let err = cleanup_pidfile_at(&path).unwrap_err();
+        let contender = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path);
+
+        assert!(path.exists());
+        assert!(err.to_string().contains("locked by a running daemon"));
+        assert_eq!(
+            contender.unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(pidfile_lock_is_held(&path));
+        FileExt::unlock(&file).unwrap();
     }
 }
