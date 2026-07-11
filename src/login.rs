@@ -157,76 +157,101 @@ struct CallbackResult {
     code: String,
 }
 
+async fn write_callback_response(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
 async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<CallbackResult> {
-    let (mut stream, _) = listener
-        .accept()
-        .await
-        .context("accepting OAuth callback connection")?;
-
-    // Read until we have the full first line (may arrive in multiple reads on Windows)
-    let mut buf = vec![0u8; 8192];
-    let mut total = 0;
     loop {
-        let n = stream
-            .read(&mut buf[total..])
+        let (mut stream, _) = listener
+            .accept()
             .await
-            .context("reading OAuth callback request")?;
-        if n == 0 {
-            break;
+            .context("accepting OAuth callback connection")?;
+
+        // Read until we have the full first line (may arrive in multiple reads on Windows)
+        let mut buf = vec![0u8; 8192];
+        let mut total = 0;
+        let request_complete = loop {
+            let n = match stream.read(&mut buf[total..]).await {
+                Ok(n) => n,
+                Err(_) => break false,
+            };
+            if n == 0 {
+                break false;
+            }
+            total += n;
+            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n")
+                || buf[..total].windows(2).any(|w| w == b"\n\n")
+            {
+                break true;
+            }
+            if total >= buf.len() {
+                break false;
+            }
+        };
+        if !request_complete {
+            write_callback_response(&mut stream, "400 Bad Request", "Invalid callback request")
+                .await;
+            continue;
         }
-        total += n;
-        // Stop once we see the end of the HTTP request line
-        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n")
-            || buf[..total].windows(2).any(|w| w == b"\n\n")
-        {
-            break;
+
+        let request = String::from_utf8_lossy(&buf[..total]);
+        let first_line = request.lines().next().unwrap_or("");
+        let mut request_parts = first_line.split_whitespace();
+        let method = request_parts.next().unwrap_or("");
+        let target = request_parts.next().unwrap_or("");
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+
+        if method != "GET" || path != "/auth/callback" {
+            write_callback_response(&mut stream, "404 Not Found", "Not found").await;
+            continue;
         }
-        if total >= buf.len() {
-            break;
-        }
-    }
-    let request = String::from_utf8_lossy(&buf[..total]);
 
-    let html = r#"HTTP/1.1 200 OK
-Content-Type: text/html; charset=utf-8
-Connection: close
+        let mut code = None;
+        let mut returned_state = None;
+        let mut error = None;
 
-<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:60px">
-<h2>✓ Login successful</h2><p>You may close this tab and return to the terminal.</p>
-</body></html>"#;
-    let _ = stream.write_all(html.as_bytes()).await;
-
-    let first_line = request.lines().next().unwrap_or("");
-    let path = first_line.split_whitespace().nth(1).unwrap_or("");
-    let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-
-    let mut code = None;
-    let mut returned_state = None;
-    let mut error = None;
-
-    for part in query.split('&') {
-        if let Some((k, v)) = part.split_once('=') {
-            let decoded = urlencoding::decode(v).unwrap_or_default().into_owned();
-            match k {
-                "code" => code = Some(decoded),
-                "state" => returned_state = Some(decoded),
-                "error" => error = Some(decoded),
-                _ => {}
+        for part in query.split('&') {
+            if let Some((k, v)) = part.split_once('=') {
+                let decoded = urlencoding::decode(v).unwrap_or_default().into_owned();
+                match k {
+                    "code" => code = Some(decoded),
+                    "state" => returned_state = Some(decoded),
+                    "error" => error = Some(decoded),
+                    _ => {}
+                }
             }
         }
-    }
 
-    if let Some(e) = error {
-        bail!("Authorization failed: {e}");
-    }
+        if returned_state.as_deref() != Some(expected_state) {
+            write_callback_response(&mut stream, "403 Forbidden", "Invalid callback state").await;
+            continue;
+        }
 
-    if returned_state.as_deref() != Some(expected_state) {
-        bail!("State mismatch -- possible CSRF attack, login aborted");
-    }
+        if let Some(e) = error {
+            write_callback_response(&mut stream, "400 Bad Request", "Authorization failed").await;
+            bail!("Authorization failed: {e}");
+        }
 
-    match code {
-        Some(c) if !c.is_empty() => Ok(CallbackResult { code: c }),
-        _ => bail!("Callback did not include an authorization code"),
+        let Some(code) = code.filter(|code| !code.is_empty()) else {
+            write_callback_response(
+                &mut stream,
+                "400 Bad Request",
+                "Callback did not include an authorization code",
+            )
+            .await;
+            continue;
+        };
+
+        let html = r#"<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:60px">
+<h2>✓ Login successful</h2><p>You may close this tab and return to the terminal.</p>
+</body></html>"#;
+        write_callback_response(&mut stream, "200 OK", html).await;
+        return Ok(CallbackResult { code });
     }
 }
 
@@ -636,6 +661,16 @@ mod tests {
     use super::*;
     use chrono::DateTime;
 
+    async fn send_callback_request(addr: std::net::SocketAddr, path: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
     #[test]
     fn test_build_auth_json_structure() {
         let tokens = LoginTokens {
@@ -785,5 +820,29 @@ mod tests {
     #[test]
     fn test_callback_ports_match_current_codex_fallback_order() {
         assert_eq!(callback_ports(), [1455, 1457]);
+    }
+
+    #[tokio::test]
+    async fn test_callback_ignores_stray_and_wrong_state_before_valid_callback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let callback = tokio::spawn(async move { wait_for_callback(listener, "expected").await });
+
+        let stray = send_callback_request(addr, "/favicon.ico").await;
+        assert!(stray.starts_with("HTTP/1.1 404 Not Found"));
+
+        let wrong_state =
+            send_callback_request(addr, "/auth/callback?code=attacker&state=wrong").await;
+        assert!(wrong_state.starts_with("HTTP/1.1 403 Forbidden"));
+
+        let wrong_state_error =
+            send_callback_request(addr, "/auth/callback?error=access_denied&state=wrong").await;
+        assert!(wrong_state_error.starts_with("HTTP/1.1 403 Forbidden"));
+
+        let valid =
+            send_callback_request(addr, "/auth/callback?code=valid-code&state=expected").await;
+        assert!(valid.starts_with("HTTP/1.1 200 OK"));
+
+        assert_eq!(callback.await.unwrap().unwrap().code, "valid-code");
     }
 }
