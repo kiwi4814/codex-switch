@@ -20,9 +20,19 @@ fn detect_codex_version() -> &'static str {
             .output()
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| s.split_whitespace().last().map(|v| v.trim().to_string()))
-            .unwrap_or_else(|| "0.1.0".to_string())
+            .and_then(|s| parse_codex_version(&s))
+            .unwrap_or_else(|| crate::auth::ALIGNED_CODEX_VERSION.to_string())
     })
+}
+
+/// Pick the version token out of `codex --version` output. Output shapes vary
+/// (`codex-cli 0.144.1`, `codex-cli 0.1.0 (build abc)`), so take the first
+/// dotted token that starts with a digit rather than the last token.
+fn parse_codex_version(stdout: &str) -> Option<String> {
+    stdout
+        .split_whitespace()
+        .find(|t| t.starts_with(|c: char| c.is_ascii_digit()) && t.contains('.'))
+        .map(|v| v.to_string())
 }
 
 fn build_models_request(
@@ -325,6 +335,20 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_codex_version_picks_semver_token() {
+        assert_eq!(
+            parse_codex_version("codex-cli 0.144.1\n"),
+            Some("0.144.1".to_string())
+        );
+        assert_eq!(
+            parse_codex_version("codex-cli 0.1.0 (build abc)\n"),
+            Some("0.1.0".to_string())
+        );
+        assert_eq!(parse_codex_version("0.5.0\n"), Some("0.5.0".to_string()));
+        assert_eq!(parse_codex_version("command not found\n"), None);
+    }
 
     #[test]
     fn test_models_request_includes_workspace_and_fedramp_headers() {

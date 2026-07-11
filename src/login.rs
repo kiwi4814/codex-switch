@@ -33,6 +33,9 @@ pub struct LoginTokens {
     pub id_token: String,
     pub access_token: String,
     pub refresh_token: String,
+    /// API key from the post-login token exchange (browser flow only,
+    /// best-effort — Codex persists it as OPENAI_API_KEY).
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,7 +92,13 @@ pub async fn run_device_auth() -> Result<LoginTokens> {
     // Windows environments where that port may be blocked.
     let (listener, actual_port) = bind_callback_listener().await?;
     let actual_redirect = redirect_uri(actual_port);
-    let authorize_url = build_authorize_url(&pkce.code_challenge, &state, &actual_redirect);
+    let forced_workspace_ids = crate::auth::configured_forced_workspace_ids();
+    let authorize_url = build_authorize_url(
+        &pkce.code_challenge,
+        &state,
+        &actual_redirect,
+        &forced_workspace_ids,
+    );
 
     user_println("");
     user_println("Opening browser for Codex login...");
@@ -120,27 +129,96 @@ pub async fn run_device_auth() -> Result<LoginTokens> {
         callback_result.code.len()
     );
 
-    let tokens =
+    let mut tokens =
         exchange_code(&callback_result.code, &pkce.code_verifier, &actual_redirect).await?;
     crate::auth::validate_managed_chatgpt_account(&tokens.id_token)?;
+    // Best-effort API key exchange, same as Codex's browser login. Failure
+    // leaves OPENAI_API_KEY null, which Codex accepts.
+    if let Ok(client) = crate::auth::build_http_client() {
+        tokens.api_key = obtain_api_key(&client, &tokens.id_token).await;
+    }
     Ok(tokens)
+}
+
+/// Exchange the id_token for an API key (`OPENAI_API_KEY`), mirroring
+/// Codex's post-login token exchange.
+async fn obtain_api_key(client: &reqwest::Client, id_token: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ExchangeResp {
+        access_token: String,
+    }
+
+    let token_url = format!("{ISSUER}/oauth/token");
+    let resp = match build_api_key_exchange_request(client, &token_url, id_token)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            debug!("API key exchange request failed (continuing without): {e}");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        debug!(
+            "API key exchange returned HTTP {} (continuing without)",
+            resp.status()
+        );
+        return None;
+    }
+    match resp.json::<ExchangeResp>().await {
+        Ok(body) => Some(body.access_token),
+        Err(e) => {
+            debug!("API key exchange parse failed (continuing without): {e}");
+            None
+        }
+    }
+}
+
+/// Body shape must match Codex 0.144.1's `obtain_api_key` token exchange.
+fn build_api_key_exchange_request(
+    client: &reqwest::Client,
+    token_url: &str,
+    id_token: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .post(token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "grant_type={}&client_id={}&requested_token={}&subject_token={}&subject_token_type={}",
+            urlencoding::encode("urn:ietf:params:oauth:grant-type:token-exchange"),
+            urlencoding::encode(CLIENT_ID),
+            urlencoding::encode("openai-api-key"),
+            urlencoding::encode(id_token),
+            urlencoding::encode("urn:ietf:params:oauth:token-type:id_token")
+        ))
 }
 
 // ── Authorization URL ─────────────────────────────────────
 
-fn build_authorize_url(code_challenge: &str, state: &str, redirect_uri: &str) -> String {
-    let params = [
-        ("response_type", "code"),
-        ("client_id", CLIENT_ID),
-        ("redirect_uri", redirect_uri),
-        ("scope", SCOPE),
-        ("code_challenge", code_challenge),
-        ("code_challenge_method", "S256"),
-        ("id_token_add_organizations", "true"),
-        ("codex_cli_simplified_flow", "true"),
-        ("state", state),
-        ("originator", ORIGINATOR),
+fn build_authorize_url(
+    code_challenge: &str,
+    state: &str,
+    redirect_uri: &str,
+    forced_workspace_ids: &[String],
+) -> String {
+    let mut params = vec![
+        ("response_type", "code".to_string()),
+        ("client_id", CLIENT_ID.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("scope", SCOPE.to_string()),
+        ("code_challenge", code_challenge.to_string()),
+        ("code_challenge_method", "S256".to_string()),
+        ("id_token_add_organizations", "true".to_string()),
+        ("codex_cli_simplified_flow", "true".to_string()),
+        ("state", state.to_string()),
+        ("originator", ORIGINATOR.to_string()),
     ];
+    // Codex pre-restricts the workspace picker on the consent page when the
+    // managed config forces workspaces.
+    if !forced_workspace_ids.is_empty() {
+        params.push(("allowed_workspace_id", forced_workspace_ids.join(",")));
+    }
 
     let qs = params
         .iter()
@@ -309,6 +387,7 @@ async fn exchange_code_with_redirect(
                 id_token: id,
                 access_token: access,
                 refresh_token: refresh,
+                api_key: None,
             })
         }
         _ => bail!("Token response missing required fields (HTTP {status})"),
@@ -571,13 +650,21 @@ pub fn build_auth_json(tokens: &LoginTokens, account_id: &str) -> serde_json::Va
     use crate::output::format_iso8601;
     let ts = crate::auth::now_unix_secs();
 
+    // Same shape Codex 0.144.1 writes on a ChatGPT login: auth_mode is
+    // persisted and an unknown account_id is null rather than "".
+    let account_id_value = if account_id.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(account_id.to_string())
+    };
     serde_json::json!({
-        "OPENAI_API_KEY": null,
+        "OPENAI_API_KEY": tokens.api_key,
+        "auth_mode": "chatgpt",
         "tokens": {
             "id_token": tokens.id_token,
             "access_token": tokens.access_token,
             "refresh_token": tokens.refresh_token,
-            "account_id": account_id
+            "account_id": account_id_value
         },
         "last_refresh": format_iso8601(ts)
     })
@@ -677,6 +764,7 @@ mod tests {
             id_token: "id-token".to_string(),
             access_token: "access-token".to_string(),
             refresh_token: "refresh-token".to_string(),
+            api_key: None,
         };
 
         let before = crate::auth::now_unix_secs();
@@ -710,6 +798,96 @@ mod tests {
             .unwrap()
             .timestamp();
         assert!(parsed >= before && parsed <= after);
+
+        // Codex 0.144.1 persists auth_mode on ChatGPT logins.
+        assert_eq!(
+            auth.get("auth_mode").and_then(|v| v.as_str()),
+            Some("chatgpt")
+        );
+    }
+
+    #[test]
+    fn test_build_auth_json_persists_api_key_when_present() {
+        let tokens = LoginTokens {
+            id_token: "id-token".to_string(),
+            access_token: "access-token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            api_key: Some("sk-test-key".to_string()),
+        };
+
+        let auth = build_auth_json(&tokens, "acct-123");
+
+        assert_eq!(
+            auth.get("OPENAI_API_KEY").and_then(|v| v.as_str()),
+            Some("sk-test-key")
+        );
+    }
+
+    #[test]
+    fn test_authorize_url_includes_forced_workspace_ids() {
+        let ids = vec!["ws-1".to_string(), "ws-2".to_string()];
+        let url = build_authorize_url(
+            "challenge",
+            "state",
+            "http://localhost:1455/auth/callback",
+            &ids,
+        );
+        assert!(url.contains("allowed_workspace_id=ws-1%2Cws-2"), "{url}");
+
+        let url = build_authorize_url(
+            "challenge",
+            "state",
+            "http://localhost:1455/auth/callback",
+            &[],
+        );
+        assert!(!url.contains("allowed_workspace_id"), "{url}");
+    }
+
+    #[test]
+    fn test_api_key_exchange_request_matches_codex_contract() {
+        let request = build_api_key_exchange_request(
+            &reqwest::Client::new(),
+            "https://auth.openai.com/oauth/token",
+            "the-id-token",
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("Content-Type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-www-form-urlencoded")
+        );
+        let body = std::str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange\
+             &client_id=app_EMoamEEZ73f0CkXaXp7hrann\
+             &requested_token=openai-api-key\
+             &subject_token=the-id-token\
+             &subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aid_token"
+        );
+    }
+
+    #[test]
+    fn test_build_auth_json_writes_null_account_id_when_unknown() {
+        let tokens = LoginTokens {
+            id_token: "id-token".to_string(),
+            access_token: "access-token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            api_key: None,
+        };
+
+        let auth = build_auth_json(&tokens, "");
+
+        // Upstream serializes a missing account_id as null, not "".
+        assert!(
+            auth.pointer("/tokens/account_id")
+                .expect("account_id key should exist")
+                .is_null()
+        );
     }
 
     #[test]

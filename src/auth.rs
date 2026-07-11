@@ -11,7 +11,17 @@ use crate::error::CsError;
 const MAX_BACKUPS: usize = 3;
 
 pub(crate) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-pub(crate) const USER_AGENT: &str = "codex/0.2.0";
+/// Upstream Codex version this release is contract-aligned with.
+pub(crate) const ALIGNED_CODEX_VERSION: &str = "0.144.1";
+
+/// User-Agent in the upstream shape: `codex_cli_rs/<version> (<os>; <arch>)`.
+pub(crate) fn codex_user_agent() -> String {
+    format!(
+        "codex_cli_rs/{ALIGNED_CODEX_VERSION} ({}; {})",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
 pub(crate) const ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
@@ -95,6 +105,23 @@ fn validate_managed_auth_config(config: &toml::Value, account_id: Option<&str>) 
         );
     }
 
+    let workspace_ids = forced_chatgpt_workspace_ids(config)?;
+    if workspace_ids.is_empty() {
+        return Ok(());
+    }
+
+    let account_id = account_id.ok_or_else(|| {
+        anyhow::anyhow!("login token has no workspace id required by Codex managed policy")
+    })?;
+    if !workspace_ids.iter().any(|id| id == account_id) {
+        anyhow::bail!(
+            "workspace {account_id} is not allowed by Codex forced_chatgpt_workspace_id policy"
+        );
+    }
+    Ok(())
+}
+
+fn forced_chatgpt_workspace_ids(config: &toml::Value) -> Result<Vec<String>> {
     let workspace_ids: Vec<&str> = match config.get("forced_chatgpt_workspace_id") {
         None => Vec::new(),
         Some(toml::Value::String(id)) => vec![id.trim()],
@@ -113,23 +140,25 @@ fn validate_managed_auth_config(config: &toml::Value, account_id: Option<&str>) 
             anyhow::bail!("forced_chatgpt_workspace_id must be a string or a list of strings")
         }
     };
-    let workspace_ids: Vec<&str> = workspace_ids
+    Ok(workspace_ids
         .into_iter()
         .filter(|id| !id.is_empty())
-        .collect();
-    if workspace_ids.is_empty() {
-        return Ok(());
-    }
+        .map(str::to_string)
+        .collect())
+}
 
-    let account_id = account_id.ok_or_else(|| {
-        anyhow::anyhow!("login token has no workspace id required by Codex managed policy")
-    })?;
-    if !workspace_ids.contains(&account_id) {
-        anyhow::bail!(
-            "workspace {account_id} is not allowed by Codex forced_chatgpt_workspace_id policy"
-        );
-    }
-    Ok(())
+/// Workspace ids forced by Codex managed config — best-effort, empty when
+/// unset or unreadable. Used to pre-restrict the OAuth authorize page the
+/// same way Codex does via `allowed_workspace_id`.
+pub(crate) fn configured_forced_workspace_ids() -> Vec<String> {
+    let Ok(codex_home) = codex_home_from_values(std::env::var_os("CODEX_HOME"), dirs::home_dir())
+    else {
+        return Vec::new();
+    };
+    let Ok(Some((_path, config))) = load_codex_config(&codex_home) else {
+        return Vec::new();
+    };
+    forced_chatgpt_workspace_ids(&config).unwrap_or_default()
 }
 
 pub(crate) fn validate_managed_chatgpt_account(id_token: &str) -> Result<()> {
@@ -264,13 +293,8 @@ pub fn update_tokens(
     refresh_token: &str,
 ) -> Result<()> {
     let mut val = read_auth(path)?;
-    let tokens = val
-        .get_mut("tokens")
-        .and_then(|t| t.as_object_mut())
-        .ok_or_else(|| anyhow::anyhow!("auth.json missing tokens object in {}", path.display()))?;
-    tokens.insert("id_token".into(), serde_json::json!(id_token));
-    tokens.insert("access_token".into(), serde_json::json!(access_token));
-    tokens.insert("refresh_token".into(), serde_json::json!(refresh_token));
+    apply_tokens(&mut val, id_token, access_token, refresh_token)
+        .with_context(|| format!("updating tokens in {}", path.display()))?;
     write_auth(path, &val)
 }
 
@@ -288,6 +312,14 @@ pub fn apply_tokens(
     tokens.insert("id_token".into(), serde_json::json!(id_token));
     tokens.insert("access_token".into(), serde_json::json!(access_token));
     tokens.insert("refresh_token".into(), serde_json::json!(refresh_token));
+    // Codex refreshes proactively when last_refresh is older than 8 days;
+    // stamping it here keeps our refreshes recognized (matches upstream).
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert(
+            "last_refresh".into(),
+            serde_json::json!(crate::output::format_iso8601(now_unix_secs())),
+        );
+    }
     Ok(())
 }
 
@@ -383,7 +415,7 @@ pub fn build_http_client() -> Result<reqwest::Client> {
 
 pub fn build_http_client_with_proxy(proxy_url: Option<&str>) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(codex_user_agent())
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(60));
 
@@ -503,8 +535,66 @@ fn cleanup_old_backups(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     use serde_json::json;
+
+    fn assert_recent_rfc3339(value: &serde_json::Value) {
+        let text = value.as_str().expect("last_refresh should be a string");
+        let parsed = chrono::DateTime::parse_from_rfc3339(text).expect("RFC3339 last_refresh");
+        let age = chrono::Utc::now().signed_duration_since(parsed);
+        assert!(
+            age.num_seconds().abs() < 60,
+            "last_refresh not recent: {text}"
+        );
+    }
+
+    #[test]
+    fn test_apply_tokens_updates_last_refresh() {
+        let mut val = json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": "old-id",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "account_id": "acct"
+            },
+            "last_refresh": "2020-01-01T00:00:00Z"
+        });
+
+        apply_tokens(&mut val, "new-id", "new-access", "new-refresh").unwrap();
+
+        assert_eq!(val["tokens"]["access_token"], "new-access");
+        assert_recent_rfc3339(&val["last_refresh"]);
+    }
+
+    #[test]
+    fn test_update_tokens_updates_last_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        write_auth(
+            &path,
+            &json!({
+                "tokens": { "id_token": "a", "access_token": "b", "refresh_token": "c" },
+                "last_refresh": "2020-01-01T00:00:00Z"
+            }),
+        )
+        .unwrap();
+
+        update_tokens(&path, "new-id", "new-access", "new-refresh").unwrap();
+
+        let val = read_auth(&path).unwrap();
+        assert_eq!(val["tokens"]["refresh_token"], "new-refresh");
+        assert_recent_rfc3339(&val["last_refresh"]);
+    }
+
+    #[test]
+    fn test_user_agent_matches_upstream_shape() {
+        let ua = codex_user_agent();
+        assert!(
+            ua.starts_with("codex_cli_rs/0.144.1 ("),
+            "unexpected UA: {ua}"
+        );
+        assert!(ua.ends_with(')'));
+    }
 
     #[test]
     fn test_sanitize_proxy_url_masks_userinfo() {

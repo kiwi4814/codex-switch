@@ -20,7 +20,7 @@ jobs:
       prerelease: ${{ steps.parse.outputs.prerelease }}
       is_dev: ${{ steps.parse.outputs.is_dev }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Parse tag
         id: parse
         run: |
@@ -75,11 +75,12 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch 2026-07
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Install musl tools (Linux x86_64)
@@ -90,7 +91,7 @@ jobs:
 
       - name: Install cross (Linux ARM64 musl)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev 64b5bb4d3d34de062552b9a2093affe77b4ad16a
 
       - name: Inject version into Cargo.toml
         shell: bash
@@ -127,7 +128,7 @@ jobs:
           sha256sum "${{ matrix.name }}.zip" > "${{ matrix.name }}.zip.sha256"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.name }}
           path: |
@@ -143,10 +144,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
@@ -226,7 +227,7 @@ jobs:
 
       - name: Create GitHub Release (dev)
         if: needs.meta.outputs.is_dev == 'true'
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           tag_name: dev
           name: "dev (${{ needs.meta.outputs.version }})"
@@ -239,7 +240,7 @@ jobs:
 
       - name: Create GitHub Release (stable)
         if: needs.meta.outputs.is_dev != 'true'
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           tag_name: v${{ needs.meta.outputs.version }}
           name: v${{ needs.meta.outputs.version }}

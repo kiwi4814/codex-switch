@@ -71,9 +71,17 @@ pub fn parse_account_info(auth: &Value) -> AccountInfo {
 
     let claims = decode_jwt_payload(id_token).unwrap_or_default();
 
+    // Root claim first, then the profile claim — matches Codex 0.144.1,
+    // which falls back to https://api.openai.com/profile.email.
     let email = claims
         .get("email")
         .and_then(|v| v.as_str())
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/profile")
+                .and_then(|p| p.get("email"))
+                .and_then(|v| v.as_str())
+        })
         .map(|s| s.to_string());
 
     let auth_claims = claims.get("https://api.openai.com/auth");
@@ -258,6 +266,29 @@ mod tests {
         assert_eq!(info.email.as_deref(), Some("user@example.com"));
         assert_eq!(info.plan_type.as_deref(), Some("pro"));
         assert_eq!(info.account_id.as_deref(), Some("acct-from-claim"));
+    }
+
+    #[test]
+    fn test_parse_account_info_email_falls_back_to_profile_claim() {
+        // Codex 0.144.1 reads email from the root claim, then falls back to
+        // the https://api.openai.com/profile claim — some id_tokens only
+        // carry the latter.
+        let auth = json!({
+            "tokens": {
+                "id_token": make_jwt(&json!({
+                    "https://api.openai.com/profile": {
+                        "email": "workspace-user@example.com"
+                    },
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "acct-1"
+                    }
+                }))
+            }
+        });
+
+        let info = parse_account_info(&auth);
+
+        assert_eq!(info.email.as_deref(), Some("workspace-user@example.com"));
     }
 
     #[test]
