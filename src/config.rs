@@ -140,6 +140,8 @@ pub struct DaemonConfig {
     pub notify: bool,
     /// Log level for daemon (default: "error")
     pub log_level: String,
+    /// Hold a pending switch while a Codex session is running (default: true)
+    pub defer_switch_while_codex_running: bool,
 }
 
 impl Default for DaemonConfig {
@@ -152,6 +154,7 @@ impl Default for DaemonConfig {
             token_check_interval_secs: 300,
             notify: false,
             log_level: "error".to_string(),
+            defer_switch_while_codex_running: true,
         }
     }
 }

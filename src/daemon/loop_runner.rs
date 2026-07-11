@@ -1,6 +1,25 @@
 use anyhow::Result;
 
+use super::state::{self, DaemonState, PendingSwitch, SwitchRecord};
 use crate::{auth, cache, config, profile, usage, warmup};
+
+/// Outcome of one monitor poll.
+enum PollOutcome {
+    NoAction,
+    Switched {
+        from: String,
+        to: String,
+        score: f64,
+    },
+    Deferred {
+        to: String,
+    },
+}
+
+/// Backoff after `consecutive_failures` failed polls, capped at 16 poll intervals.
+fn poll_backoff_secs(poll_secs: u64, consecutive_failures: u32) -> u64 {
+    poll_secs * 2u64.pow(consecutive_failures.min(4))
+}
 
 /// Main daemon event loop: periodically checks usage and switches account when needed.
 pub async fn run_daemon_loop() -> Result<()> {
@@ -20,7 +39,13 @@ pub async fn run_daemon_loop() -> Result<()> {
         cache_refresh_period,
     );
     cache_refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut consecutive_failures: u32 = 0;
+
+    let mut st = DaemonState {
+        pid: std::process::id(),
+        started_at: auth::now_unix_secs(),
+        ..DaemonState::default()
+    };
+    state::write(&mut st);
 
     tracing::info!(
         "Daemon loop started: poll={}s, token_check={}s, cache_refresh={}s, auto_warmup={}, threshold={}%",
@@ -34,29 +59,61 @@ pub async fn run_daemon_loop() -> Result<()> {
     loop {
         tokio::select! {
             _ = poll_interval.tick() => {
-                match check_and_switch().await {
-                    Ok(switched) => {
-                        consecutive_failures = 0;
-                        if switched {
-                            tracing::info!("Account switch completed");
-                        }
+                // Failure backoff suspends polling only; token and cache
+                // timers keep running.
+                let now = auth::now_unix_secs();
+                if let Some(until) = st.backoff_until {
+                    if now < until {
+                        tracing::debug!("Poll suspended by backoff for {}s more", until - now);
+                        continue;
                     }
-                    Err(e) => {
-                        consecutive_failures += 1;
-                        let backoff_secs = poll_secs * 2u64.pow(consecutive_failures.min(4));
-                        tracing::error!(
-                            "Monitor cycle failed ({consecutive_failures}x): {e}, backing off {backoff_secs}s"
-                        );
-                        // Backoff with nested select! so shutdown signal is still responsive
-                        tokio::select! {
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                            _ = shutdown_signal() => {
-                                tracing::info!("Received shutdown signal during backoff, exiting");
-                                break;
+                    st.backoff_until = None;
+                }
+
+                match check_and_switch().await {
+                    Ok(outcome) => {
+                        st.consecutive_failures = 0;
+                        st.last_error = None;
+                        st.last_poll_at = Some(auth::now_unix_secs());
+                        match outcome {
+                            PollOutcome::Switched { from, to, score } => {
+                                tracing::info!("Account switch completed");
+                                st.pending_switch = None;
+                                st.last_switch = Some(SwitchRecord {
+                                    from,
+                                    to,
+                                    at: auth::now_unix_secs(),
+                                    score,
+                                });
+                            }
+                            PollOutcome::Deferred { to } => {
+                                // Keep the original `since` while the same target stays pending.
+                                let since = st
+                                    .pending_switch
+                                    .as_ref()
+                                    .filter(|p| p.to == to)
+                                    .map(|p| p.since)
+                                    .unwrap_or_else(auth::now_unix_secs);
+                                st.pending_switch = Some(PendingSwitch { to, since });
+                            }
+                            PollOutcome::NoAction => {
+                                st.pending_switch = None;
                             }
                         }
                     }
+                    Err(e) => {
+                        st.consecutive_failures += 1;
+                        st.last_poll_at = Some(auth::now_unix_secs());
+                        st.last_error = Some(e.to_string());
+                        let backoff_secs = poll_backoff_secs(poll_secs, st.consecutive_failures);
+                        st.backoff_until = Some(auth::now_unix_secs() + backoff_secs as i64);
+                        tracing::error!(
+                            "Monitor cycle failed ({}x): {e}, backing off {backoff_secs}s",
+                            st.consecutive_failures
+                        );
+                    }
                 }
+                state::write(&mut st);
             }
             _ = token_interval.tick() => {
                 usage::refresh_expiring_tokens().await;
@@ -71,6 +128,8 @@ pub async fn run_daemon_loop() -> Result<()> {
                     ),
                     Err(e) => tracing::warn!("Cache refresh skipped: {e}"),
                 }
+                st.last_cache_refresh_at = Some(auth::now_unix_secs());
+                state::write(&mut st);
             }
             _ = shutdown_signal() => {
                 tracing::info!("Received shutdown signal, exiting daemon loop");
@@ -82,17 +141,15 @@ pub async fn run_daemon_loop() -> Result<()> {
 }
 
 /// Check current account usage and switch to a better candidate if threshold exceeded.
-///
-/// Returns `true` if a switch was performed.
-async fn check_and_switch() -> Result<bool> {
+async fn check_and_switch() -> Result<PollOutcome> {
     let profiles = profile::list_profiles()?;
     if profiles.len() < 2 {
-        return Ok(false);
+        return Ok(PollOutcome::NoAction);
     }
 
     let current = profile::read_current();
     if current.is_empty() {
-        return Ok(false);
+        return Ok(PollOutcome::NoAction);
     }
 
     let cfg = config::get();
@@ -123,7 +180,7 @@ async fn check_and_switch() -> Result<bool> {
             current_used,
             threshold,
         );
-        return Ok(false);
+        return Ok(PollOutcome::NoAction);
     }
 
     tracing::info!(
@@ -133,25 +190,8 @@ async fn check_and_switch() -> Result<bool> {
         threshold,
     );
 
-    // 3. Score current account using adaptive algorithm
+    // 3. Fetch all other candidates concurrently
     let team_priority = cfg.use_cfg.team_priority;
-    let pool_size = profiles.len();
-
-    let current_info = profile::profile_auth_path(&current)
-        .map(|p| auth::read_account_info(&p))
-        .unwrap_or_default();
-    let mut current_candidate = usage::Candidate::from_usage(
-        current.clone(),
-        &current_usage,
-        current_info.is_team(),
-        current_info.is_free(),
-        cache::get_last_used(&current),
-        now,
-    );
-    current_candidate.pool_size = pool_size;
-    current_candidate.team_priority = team_priority;
-
-    // 4. Fetch all other candidates concurrently, then compute pool_exhausted and score
     let mut tasks = tokio::task::JoinSet::new();
 
     for alias in &profiles {
@@ -170,7 +210,14 @@ async fn check_and_switch() -> Result<bool> {
         });
     }
 
-    let mut other_candidates: Vec<(usage::Candidate, String)> = Vec::new();
+    // 4. Score everything uniformly (same helper as CLI `use`); the current
+    // account goes first so it can be split back off after scoring.
+    let mut items = vec![(
+        current.clone(),
+        current_usage.clone(),
+        auth::read_account_info(&current_path),
+        cache::get_last_used(&current),
+    )];
     while let Some(res) = tasks.join_next().await {
         let (alias, path, u) = match res {
             Ok(v) => v,
@@ -184,59 +231,32 @@ async fn check_and_switch() -> Result<bool> {
             }
         };
         let info = auth::read_account_info(&path);
-        let mut candidate = usage::Candidate::from_usage(
-            alias.clone(),
-            &u,
-            info.is_team(),
-            info.is_free(),
-            cache::get_last_used(&alias),
-            now,
-        );
-        candidate.pool_size = pool_size;
-        candidate.team_priority = team_priority;
-        other_candidates.push((candidate, alias));
+        let last_used = cache::get_last_used(&alias);
+        items.push((alias, u, info, last_used));
     }
 
-    // Compute pool_exhausted across all accounts (including current)
-    let pool_exhausted = other_candidates
-        .iter()
-        .filter(|(c, _)| c.effective_used_5h() >= 100.0)
-        .count()
-        + if current_candidate.effective_used_5h() >= 100.0 {
-            1
-        } else {
-            0
-        };
-
-    // Patch pool_exhausted into current candidate and re-score
-    current_candidate.pool_exhausted = pool_exhausted;
-    let current_score = usage::score_unified(&current_candidate, safety_7d);
-
-    // Two-phase: prefer eligible candidates, fallback to best ineligible
-    let mut best_eligible: Option<(String, f64)> = None;
-    let mut best_ineligible: Option<(String, f64)> = None;
-    let mut any_eligible = false;
-
-    for (mut candidate, alias) in other_candidates {
-        candidate.pool_exhausted = pool_exhausted;
-        let s = usage::score_unified(&candidate, safety_7d);
-        let eligible = usage::is_candidate_eligible(&candidate, safety_7d);
-
-        if eligible {
-            any_eligible = true;
-            if s > current_score && best_eligible.as_ref().is_none_or(|(_, bs)| s > *bs) {
-                best_eligible = Some((alias, s));
-            }
-        } else if s > current_score && best_ineligible.as_ref().is_none_or(|(_, bs)| s > *bs) {
-            best_ineligible = Some((alias, s));
-        }
-    }
-
-    // Use eligible candidate if available, otherwise fallback to best ineligible
-    let best = best_eligible.or(if !any_eligible { best_ineligible } else { None });
+    let mut scored = usage::score_candidates(items, now, safety_7d, team_priority);
+    let current_score = scored.remove(0).score;
 
     // 5. Switch if a better candidate was found
-    if let Some((best_alias, best_score)) = best {
+    if let Some((best_alias, best_score)) =
+        usage::pick_switch_target(current_score, &scored, safety_7d)
+    {
+        let (best_alias, best_score) = (best_alias.to_string(), best_score);
+        // A switch replaces the live auth.json; doing that under an active
+        // Codex session would swap accounts mid-conversation. Hold the
+        // switch and let the next poll retry once the session ends.
+        if cfg.daemon.defer_switch_while_codex_running
+            && super::codex_process::codex_process_running()
+        {
+            tracing::info!(
+                "Deferring switch '{}' -> '{}': a Codex session is running",
+                current,
+                best_alias,
+            );
+            return Ok(PollOutcome::Deferred { to: best_alias });
+        }
+
         tracing::info!(
             "Switching: '{}' (score {:.1}) -> '{}' (score {:.1})",
             current,
@@ -253,11 +273,28 @@ async fn check_and_switch() -> Result<bool> {
                 best_alias, best_score
             ));
         }
-        return Ok(true);
+        return Ok(PollOutcome::Switched {
+            from: current,
+            to: best_alias,
+            score: best_score,
+        });
     }
 
     tracing::debug!("No better candidate found");
-    Ok(false)
+    Ok(PollOutcome::NoAction)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::poll_backoff_secs;
+
+    #[test]
+    fn poll_backoff_doubles_and_caps_at_sixteen_intervals() {
+        assert_eq!(poll_backoff_secs(60, 1), 120);
+        assert_eq!(poll_backoff_secs(60, 2), 240);
+        assert_eq!(poll_backoff_secs(60, 4), 960);
+        assert_eq!(poll_backoff_secs(60, 10), 960);
+    }
 }
 
 #[derive(Default)]

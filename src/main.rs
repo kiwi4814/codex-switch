@@ -38,10 +38,27 @@ async fn main() {
     } else {
         EnvFilter::new("codex_switch=error")
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
+    // The daemon runs with stdio discarded (launchd / detached spawn), so its
+    // loop also logs to a rotating file. Everything else logs to stderr only.
+    let daemon_foreground = matches!(
+        &cli.command,
+        Commands::Daemon(cli::DaemonCommand::Start { foreground: true })
+    );
+    let mut _log_guard = None;
+    if daemon_foreground && let Ok((file_writer, guard)) = daemon::file_log_writer() {
+        use tracing_subscriber::fmt::writer::MakeWriterExt;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::io::stderr.and(file_writer))
+            .init();
+        _log_guard = Some(guard);
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    }
     let use_json = cli.json || cli.json_pretty;
     let message_mode = if matches!(&cli.command, Commands::Tui) {
         MessageMode::Silent
@@ -659,46 +676,22 @@ fn score_profile_candidates(
     safety_7d: f64,
     team_priority: bool,
 ) -> Vec<(usage::Candidate, usage::UsageInfo, f64)> {
-    let pool_size = fetched.len();
-
-    let mut candidates: Vec<(usage::Candidate, usage::UsageInfo)> = fetched
+    let items = fetched
         .into_iter()
         .map(|(alias, u)| {
             let info = profile::profile_auth_path(&alias)
                 .map(|p| auth::read_account_info(&p))
                 .unwrap_or_default();
             let last_used = cache::get_last_used(&alias);
-            // API plan_type is authoritative over JWT for scoring (handles plan downgrades)
-            let api_plan = u.plan_type.as_deref();
-            let is_team = api_plan
-                .map(|p| p == "team")
-                .unwrap_or_else(|| info.is_team());
-            let is_free = api_plan
-                .map(|p| p == "free")
-                .unwrap_or_else(|| info.is_free());
-            let mut candidate =
-                usage::Candidate::from_usage(alias, &u, is_team, is_free, last_used, now);
-            candidate.pool_size = pool_size;
-            candidate.team_priority = team_priority;
-            (candidate, u)
+            (alias, u, info, last_used)
         })
         .collect();
 
-    let pool_exhausted = candidates
-        .iter()
-        .filter(|(candidate, _)| candidate.effective_used_5h() >= 100.0)
-        .count();
-    for (candidate, _) in &mut candidates {
-        candidate.pool_exhausted = pool_exhausted;
-    }
-
-    let mut scored: Vec<(usage::Candidate, usage::UsageInfo, f64)> = candidates
-        .into_iter()
-        .map(|(candidate, usage)| {
-            let score = usage::score_unified(&candidate, safety_7d);
-            (candidate, usage, score)
-        })
-        .collect();
+    let mut scored: Vec<(usage::Candidate, usage::UsageInfo, f64)> =
+        usage::score_candidates(items, now, safety_7d, team_priority)
+            .into_iter()
+            .map(|s| (s.candidate, s.usage, s.score))
+            .collect();
 
     scored.sort_by(|a, b| {
         let eligible_a = usage::is_candidate_eligible(&a.0, safety_7d);

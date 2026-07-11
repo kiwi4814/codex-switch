@@ -649,6 +649,21 @@ pub async fn validate_import_auth(
     }
 }
 
+/// Build the token refresh request. Codex 0.144.1 sends a JSON body
+/// ({client_id, grant_type, refresh_token}) — keep the same shape so the
+/// auth server sees requests identical to the real client's.
+pub(crate) fn build_refresh_request(
+    client: &reqwest::Client,
+    token_url: &str,
+    refresh_token: &str,
+) -> reqwest::RequestBuilder {
+    client.post(token_url).json(&serde_json::json!({
+        "client_id": CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }))
+}
+
 pub(crate) async fn do_refresh_token(
     alias: &str,
     client: &reqwest::Client,
@@ -656,19 +671,10 @@ pub(crate) async fn do_refresh_token(
     current_access_token: Option<&str>,
     refresh_token: &str,
 ) -> Result<RefreshedTokens> {
-    let body = format!(
-        "grant_type=refresh_token&refresh_token={}&client_id={}",
-        urlencoding::encode(refresh_token),
-        urlencoding::encode(CLIENT_ID),
-    );
-
     let token_url = auth::token_url();
     debug!("[{alias}] sending token refresh request to {token_url}");
 
-    let resp = client
-        .post(token_url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body)
+    let resp = build_refresh_request(client, &token_url, refresh_token)
         .send()
         .await
         .map_err(|e| format_reqwest_error("token refresh request failed", &e))?;
@@ -1258,6 +1264,95 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
     tier_bonus + headroom + sustain + drain_value + recency
 }
 
+// ── Shared candidate building and selection ───────────────
+//
+// CLI `use` and the daemon score the same way through these helpers; only
+// the final ranking/selection policy differs per caller.
+
+/// One scored candidate. Pure data, no I/O.
+pub struct ScoredCandidate {
+    pub candidate: Candidate,
+    pub usage: UsageInfo,
+    pub score: f64,
+}
+
+/// Build and score candidates uniformly: the API `plan_type` is
+/// authoritative over the JWT (handles plan downgrades), and
+/// `pool_exhausted` counts 5h-exhausted accounts across the whole input.
+/// Input order is preserved.
+pub fn score_candidates(
+    fetched: Vec<(String, UsageInfo, crate::jwt::AccountInfo, i64)>,
+    now: i64,
+    safety_7d: f64,
+    team_priority: bool,
+) -> Vec<ScoredCandidate> {
+    let pool_size = fetched.len();
+
+    let mut candidates: Vec<(Candidate, UsageInfo)> = fetched
+        .into_iter()
+        .map(|(alias, u, info, last_used)| {
+            let api_plan = u.plan_type.as_deref();
+            let is_team = api_plan
+                .map(|p| p == "team")
+                .unwrap_or_else(|| info.is_team());
+            let is_free = api_plan
+                .map(|p| p == "free")
+                .unwrap_or_else(|| info.is_free());
+            let mut candidate = Candidate::from_usage(alias, &u, is_team, is_free, last_used, now);
+            candidate.pool_size = pool_size;
+            candidate.team_priority = team_priority;
+            (candidate, u)
+        })
+        .collect();
+
+    let pool_exhausted = candidates
+        .iter()
+        .filter(|(candidate, _)| candidate.effective_used_5h() >= 100.0)
+        .count();
+    for (candidate, _) in &mut candidates {
+        candidate.pool_exhausted = pool_exhausted;
+    }
+
+    candidates
+        .into_iter()
+        .map(|(candidate, usage)| {
+            let score = score_unified(&candidate, safety_7d);
+            ScoredCandidate {
+                candidate,
+                usage,
+                score,
+            }
+        })
+        .collect()
+}
+
+/// Daemon switch policy over already-scored candidates: prefer an eligible
+/// candidate that beats `current_score`; fall back to the best ineligible
+/// one only when no candidate is eligible at all.
+pub fn pick_switch_target<'a>(
+    current_score: f64,
+    others: &'a [ScoredCandidate],
+    safety_7d: f64,
+) -> Option<(&'a str, f64)> {
+    let mut best_eligible: Option<(&'a str, f64)> = None;
+    let mut best_ineligible: Option<(&'a str, f64)> = None;
+    let mut any_eligible = false;
+
+    for s in others {
+        let eligible = is_candidate_eligible(&s.candidate, safety_7d);
+        if eligible {
+            any_eligible = true;
+            if s.score > current_score && best_eligible.is_none_or(|(_, bs)| s.score > bs) {
+                best_eligible = Some((s.candidate.alias.as_str(), s.score));
+            }
+        } else if s.score > current_score && best_ineligible.is_none_or(|(_, bs)| s.score > bs) {
+            best_ineligible = Some((s.candidate.alias.as_str(), s.score));
+        }
+    }
+
+    best_eligible.or(if !any_eligible { best_ineligible } else { None })
+}
+
 fn known_rate_limit_reached_type(body: &Value) -> bool {
     let kind = body.get("rate_limit_reached_type").and_then(|value| {
         value
@@ -1515,6 +1610,35 @@ mod tests {
     use chrono::DateTime;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_refresh_request_uses_json_body_like_codex() {
+        let request = build_refresh_request(
+            &reqwest::Client::new(),
+            "https://auth.openai.com/oauth/token",
+            "refresh-token-value",
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("Content-Type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "client_id": crate::auth::CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": "refresh-token-value",
+            })
+        );
+    }
 
     #[test]
     fn test_account_routing_headers_include_workspace_and_fedramp() {
@@ -2021,6 +2145,120 @@ mod tests {
             pool_exhausted: 0,
             team_priority: true,
         }
+    }
+
+    fn usage_with_5h(used_percent: f64, resets_at: i64, plan_type: Option<&str>) -> UsageInfo {
+        UsageInfo {
+            primary: Some(WindowUsage {
+                used_percent: Some(used_percent),
+                resets_at: Some(resets_at),
+            }),
+            secondary: Some(WindowUsage {
+                used_percent: Some(10.0),
+                resets_at: Some(resets_at + 5 * 86400),
+            }),
+            plan_type: plan_type.map(|p| p.to_string()),
+            ..UsageInfo::default()
+        }
+    }
+
+    #[test]
+    fn test_score_candidates_api_plan_overrides_jwt_and_counts_pool_exhausted() {
+        let now = 1_000_000i64;
+        let jwt_team = crate::jwt::AccountInfo {
+            plan_type: Some("team".to_string()),
+            ..Default::default()
+        };
+        let items = vec![
+            // API says free although the JWT still claims team (plan downgrade)
+            (
+                "downgraded".to_string(),
+                usage_with_5h(100.0, now + 3600, Some("free")),
+                jwt_team,
+                0,
+            ),
+            // No API plan — JWT (default: not team/free) applies
+            (
+                "healthy".to_string(),
+                usage_with_5h(20.0, now + 3600, None),
+                Default::default(),
+                0,
+            ),
+        ];
+
+        let scored = score_candidates(items, now, 20.0, true);
+
+        assert_eq!(scored.len(), 2);
+        assert_eq!(scored[0].candidate.alias, "downgraded"); // input order preserved
+        assert!(scored[0].candidate.is_free);
+        assert!(!scored[0].candidate.is_team);
+        // One exhausted account (100% 5h), visible to every candidate
+        assert_eq!(scored[0].candidate.pool_exhausted, 1);
+        assert_eq!(scored[1].candidate.pool_exhausted, 1);
+        assert_eq!(scored[1].candidate.pool_size, 2);
+    }
+
+    fn scored(candidate: Candidate, safety_7d: f64) -> ScoredCandidate {
+        let score = score_unified(&candidate, safety_7d);
+        ScoredCandidate {
+            candidate,
+            usage: UsageInfo::default(),
+            score,
+        }
+    }
+
+    #[test]
+    fn test_pick_switch_target_prefers_eligible_above_current() {
+        let now = 1_000_000i64;
+        let current = make_candidate("current", 90.0, Some(now + 3600), 50.0, Some(now + 86400));
+        let good = make_candidate("good", 10.0, Some(now + 3600), 10.0, Some(now + 5 * 86400));
+        let current_score = score_unified(&current, 20.0);
+
+        let others = vec![scored(good, 20.0)];
+        let pick = pick_switch_target(current_score, &others, 20.0);
+        assert_eq!(pick.map(|(a, _)| a), Some("good"));
+    }
+
+    #[test]
+    fn test_pick_switch_target_ignores_ineligible_when_an_eligible_exists() {
+        let now = 1_000_000i64;
+        let current = make_candidate("current", 90.0, Some(now + 3600), 50.0, Some(now + 86400));
+        let current_score = score_unified(&current, 20.0);
+
+        // Eligible but worse than current; ineligible (7d over safety margin) better.
+        let weak_eligible =
+            make_candidate("weak", 95.0, Some(now + 3600), 40.0, Some(now + 5 * 86400));
+        let strong_ineligible = make_candidate(
+            "strong",
+            0.0,
+            Some(now + 18000),
+            95.0,
+            Some(now + 5 * 86400),
+        );
+
+        let others = vec![scored(weak_eligible, 20.0), scored(strong_ineligible, 20.0)];
+        // An eligible candidate exists, so the ineligible one must not be picked,
+        // and the eligible one does not beat current — no switch.
+        assert!(pick_switch_target(current_score, &others, 20.0).is_none());
+    }
+
+    #[test]
+    fn test_pick_switch_target_falls_back_when_nothing_is_eligible() {
+        let now = 1_000_000i64;
+        let current = make_candidate("current", 100.0, Some(now + 3600), 96.0, Some(now + 86400));
+        let current_score = score_unified(&current, 20.0);
+
+        let ineligible = make_candidate(
+            "fallback",
+            0.0,
+            Some(now + 18000),
+            95.0,
+            Some(now + 5 * 86400),
+        );
+        let others = vec![scored(ineligible, 20.0)];
+
+        let pick = pick_switch_target(current_score, &others, 20.0);
+        assert_eq!(pick.map(|(a, _)| a), Some("fallback"));
     }
 
     #[test]

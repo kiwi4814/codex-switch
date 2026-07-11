@@ -111,7 +111,11 @@ cache_refresh_interval_secs = 1
 auto_warmup = false
 token_check_interval_secs = 60
 notify = false
-log_level = "error"
+# info so the startup line reaches the rotating log file (asserted below).
+log_level = "info"
+# The host running this test may have real Codex sessions open; switching
+# must not be deferred by them.
+defer_switch_while_codex_running = false
 "#,
     )
     .unwrap();
@@ -274,6 +278,39 @@ async fn daemon_start_switch_status_and_stop() {
                 .unwrap_or(false)
                 && read_live_access_token(&env.live_auth_path()).as_deref() == Some("tok_gradual_b")
         },
+    );
+
+    // The daemon runs with stdio discarded, so its loop must log to the
+    // rotating file under app_home/logs.
+    wait_until(Duration::from_secs(10), "daemon writes a log file", || {
+        std::fs::read_dir(env.app_home().join("logs"))
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    e.file_name().to_string_lossy().starts_with("daemon")
+                        && e.metadata().is_ok_and(|m| m.len() > 0)
+                })
+            })
+            .unwrap_or(false)
+    });
+
+    // The loop's state snapshot should record the switch and be exposed by status --json.
+    wait_until(
+        Duration::from_secs(10),
+        "status snapshot records the switch",
+        || {
+            let out = run_cmd(&env, &["--json", "daemon", "status"]);
+            if !out.status.success() {
+                return false;
+            }
+            let json = stdout_json(&out);
+            json["snapshot"]["last_switch"]["to"] == "gradual_b"
+                && json["snapshot"]["pid"].as_u64().is_some()
+                && json["snapshot"]["last_poll_at"].as_i64().is_some()
+        },
+    );
+    assert!(
+        env.app_home().join("daemon-state.json").exists(),
+        "daemon should write its state snapshot"
     );
 
     let stop = run_cmd(&env, &["daemon", "stop"]);

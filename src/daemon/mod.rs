@@ -1,11 +1,31 @@
+pub mod codex_process;
 pub mod loop_runner;
 pub mod notify;
 pub mod pidfile;
 pub mod service;
+pub mod state;
 
 use crate::cli::DaemonCommand;
 use crate::output::{print_json, user_println};
 use anyhow::Result;
+
+/// Rolling file logger for the daemon (`~/.codex-switch/logs/daemon.log.*`),
+/// daily rotation capped at 7 files. launchd and the detached spawn discard
+/// stdio, so without this the daemon's tracing output is lost entirely.
+pub fn file_log_writer() -> Result<(
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+)> {
+    let dir = crate::auth::app_home()?.join("logs");
+    std::fs::create_dir_all(&dir)?;
+    let appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("daemon")
+        .filename_suffix("log")
+        .max_log_files(7)
+        .build(&dir)?;
+    Ok(tracing_appender::non_blocking(appender))
+}
 
 pub async fn dispatch(cmd: DaemonCommand, json: bool) -> Result<()> {
     match cmd {
@@ -213,6 +233,9 @@ fn status(json: bool) -> Result<()> {
         (None, _) => "stopped",
     };
 
+    // Loop-written snapshot; only meaningful while the daemon is running.
+    let snapshot = if running { state::read() } else { None };
+
     if json {
         let cfg = crate::config::get();
         print_json(&serde_json::json!({
@@ -221,6 +244,7 @@ fn status(json: bool) -> Result<()> {
             "pid": pid,
             "pidfile": pidfile,
             "stale_pid_cleaned": state == "stale",
+            "snapshot": snapshot,
             "platform": {
                 "os": std::env::consts::OS,
                 "daemon_start_supported": cfg!(any(unix, target_os = "windows")),
@@ -249,6 +273,33 @@ fn status(json: bool) -> Result<()> {
         match (pid, running) {
             (Some(pid), true) => {
                 user_println(&format!("Daemon is running (PID {pid})"));
+                if let Some(snap) = &snapshot {
+                    if let Some(at) = snap.last_poll_at {
+                        user_println(&format!("  Last poll: {}", format_unix(at)));
+                    }
+                    if let Some(sw) = &snap.last_switch {
+                        user_println(&format!(
+                            "  Last switch: '{}' -> '{}' at {} (score {:.0})",
+                            sw.from,
+                            sw.to,
+                            format_unix(sw.at),
+                            sw.score
+                        ));
+                    }
+                    if let Some(p) = &snap.pending_switch {
+                        user_println(&format!(
+                            "  Pending switch to '{}' since {} (waiting for Codex session to end)",
+                            p.to,
+                            format_unix(p.since)
+                        ));
+                    }
+                    if let Some(err) = &snap.last_error {
+                        user_println(&format!(
+                            "  Last error ({} consecutive): {err}",
+                            snap.consecutive_failures
+                        ));
+                    }
+                }
             }
             (Some(pid), false) => {
                 user_println(&format!("Daemon is not running (stale PID {pid})"));
@@ -267,6 +318,13 @@ fn status(json: bool) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(any(unix, target_os = "windows"))]
+fn format_unix(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| ts.to_string())
 }
 
 fn service_manager_name() -> &'static str {
