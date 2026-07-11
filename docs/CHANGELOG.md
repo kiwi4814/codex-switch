@@ -21,6 +21,7 @@
 - **Usage and reset-credit alignment** — Usage, models, and warmup requests carry workspace/FedRAMP routing headers; empty or structurally drifted usage responses are rejected; account-limited state is persisted; reset credits support no-expiry entries; consume retries reuse one redemption request ID and only `code=reset` is success.
 - **Cross-platform daemon lifecycle** — launchd, systemd user services, and Windows Task Scheduler preserve `CODEX_HOME`; PID files include executable identity and an active OS lock; stale or legacy PID data is never trusted for signaling; zero daemon intervals normalize to 60/300/300 seconds.
 - **Fail-fast configuration** — An existing unreadable, malformed, or dangling-symlink `config.toml` now reports the real error instead of silently starting with defaults; defaults remain limited to a genuinely missing file.
+- **Internal module layout** — The oversized `usage.rs` (2,645 lines) and `main.rs` (1,740 lines) were split into focused submodules (`usage/{scoring,api,reset_credits,parse}` and `commands/`) as a pure mechanical move; public paths, behavior, and tests are unchanged.
 
 ### Fixed
 
@@ -35,6 +36,10 @@
 - **Documentation drift** — Removed nonexistent `use --force` and `codex --quiet` examples; documented self-update channel preservation, Windows `.zip` artifacts, Windows Task Scheduler support, daemon cache/warmup settings, and the file-auth prerequisite.
 - **Safer CLI and TUI feedback** — Profile deletion now defaults to `y/N`, requires `--yes` for JSON/non-interactive callers, refuses the active profile, and archives deleted credentials for recovery; all-skipped directory imports return a structured failure and nonzero exit; device login stops after three consecutive polling failures; empty account lists, TUI add discovery, menu key handling, and error coloring now provide actionable feedback.
 - **Platform-specific update guidance** — Homebrew dev-channel errors no longer recommend a mutable `master` pipe, and Windows privilege failures no longer suggest `sudo`.
+- **Case-insensitive checksum verification** — `self-update` compares release SHA-256 digests case-insensitively, so an uppercase checksum file no longer rejects a valid archive; the comparison and the malformed-usage-response rejection are now locked by unit tests.
+- **Nested debug-log redaction** — Sensitive token fields in `--debug` HTTP body logs are masked at any nesting depth (objects and arrays), not only at the top level.
+- **Per-account warmup model cache** — The warmup model cache is keyed by account, so one account's resolved model is never reused for another plan tier (avoiding wasteful 400 retries) and cache invalidation only affects the failing account; the `codex --version` probe now runs on the blocking thread pool instead of stalling an async worker.
+- **Self-update trust model documented** — README clarifies that the release `.sha256` guards download integrity only; the trust anchor is the GitHub Release over TLS, and there is no independent code signature yet.
 
 ## v0.0.21 — 2026-07-10
 

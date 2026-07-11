@@ -238,7 +238,7 @@ codex-switch self-update --version 0.0.22
 ```
 
 - Homebrew 安装不会被程序自行覆盖，请使用 `brew upgrade xjoker/tap/codex-switch`
-- 直装版本会先校验 release 对应的 `.sha256`，再替换当前二进制
+- 直装版本会先校验 release 对应的 `.sha256`，再替换当前二进制。校验和与二进制同属一个 GitHub Release，因此只防下载损坏、不防 Release 本身被篡改；信任锚是 TLS 之上的 GitHub Releases，目前没有独立代码签名
 - 不带参数的 `self-update` 会保持当前二进制所属的通道；使用 `--dev` 或 `--stable` 显式切换通道
 - Homebrew 用户需先 `brew uninstall codex-switch` 才能使用 `--dev`
 
