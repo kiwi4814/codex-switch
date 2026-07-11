@@ -43,17 +43,20 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     let status_height = status_bar_height(app, area.width);
 
+    let detail_height = if app.detail_visible { 12 } else { 0 };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(6),                       // account list
-            Constraint::Length(12),                   // detail panel
+            Constraint::Length(detail_height),        // detail panel
             Constraint::Length(status_height as u16), // status bar
         ])
         .split(area);
 
     render_account_table(f, app, vertical[0]);
-    render_detail_panel(f, app, vertical[1]);
+    if app.detail_visible {
+        render_detail_panel(f, app, vertical[1]);
+    }
     render_status_bar(f, app, vertical[2]);
 
     // Overlays (rendered last, on top of everything).

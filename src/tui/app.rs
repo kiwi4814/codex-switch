@@ -102,6 +102,7 @@ pub struct App {
     pub auto_refresh_interval: Duration,
     pub next_auto_refresh: Option<Instant>,
     pub auto_warmup_enabled: bool,
+    pub detail_visible: bool,
     pub help_popup: Option<super::popup::PopupState>,
     pub menu: Option<super::menu::MenuState>,
 }
@@ -139,6 +140,7 @@ impl App {
             auto_refresh_interval: Duration::from_secs(cfg.tui.auto_refresh_interval_secs),
             next_auto_refresh: None,
             auto_warmup_enabled: false,
+            detail_visible: true,
             help_popup: None,
             menu: None,
         }
@@ -1088,6 +1090,15 @@ impl App {
         }
     }
 
+    pub fn toggle_detail_panel(&mut self) {
+        self.detail_visible = !self.detail_visible;
+        if self.detail_visible {
+            self.set_status("Account details shown".to_string(), 3);
+        } else {
+            self.set_status("Account details hidden".to_string(), 3);
+        }
+    }
+
     /// Toggle auto-warmup. Auto-warmup piggybacks on the auto-refresh tick: every
     /// refresh cycle it calls `warmup_all`, which spawns warmup for any account
     /// whose 5h window has expired (paid) or 7d window has expired (free).
@@ -1281,6 +1292,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 KeyCode::Char('a') => app.open_add_menu(),
                 KeyCode::Char('r') => app.refresh(true),
                 KeyCode::Char('t') => app.toggle_auto_refresh(),
+                KeyCode::Char('i') => app.toggle_detail_panel(),
                 KeyCode::Char('s') => app.cycle_sort(),
                 KeyCode::Char('h') => app.open_help(),
                 KeyCode::Char(' ') => app.toggle_mark(),

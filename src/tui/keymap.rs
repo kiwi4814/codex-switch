@@ -161,6 +161,12 @@ pub const KEYMAP: &[Binding] = &[
         in_status_bar: false,
     },
     Binding {
+        keys: "i",
+        section: Section::Global,
+        label: "show / hide account detail panel",
+        in_status_bar: false,
+    },
+    Binding {
         keys: "h",
         section: Section::Global,
         label: "show this help",
