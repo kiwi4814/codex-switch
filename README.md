@@ -180,7 +180,7 @@ codex-switch self-update --check
 | `codex-switch daemon start [--foreground]` | Start the auto-switch daemon (Beta). Detached by default; use `--foreground` for service managers |
 | `codex-switch daemon stop` | Stop a running Beta daemon |
 | `codex-switch daemon status` | Show Beta daemon status and platform support details |
-| `codex-switch daemon install` | Install the Beta daemon as a user service (macOS LaunchAgent / Linux systemd user service / Windows Task Scheduler) |
+| `codex-switch daemon install` | Install the Beta daemon (macOS LaunchAgent / Linux systemd user service / Windows Task Scheduler; Windows requires elevated PowerShell) |
 | `codex-switch daemon uninstall` | Remove the Beta daemon user service |
 | `codex-switch self-update [--check] [--dev\|--stable] [--version <VERSION>]` | Check or update a direct install. Without a channel flag it stays on the current stable/dev channel; `--version` selects an exact stable release |
 | `codex-switch tui` | Launch the interactive terminal UI |
@@ -344,7 +344,8 @@ codex-switch daemon status
 # Stop it
 codex-switch daemon stop
 
-# Install/remove a user service
+# Install/remove the daemon service
+# Windows: run these two commands from elevated PowerShell.
 codex-switch daemon install
 codex-switch daemon uninstall
 ```
@@ -503,7 +504,7 @@ When a usage query returns HTTP 401/403, the tool automatically attempts to refr
 - File manager opens via `explorer.exe`
 - Terminal: works with Windows Terminal, PowerShell, and cmd.exe
 - TUI rendering uses Windows Console API via `crossterm`
-- `daemon install` uses an on-logon Windows Task Scheduler task; use `daemon status` to inspect whether it is installed and running
+- `daemon install` uses an on-logon Windows Task Scheduler task and requires elevated PowerShell; use `daemon status` to inspect whether it is installed and running
 - **Recommended terminal: [Windows Terminal](https://aka.ms/terminal).** Git Bash (mintty) has known compatibility issues with TUI rendering — use Windows Terminal or PowerShell instead
 
 ## JSON Output

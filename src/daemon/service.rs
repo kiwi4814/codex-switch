@@ -430,7 +430,19 @@ fn schtasks(args: &[&str], action: &str) -> Result<std::process::Output> {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let detail = if stderr.is_empty() { stdout } else { stderr };
-    anyhow::bail!("failed to {action}: {detail}");
+    anyhow::bail!(task_scheduler_failure_message(action, &detail));
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn task_scheduler_failure_message(action: &str, detail: &str) -> String {
+    let message = format!("failed to {action}: {detail}");
+    if action == "create scheduled task" {
+        format!(
+            "{message} Re-run `codex-switch daemon install` from an elevated PowerShell session."
+        )
+    } else {
+        message
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -485,7 +497,7 @@ fn uninstall_task_scheduler() -> Result<()> {
 mod tests {
     use super::{
         exit_code_indicates_installed, launchd_plist, systemd_unit, task_scheduler_command,
-        uninstall_may_continue,
+        task_scheduler_failure_message, uninstall_may_continue,
     };
     use std::path::Path;
 
@@ -555,6 +567,14 @@ mod tests {
         assert_eq!(
             cmd,
             r#"cmd.exe /D /S /C ""set "CODEX_HOME=C:\Users\A & B\.codex" && "C:\Program Files\codex-switch.exe" daemon start --foreground"""#
+        );
+    }
+
+    #[test]
+    fn windows_task_scheduler_create_error_includes_elevation_guidance() {
+        assert_eq!(
+            task_scheduler_failure_message("create scheduled task", "ERROR: Access is denied."),
+            "failed to create scheduled task: ERROR: Access is denied. Re-run `codex-switch daemon install` from an elevated PowerShell session."
         );
     }
 

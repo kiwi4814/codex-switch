@@ -179,7 +179,7 @@ codex-switch self-update --check
 | `codex-switch daemon start [--foreground]` | 启动自动切换守护进程（Beta）。默认后台运行；`--foreground` 用于服务管理器 |
 | `codex-switch daemon stop` | 停止运行的 Beta 守护进程 |
 | `codex-switch daemon status` | 显示 Beta 守护进程状态和平台支持信息 |
-| `codex-switch daemon install` | 安装 Beta 守护进程作为用户服务（macOS LaunchAgent / Linux systemd 用户服务 / Windows 任务计划程序） |
+| `codex-switch daemon install` | 安装 Beta 守护进程（macOS LaunchAgent / Linux systemd 用户服务 / Windows 任务计划程序；Windows 需以管理员 PowerShell 执行） |
 | `codex-switch daemon uninstall` | 卸载 Beta 守护进程系统服务 |
 | `codex-switch self-update [--check] [--dev\|--stable] [--version <VERSION>]` | 检查或更新直装版本；不带通道参数时保持当前 stable/dev 通道，`--version` 安装指定正式版本 |
 | `codex-switch tui` | 启动交互式终端界面 |
@@ -343,7 +343,8 @@ codex-switch daemon status
 # 停止守护进程
 codex-switch daemon stop
 
-# 安装/卸载用户服务
+# 安装/卸载守护进程服务
+# Windows：以下两条命令需在管理员 PowerShell 中执行。
 codex-switch daemon install
 codex-switch daemon uninstall
 ```
@@ -502,7 +503,7 @@ v0.0.13+ 不再有模式选择。此统一算法替代了之前的 `max-remainin
 - 文件管理器通过 `explorer.exe` 打开
 - 终端：支持 Windows Terminal、PowerShell 和 cmd.exe
 - TUI 通过 `crossterm` 使用 Windows Console API 渲染
-- `daemon install` 使用登录时触发的 Windows 任务计划程序；可用 `daemon status` 检查安装和运行状态
+- `daemon install` 使用登录时触发的 Windows 任务计划程序，需以管理员 PowerShell 执行；可用 `daemon status` 检查安装和运行状态
 - **推荐终端：[Windows Terminal](https://aka.ms/terminal)。** Git Bash（mintty）与 TUI 渲染存在已知兼容性问题，请使用 Windows Terminal 或 PowerShell
 
 ## JSON 输出

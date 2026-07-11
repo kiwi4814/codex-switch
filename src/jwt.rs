@@ -32,15 +32,41 @@ impl AccountInfo {
     /// Same as `plan_label` but with an overridden plan type (e.g. from API response).
     pub fn plan_label_with(&self, plan_type: Option<&str>) -> String {
         let base = plan_type.unwrap_or("?").to_string();
+        let titled_organization_count = self
+            .organizations
+            .iter()
+            .filter(|organization| !organization.title.is_empty())
+            .count();
+        let active_workspace_is_organization = self.workspace_name.as_ref().is_some_and(|name| {
+            self.organizations
+                .iter()
+                .any(|organization| organization.title == *name)
+        });
+        let displayed_organization_count = if active_workspace_is_organization
+            || self.workspace_name.is_none()
+                && self
+                    .organizations
+                    .iter()
+                    .any(|organization| organization.is_default && !organization.title.is_empty())
+        {
+            titled_organization_count.saturating_sub(1)
+        } else {
+            titled_organization_count
+        };
+        let organization_suffix = match displayed_organization_count {
+            0 => String::new(),
+            1 => " (+1 org)".to_string(),
+            count => format!(" (+{count} orgs)"),
+        };
         if let Some(name) = &self.workspace_name
             && !name.is_empty()
         {
-            return format!("{base} - {name}");
+            return format!("{base} - {name}{organization_suffix}");
         }
         if let Some(org) = self.organizations.iter().find(|o| o.is_default)
             && !org.title.is_empty()
         {
-            return format!("{base} - {}", org.title);
+            return format!("{base} - {}{organization_suffix}", org.title);
         }
         base
     }
@@ -325,6 +351,56 @@ mod tests {
         assert!(info.user_id.is_none());
         assert!(info.workspace_name.is_none());
         assert!(info.organizations.is_empty());
+    }
+
+    #[test]
+    fn plan_label_shows_active_team_and_additional_organizations() {
+        let info = AccountInfo {
+            plan_type: Some("team".to_string()),
+            workspace_name: Some("Platform Team".to_string()),
+            organizations: vec![
+                OrgInfo {
+                    id: "org-platform".to_string(),
+                    title: "Platform Team".to_string(),
+                    role: "owner".to_string(),
+                    is_default: true,
+                },
+                OrgInfo {
+                    id: "org-research".to_string(),
+                    title: "Research Team".to_string(),
+                    role: "member".to_string(),
+                    is_default: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(info.plan_label(), "team - Platform Team (+1 org)");
+    }
+
+    #[test]
+    fn plan_label_counts_every_org_when_workspace_is_not_an_org_title() {
+        let info = AccountInfo {
+            plan_type: Some("team".to_string()),
+            workspace_name: Some("Personal".to_string()),
+            organizations: vec![
+                OrgInfo {
+                    id: "org-platform".to_string(),
+                    title: "Platform Team".to_string(),
+                    role: "owner".to_string(),
+                    is_default: true,
+                },
+                OrgInfo {
+                    id: "org-research".to_string(),
+                    title: "Research Team".to_string(),
+                    role: "member".to_string(),
+                    is_default: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(info.plan_label(), "team - Personal (+2 orgs)");
     }
 
     #[test]
