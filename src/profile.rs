@@ -274,6 +274,7 @@ pub fn replace_profile_auth_and_live_if_current(
     validate_alias(alias)?;
     let profile_path = profile_auth_path(alias)?;
     let _transaction = lock_auth_transaction()?;
+    ensure_same_account_identity(alias, &read_auth(&profile_path)?, val)?;
     write_auth(&profile_path, val)?;
     if read_current() == alias {
         let live = codex_auth_path()?;
@@ -335,6 +336,27 @@ pub fn extract_identity(auth: &serde_json::Value) -> AccountIdentity {
         account_id: info.account_id,
         email: info.email.map(|e| e.to_lowercase()),
     }
+}
+
+fn ensure_same_account_identity(
+    alias: &str,
+    existing: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> Result<()> {
+    let existing = extract_identity(existing);
+    let incoming = extract_identity(incoming);
+    let email_matches = matches!(
+        (&existing.email, &incoming.email),
+        (Some(existing), Some(incoming)) if existing == incoming
+    );
+    let account_matches = match (&existing.account_id, &incoming.account_id) {
+        (Some(existing), Some(incoming)) => existing == incoming,
+        _ => true,
+    };
+    if email_matches && account_matches {
+        return Ok(());
+    }
+    anyhow::bail!("authenticated account does not match profile '{alias}'")
 }
 
 /// Find a profile with a strict match: both account_id AND email must be present and equal.
@@ -523,6 +545,7 @@ pub fn update_profile_from_live(alias: &str) -> Result<()> {
     let src = codex_auth_path()?;
     let val = read_auth(&src)?;
     let dst = profile_auth_path(alias)?;
+    ensure_same_account_identity(alias, &read_auth(&dst)?, &val)?;
     ensure_profile_parent(&dst)?;
     write_auth(&dst, &val)?;
     // Best-effort: normalize live file to match profile (same key ordering)
@@ -1445,6 +1468,52 @@ mod tests {
 
         // Verify: current marker updated
         assert_eq!(super::read_current(), "alice");
+    }
+
+    #[test]
+    fn update_profile_from_live_rejects_different_account_identity() {
+        let _env = TestEnv::new();
+        let live = crate::auth::codex_auth_path().unwrap();
+        let alice = realistic_auth_json("alice@example.com", "acct_a", "acc_a1", "ref_a1");
+        crate::auth::write_auth(&live, &alice).unwrap();
+        super::cmd_save(Some("alice")).unwrap();
+
+        let bob = realistic_auth_json("bob@example.com", "acct_b", "acc_b1", "ref_b1");
+        crate::auth::write_auth(&live, &bob).unwrap();
+
+        let result = super::update_profile_from_live("alice");
+        assert!(result.is_err());
+        let saved = crate::auth::read_auth(&super::profile_auth_path("alice").unwrap()).unwrap();
+        assert_eq!(saved["tokens"]["access_token"], "acc_a1");
+    }
+
+    #[test]
+    fn relogin_rejects_different_account_identity() {
+        let _env = TestEnv::new();
+        let live = crate::auth::codex_auth_path().unwrap();
+        let alice = realistic_auth_json("alice@example.com", "acct_a", "acc_a1", "ref_a1");
+        crate::auth::write_auth(&live, &alice).unwrap();
+        super::cmd_save(Some("alice")).unwrap();
+
+        let bob = realistic_auth_json("bob@example.com", "acct_b", "acc_b1", "ref_b1");
+        let result = super::replace_profile_auth_and_live_if_current("alice", &bob);
+        assert!(result.is_err());
+        let saved = crate::auth::read_auth(&super::profile_auth_path("alice").unwrap()).unwrap();
+        assert_eq!(saved["tokens"]["access_token"], "acc_a1");
+    }
+
+    #[test]
+    fn relogin_allows_matching_legacy_email_without_account_id() {
+        let _env = TestEnv::new();
+        let live = crate::auth::codex_auth_path().unwrap();
+        let old = realistic_auth_json("alice@example.com", "", "acc_a1", "ref_a1");
+        crate::auth::write_auth(&live, &old).unwrap();
+        super::cmd_save(Some("alice")).unwrap();
+
+        let refreshed = realistic_auth_json("Alice@example.com", "", "acc_a2", "ref_a2");
+        super::replace_profile_auth_and_live_if_current("alice", &refreshed).unwrap();
+        let saved = crate::auth::read_auth(&super::profile_auth_path("alice").unwrap()).unwrap();
+        assert_eq!(saved["tokens"]["access_token"], "acc_a2");
     }
 
     // ── Failure paths ────────────────────────────────────────
