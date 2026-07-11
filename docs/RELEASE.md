@@ -2,6 +2,20 @@
 
 日常质量门由 `.github/workflows/ci.yml` 驱动：`dev` 分支 push，以及目标为 `dev` / `master` 的 pull request，都会在 Linux、macOS、Windows 上执行测试、Clippy 和构建；Linux 质量 job 另外执行 fmt、`cargo audit` 与安装脚本语法检查。发布构建由 `.github/workflows/release.yml` 驱动，只监听 tag 事件 `v*` 与 `dev`。
 
+本文面向项目维护者。普通用户请使用 README 中的安装与更新命令，不需要操作 Git tag。
+
+## 发布资格
+
+开始推送前必须同时满足：
+
+- 当前分支为本地 `dev`，工作树干净，且本次变更已提交
+- `Cargo.toml` 是目标基础版本，`docs/CHANGELOG.md` 顶部存在对应的 Unreleased 条目
+- 独立代码审查无 CRITICAL/HIGH，认证、更新或用户数据变更还需通过安全审查
+- 本地质量门和真实 CLI 冒烟通过
+- 已明确获得 `git push` 授权，并记录待推送 commit
+
+`dev` 发布分两道门：先推分支并等待三平台 CI 全绿，再移动 `dev` tag 触发 Release。分支 CI 未通过时禁止移动 tag。
+
 ## 版本号策略
 
 | 推送的 tag | CI 输出版本号 | GitHub Release 名 | self-update 通道 | 触发 homebrew |
@@ -39,17 +53,21 @@ bash -n scripts/install.sh
 # 2) 推送 dev 分支到远端（必须完整 refspec）
 git push origin refs/heads/dev:refs/heads/dev
 
-# 3) 删除远端旧 dev tag（指向旧 commit，需要先删才能"移动"）
+# 3) 等待 dev 分支 CI 全绿，并确认远端分支指向本次 commit
+gh run list --branch dev --workflow CI --limit 1
+git rev-parse refs/remotes/origin/dev
+
+# 4) 删除远端旧 dev tag（指向旧 commit，需要先删才能"移动"）
 git push origin :refs/tags/dev
 
-# 4) 在本地把 dev tag 重打到 HEAD
+# 5) 在本地把 dev tag 重打到 HEAD
 git tag -d dev && git tag dev
 
-# 5) 推送新 dev tag —— 触发 CI 构建 6 平台二进制 + 覆盖 GitHub Release `dev`
+# 6) 推送新 dev tag —— 触发 CI 构建 6 平台二进制 + 覆盖 GitHub Release `dev`
 git push origin refs/tags/dev:refs/tags/dev
 ```
 
-> 第 5 步**不能写 `git push origin dev`**：歧义错误（分支 + tag 同名）。必须用 `refs/tags/dev:refs/tags/dev`。
+> 第 6 步**不能写 `git push origin dev`**：歧义错误（分支 + tag 同名）。必须用 `refs/tags/dev:refs/tags/dev`。
 >
 > 第 2 步同理：必须 `refs/heads/dev:refs/heads/dev`。
 

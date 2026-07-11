@@ -23,9 +23,40 @@ use output::{
 };
 use tracing_subscriber::EnvFilter;
 
+#[derive(Debug)]
+struct OutputAlreadyReported;
+
+impl std::fmt::Display for OutputAlreadyReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("command failed; details were already reported")
+    }
+}
+
+impl std::error::Error for OutputAlreadyReported {}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let use_json = cli.json || cli.json_pretty;
+    let message_mode = if matches!(&cli.command, Commands::Tui) {
+        MessageMode::Silent
+    } else if use_json {
+        MessageMode::Stderr
+    } else {
+        MessageMode::Stdout
+    };
+
+    color::init(cli.color);
+    output::set_json_pretty(cli.json_pretty);
+    output::set_message_mode(message_mode);
+    if let Err(e) = config::init() {
+        if use_json {
+            print_error(&e.to_string());
+        } else {
+            eprintln!("{}", color::error(&format!("Error: {e}")));
+        }
+        std::process::exit(1);
+    }
 
     // Priority: --debug flag > RUST_LOG env > config.toml daemon.log_level > default "error"
     let filter = if cli.debug {
@@ -59,26 +90,18 @@ async fn main() {
             .with_writer(std::io::stderr)
             .init();
     }
-    let use_json = cli.json || cli.json_pretty;
-    let message_mode = if matches!(&cli.command, Commands::Tui) {
-        MessageMode::Silent
-    } else if use_json {
-        MessageMode::Stderr
-    } else {
-        MessageMode::Stdout
-    };
-
-    config::init();
+    for warning in config::startup_warnings() {
+        eprintln!("{}", color::warn(&format!("Warning: {warning}")));
+    }
     config::set_cli_proxy(cli.proxy.clone());
-    color::init(cli.color);
-    output::set_json_pretty(cli.json_pretty);
-    output::set_message_mode(message_mode);
 
     let result = dispatch(cli.command, use_json).await;
 
     if let Err(e) = result {
         if use_json {
-            print_error(&e.to_string());
+            if e.downcast_ref::<OutputAlreadyReported>().is_none() {
+                print_error(&e.to_string());
+            }
         } else {
             eprintln!("{}", color::error(&format!("Error: {e}")));
         }
@@ -112,7 +135,7 @@ async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
         Commands::List { force } => list_cmd(force, json, auth_handled).await?,
         Commands::ResetCard { alias, yes } => reset_card_cmd(&alias, yes, json).await?,
         Commands::Rename { old, new } => rename_cmd(&old, &new, json)?,
-        Commands::Delete { alias } => delete_cmd(&alias, json)?,
+        Commands::Delete { alias, yes } => delete_cmd(&alias, yes, json)?,
         Commands::Login { alias, device } => login_cmd(alias.as_deref(), device, json).await?,
         Commands::Import { path, alias } => import_cmd(&path, alias.as_deref(), json).await?,
         Commands::SelfUpdate {
@@ -480,7 +503,28 @@ fn rename_cmd(old: &str, new: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn delete_cmd(alias: &str, json: bool) -> Result<()> {
+fn delete_cmd(alias: &str, yes: bool, json: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
+    profile::validate_alias(alias)?;
+    if profile::read_current() == alias {
+        anyhow::bail!("cannot delete the active profile '{alias}'");
+    }
+    if !profile::profile_auth_path(alias)?.exists() {
+        anyhow::bail!("profile '{alias}' not found");
+    }
+
+    if !yes {
+        if json || !std::io::stdin().is_terminal() {
+            anyhow::bail!("confirmation required; rerun with --yes to delete profile '{alias}'");
+        }
+        if !confirm_default_no(&format!(
+            "Delete profile '{alias}'? It will remain recoverable. [y/N] "
+        )) {
+            user_println("Deletion cancelled.");
+            return Ok(());
+        }
+    }
     profile::cmd_delete(alias)?;
     if json {
         print_json(&output::JsonOk {
@@ -490,6 +534,20 @@ fn delete_cmd(alias: &str, json: bool) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Prompt the user for y/N confirmation. Only an explicit "y" or "yes" accepts.
+fn confirm_default_no(prompt: &str) -> bool {
+    use std::io::{self, Write as _};
+
+    eprint!("{}", color::dim(prompt));
+    io::stderr().flush().ok();
+    let mut input = String::new();
+    match io::stdin().read_line(&mut input) {
+        Ok(0) => false,
+        Ok(_) => matches!(input.trim().to_lowercase().as_str(), "y" | "yes"),
+        Err(_) => false,
+    }
 }
 
 async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result<()> {
@@ -709,7 +767,9 @@ fn score_profile_candidates(
 async fn select_best_profile(json: bool) -> Result<(String, usage::UsageInfo, f64)> {
     let profiles = profile::list_profiles()?;
     if profiles.is_empty() {
-        anyhow::bail!("no saved profiles");
+        anyhow::bail!(
+            "no saved profiles; run `codex-switch login` or `codex-switch import <path>` first"
+        );
     }
 
     let current = profile::read_current();
@@ -1076,8 +1136,10 @@ async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> Result<()> {
         progress.finish();
     }
 
+    let all_skipped = report.imported.is_empty();
     if json {
         print_json(&output::JsonImportReport {
+            ok: !all_skipped,
             imported: report
                 .imported
                 .iter()
@@ -1099,6 +1161,9 @@ async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> Result<()> {
                 })
                 .collect(),
         });
+        if all_skipped {
+            return Err(OutputAlreadyReported.into());
+        }
     } else {
         println!(
             "{}",
@@ -1128,6 +1193,13 @@ async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> Result<()> {
                 item.source.display(),
                 item.stage,
                 item.error
+            );
+        }
+
+        if all_skipped {
+            anyhow::bail!(
+                "no profiles imported; all {} files were skipped",
+                report.skipped.len()
             );
         }
     }

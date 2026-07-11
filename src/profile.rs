@@ -82,6 +82,10 @@ fn ensure_profile_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn deleted_profiles_dir() -> Result<PathBuf> {
+    Ok(app_home()?.join("deleted-profiles"))
+}
+
 fn auth_lock_path() -> Result<PathBuf> {
     Ok(app_home()?.join("auth.lock"))
 }
@@ -750,9 +754,24 @@ pub fn cmd_delete(alias: &str) -> Result<()> {
     if read_current() == alias {
         return Err(CsError::ActiveProfileDelete(alias.to_string()).into());
     }
-    std::fs::remove_dir_all(&dir)
-        .with_context(|| format!("removing profile directory {}", dir.display()))?;
-    user_println(&format!("Deleted profile: {alias}"));
+    let deleted_dir = deleted_profiles_dir()?;
+    ensure_private_dir(&deleted_dir)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    let archived = deleted_dir.join(format!("{alias}.backup-{timestamp}"));
+    std::fs::rename(&dir, &archived).with_context(|| {
+        format!(
+            "archiving profile directory {} to {}",
+            dir.display(),
+            archived.display()
+        )
+    })?;
+    user_println(&format!(
+        "Deleted profile: {alias} (recoverable from {})",
+        archived.display()
+    ));
     Ok(())
 }
 

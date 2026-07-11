@@ -96,10 +96,13 @@ pub enum Commands {
         /// New profile alias
         new: String,
     },
-    /// Delete a profile
+    /// Delete a profile (archived for recovery)
     Delete {
         /// Profile alias
         alias: String,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
     },
     /// Log in via browser or --device code flow; re-authorizes if alias already exists
     Login {

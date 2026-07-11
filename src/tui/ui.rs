@@ -9,6 +9,7 @@ use ratatui::{
 use super::app::{App, UsageStatus};
 use super::keymap;
 use super::popup;
+use crate::jwt::PlanKind;
 use crate::output::{
     format_local_datetime, format_local_time, format_reset_short, format_reset_time,
     reset_credits_count,
@@ -33,6 +34,10 @@ const C_HIGHLIGHT_BG: Color = Color::Rgb(55, 55, 65); // selected row bg
 
 fn base() -> Style {
     Style::default().bg(BG)
+}
+
+fn status_message_color(is_error: bool) -> Color {
+    if is_error { C_RED } else { C_CYAN }
 }
 
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -668,7 +673,10 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     if let Some(s) = &app.status_msg {
-        let msg = Line::from(Span::styled(s.as_str(), base().fg(C_GREEN)));
+        let msg = Line::from(Span::styled(
+            s.as_str(),
+            base().fg(status_message_color(app.status_is_error)),
+        ));
         f.render_widget(Paragraph::new(msg).style(base()), area);
     } else if !app.marked.is_empty() {
         let line = Line::from(vec![
@@ -905,14 +913,16 @@ fn remaining_color(remaining_pct: f64) -> Color {
 }
 
 fn plan_color(plan: Option<&str>, is_selected: bool) -> Style {
-    let fg = match plan {
-        Some("pro") => C_YELLOW,
-        Some("plus") => C_CYAN,
-        Some("team") => C_MAGENTA,
-        _ => DIM,
+    let kind = PlanKind::from_wire(plan);
+    let fg = match kind {
+        PlanKind::Free | PlanKind::Unknown => C_GRAY,
+        PlanKind::Go => C_BLUE,
+        PlanKind::Plus => C_CYAN,
+        PlanKind::ProLite | PlanKind::Pro => C_YELLOW,
+        PlanKind::Team | PlanKind::Business | PlanKind::Enterprise | PlanKind::Edu => C_MAGENTA,
     };
     let s = base().fg(fg);
-    if is_selected {
+    if is_selected || matches!(kind, PlanKind::Pro | PlanKind::Enterprise) {
         s.add_modifier(Modifier::BOLD)
     } else {
         s
@@ -1043,4 +1053,31 @@ fn status_bar_height(app: &App, width: u16) -> usize {
         return 1;
     }
     build_help_lines(width as usize).len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        C_BLUE, C_CYAN, C_GRAY, C_MAGENTA, C_RED, C_YELLOW, plan_color, status_message_color,
+    };
+    use ratatui::style::Modifier;
+
+    #[test]
+    fn status_message_color_distinguishes_errors_from_information() {
+        assert_eq!(status_message_color(false), C_CYAN);
+        assert_eq!(status_message_color(true), C_RED);
+    }
+
+    #[test]
+    fn plan_color_uses_semantic_plan_families() {
+        assert_eq!(plan_color(Some("go"), false).fg, Some(C_BLUE));
+        assert_eq!(plan_color(Some("plus"), false).fg, Some(C_CYAN));
+        assert_eq!(plan_color(Some("prolite"), false).fg, Some(C_YELLOW));
+        let pro = plan_color(Some("pro"), false);
+        assert_eq!(pro.fg, Some(C_YELLOW));
+        assert!(pro.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(plan_color(Some("team"), false).fg, Some(C_MAGENTA));
+        assert_eq!(plan_color(Some("business"), false).fg, Some(C_MAGENTA));
+        assert_eq!(plan_color(Some("future_plan"), false).fg, Some(C_GRAY));
+    }
 }

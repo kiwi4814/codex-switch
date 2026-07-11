@@ -12,6 +12,17 @@ const REPO_NAME: &str = "codex-switch";
 const BIN_NAME: &str = "codex-switch";
 const UPDATE_TTL_SECS: i64 = 12 * 60 * 60;
 
+fn homebrew_dev_install_hint() -> &'static str {
+    "run `brew uninstall codex-switch`, then follow the Dev Build instructions at https://github.com/xjoker/codex-switch#dev-build-latest-development-version"
+}
+
+fn homebrew_dev_install_error() -> String {
+    format!(
+        "codex-switch is installed via Homebrew. To switch to dev, {}.",
+        homebrew_dev_install_hint()
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallSource {
     Homebrew,
@@ -167,9 +178,7 @@ pub async fn self_update(version: Option<&str>, show_progress: bool) -> Result<S
 pub async fn self_update_dev(show_progress: bool) -> Result<SelfUpdateResult> {
     let install_source = detect_install_source();
     if install_source == InstallSource::Homebrew {
-        anyhow::bail!(
-            "codex-switch is installed via Homebrew. Please run `brew uninstall codex-switch` first, then use the install script or `self-update --dev` again."
-        );
+        anyhow::bail!(homebrew_dev_install_error());
     }
 
     let current_version = current_version().to_string();
@@ -257,9 +266,12 @@ async fn download_and_replace(
     if show_progress {
         eprintln!("Replacing current executable...");
     }
-    self_replace::self_replace(&extracted_path).context(
-        "replacing current executable (permission denied? try: sudo codex-switch self-update)",
-    )?;
+    #[cfg(windows)]
+    let replace_context = "replacing current executable (close any running codex-switch processes and retry from PowerShell as Administrator)";
+    #[cfg(not(windows))]
+    let replace_context =
+        "replacing current executable (permission denied? try: sudo codex-switch self-update)";
+    self_replace::self_replace(&extracted_path).context(replace_context)?;
     Ok(())
 }
 
@@ -692,5 +704,21 @@ mod tests {
             "0.0.20-dev.20260701094804",
             "0.0.21"
         ));
+    }
+
+    #[test]
+    fn homebrew_dev_hint_avoids_removed_binary_and_unreviewed_pipe_command() {
+        let hint = super::homebrew_dev_install_hint();
+        assert!(hint.contains("brew uninstall codex-switch"));
+        assert!(hint.contains("github.com/xjoker/codex-switch"));
+        assert!(!hint.contains("| bash"));
+        assert!(!hint.contains("self-update"));
+    }
+
+    #[test]
+    fn homebrew_dev_error_wraps_the_install_hint_once() {
+        let message = super::homebrew_dev_install_error();
+        assert!(message.contains("To switch to dev, run `brew uninstall codex-switch`"));
+        assert!(!message.contains("run `run `"));
     }
 }

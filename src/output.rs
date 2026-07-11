@@ -114,6 +114,7 @@ pub struct JsonImportFailure {
 
 #[derive(Serialize)]
 pub struct JsonImportReport {
+    pub ok: bool,
     pub imported: Vec<JsonImportEntry>,
     pub skipped: Vec<JsonImportFailure>,
 }

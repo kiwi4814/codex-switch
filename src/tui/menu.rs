@@ -50,6 +50,8 @@ pub struct AccountMenuInfo {
 
 #[derive(Debug, Clone)]
 pub enum MenuAction {
+    /// Keep the menu open and ignore the key.
+    Noop,
     /// Close the menu, no further action.
     Close,
     /// Switch to alias.
@@ -132,13 +134,13 @@ impl MenuState {
                 KeyCode::Char('w') => MenuAction::WarmupOne(info.alias.clone()),
                 KeyCode::Char('c') => MenuAction::ConsumeResetCard(info.alias.clone()),
                 KeyCode::Char('d') => MenuAction::DeleteRequest(info.alias.clone()),
-                _ => MenuAction::Close,
+                _ => MenuAction::Noop,
             },
             MenuState::Add { .. } => match code {
                 KeyCode::Esc | KeyCode::Char('q') => MenuAction::Close,
                 KeyCode::Char('b') => MenuAction::Add { device: false },
                 KeyCode::Char('d') => MenuAction::Add { device: true },
-                _ => MenuAction::Close,
+                _ => MenuAction::Noop,
             },
             MenuState::ReloginFlow { alias, .. } => match code {
                 KeyCode::Esc | KeyCode::Char('q') => MenuAction::Close,
@@ -150,7 +152,7 @@ impl MenuState {
                     alias: alias.clone(),
                     device: true,
                 },
-                _ => MenuAction::Close,
+                _ => MenuAction::Noop,
             },
             MenuState::Batch { .. } => match code {
                 KeyCode::Esc | KeyCode::Char('q') => MenuAction::Close,
@@ -158,13 +160,13 @@ impl MenuState {
                 KeyCode::Char('w') => MenuAction::BatchWarmup,
                 KeyCode::Char('l') => MenuAction::BatchReloginRequest,
                 KeyCode::Char('d') => MenuAction::BatchDeleteRequest,
-                _ => MenuAction::Close,
+                _ => MenuAction::Noop,
             },
             MenuState::BatchReloginFlow { .. } => match code {
                 KeyCode::Esc | KeyCode::Char('q') => MenuAction::Close,
                 KeyCode::Char('b') => MenuAction::BatchRelogin { device: false },
                 KeyCode::Char('d') => MenuAction::BatchRelogin { device: true },
-                _ => MenuAction::Close,
+                _ => MenuAction::Noop,
             },
         }
     }
@@ -387,4 +389,20 @@ fn menu_items_stateful(
             ])
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::crossterm::event::KeyCode;
+
+    use super::{MenuAction, MenuState};
+
+    #[test]
+    fn unknown_key_keeps_menu_open() {
+        let menu = MenuState::add();
+        assert!(matches!(
+            menu.handle_key(KeyCode::Char('x')),
+            MenuAction::Noop
+        ));
+    }
 }

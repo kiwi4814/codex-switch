@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::auth::app_home;
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
+static STARTUP_WARNINGS: OnceLock<Vec<String>> = OnceLock::new();
 static CLI_PROXY: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -25,31 +27,31 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    fn normalize(mut self) -> Self {
+    fn normalize(mut self, warnings: &mut Vec<String>) -> Self {
         if self.network.max_concurrent == 0 {
-            tracing::warn!("config.network.max_concurrent=0 is invalid; using 1 instead");
+            warnings.push("config.network.max_concurrent=0 is invalid; using 1 instead".into());
             self.network.max_concurrent = 1;
         }
         if self.tui.auto_refresh_interval_secs < 30 {
-            tracing::warn!(
+            warnings.push(format!(
                 "config.tui.auto_refresh_interval_secs={} is invalid; using 30 instead",
                 self.tui.auto_refresh_interval_secs
-            );
+            ));
             self.tui.auto_refresh_interval_secs = 30;
         }
         if self.daemon.cache_refresh_interval_secs == 0 {
-            tracing::warn!(
-                "config.daemon.cache_refresh_interval_secs=0 is invalid; using 300 instead"
+            warnings.push(
+                "config.daemon.cache_refresh_interval_secs=0 is invalid; using 300 instead".into(),
             );
             self.daemon.cache_refresh_interval_secs = 300;
         }
         if self.daemon.poll_interval_secs == 0 {
-            tracing::warn!("config.daemon.poll_interval_secs=0 is invalid; using 60 instead");
+            warnings.push("config.daemon.poll_interval_secs=0 is invalid; using 60 instead".into());
             self.daemon.poll_interval_secs = 60;
         }
         if self.daemon.token_check_interval_secs == 0 {
-            tracing::warn!(
-                "config.daemon.token_check_interval_secs=0 is invalid; using 300 instead"
+            warnings.push(
+                "config.daemon.token_check_interval_secs=0 is invalid; using 300 instead".into(),
             );
             self.daemon.token_check_interval_secs = 300;
         }
@@ -195,65 +197,97 @@ struct DeprecatedUseProbe {
     min_remaining: Option<toml::Value>,
 }
 
-fn warn_deprecated_keys(raw: &str) {
+fn deprecated_key_warnings(raw: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
     let Ok(probe) = toml::from_str::<DeprecatedConfigProbe>(raw) else {
-        return;
+        return warnings;
     };
     let Some(use_cfg) = probe.use_cfg else {
-        return;
+        return warnings;
     };
     if use_cfg.mode.is_some() {
-        tracing::warn!(
+        warnings.push(
             "config: [use] 'mode' is deprecated and ignored in v0.0.13+, \
              the adaptive algorithm replaces all selection modes"
+                .into(),
         );
     }
     if use_cfg.min_remaining.is_some() {
-        tracing::warn!(
+        warnings.push(
             "config: [use] 'min_remaining' is deprecated and ignored in v0.0.13+, \
              the adaptive algorithm replaces all selection modes"
+                .into(),
         );
     }
+    warnings
 }
 
-fn load_from_str(raw: &str) -> std::result::Result<AppConfig, toml::de::Error> {
+fn load_from_str_with_warnings(
+    raw: &str,
+) -> std::result::Result<(AppConfig, Vec<String>), toml::de::Error> {
     let config = toml::from_str::<AppConfig>(raw)?;
-    warn_deprecated_keys(raw);
-    Ok(config.normalize())
+    let mut warnings = deprecated_key_warnings(raw);
+    Ok((config.normalize(&mut warnings), warnings))
 }
 
-fn load_from_file() -> AppConfig {
-    let path = match config_path() {
-        Ok(p) => p,
+#[cfg(test)]
+fn load_from_str(raw: &str) -> std::result::Result<AppConfig, toml::de::Error> {
+    load_from_str_with_warnings(raw).map(|(config, _)| config)
+}
+
+fn load_from_file() -> Result<(AppConfig, Vec<String>)> {
+    let path = config_path().context("failed to determine config path")?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(&path) {
+                Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok((AppConfig::default(), vec![]));
+                }
+                Ok(_) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to read config file {}", path.display()));
+                }
+                Err(meta_err) => {
+                    return Err(meta_err).with_context(|| {
+                        format!("failed to inspect config path {}", path.display())
+                    });
+                }
+            }
+        }
         Err(err) => {
-            tracing::warn!("Failed to determine config path: {err}");
-            return AppConfig::default();
+            return Err(err)
+                .with_context(|| format!("failed to read config file {}", path.display()));
         }
     };
-    if !path.exists() {
-        return AppConfig::default();
-    }
-    match std::fs::read_to_string(&path) {
-        Ok(content) => match load_from_str(&content) {
-            Ok(config) => config,
-            Err(err) => {
-                tracing::warn!("Failed to load config: {err}");
-                AppConfig::default()
-            }
-        },
-        Err(err) => {
-            tracing::warn!("Failed to load config: {err}");
-            AppConfig::default()
-        }
-    }
+    load_from_str_with_warnings(&content).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to parse config file {}: {}",
+            path.display(),
+            err.message()
+        )
+    })
 }
 
-pub fn init() {
-    let _ = CONFIG.set(load_from_file());
+pub fn init() -> Result<()> {
+    let (config, warnings) = load_from_file()?;
+    CONFIG
+        .set(config)
+        .map_err(|_| anyhow::anyhow!("configuration was initialized before config::init"))?;
+    STARTUP_WARNINGS
+        .set(warnings)
+        .map_err(|_| anyhow::anyhow!("configuration warnings were already initialized"))
+}
+
+pub fn startup_warnings() -> &'static [String] {
+    STARTUP_WARNINGS.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
 pub fn get() -> &'static AppConfig {
-    CONFIG.get_or_init(load_from_file)
+    // The binary entry point calls init() and fails fast for an unreadable or
+    // invalid existing file. Library-only callers have no startup phase, so
+    // they receive the in-memory defaults instead of panicking.
+    CONFIG.get_or_init(AppConfig::default)
 }
 
 pub fn set_cli_proxy(proxy: Option<String>) {
@@ -283,44 +317,8 @@ pub fn resolve_no_proxy() -> Option<String> {
     None
 }
 
-/// Minimal struct to extract only daemon.log_level without triggering tracing calls.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct DaemonLogLevelProbe {
-    daemon: DaemonLogLevelField,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct DaemonLogLevelField {
-    log_level: String,
-}
-
-impl Default for DaemonLogLevelField {
-    fn default() -> Self {
-        Self {
-            log_level: "error".to_string(),
-        }
-    }
-}
-
-/// Read daemon log_level from config file without initializing the global config.
-/// Called before tracing is set up, so it must not use tracing.
-/// Uses a minimal probe struct to avoid triggering warn_deprecated_keys/tracing calls.
 pub fn daemon_log_level() -> String {
-    let path = match config_path() {
-        Ok(p) => p,
-        Err(_) => return "error".to_string(),
-    };
-    if !path.exists() {
-        return "error".to_string();
-    }
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return "error".to_string(),
-    };
-    let probe: DaemonLogLevelProbe = toml::from_str(&content).unwrap_or_default();
-    let trimmed = probe.daemon.log_level.trim().to_string();
+    let trimmed = get().daemon.log_level.trim().to_string();
     if trimmed.is_empty() {
         "error".to_string()
     } else {

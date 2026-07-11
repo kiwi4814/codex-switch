@@ -80,6 +80,7 @@ pub struct App {
     pub view_indices: Vec<usize>,
     pub marked: BTreeSet<String>,
     pub status_msg: Option<String>,
+    pub status_is_error: bool,
     pub status_expiry: Option<Instant>,
     pub pending_results: tokio::sync::mpsc::Receiver<(String, Result<UsageInfo, UsageError>)>,
     pub result_sender: tokio::sync::mpsc::Sender<(String, Result<UsageInfo, UsageError>)>,
@@ -122,6 +123,7 @@ impl App {
             view_indices: vec![],
             marked: BTreeSet::new(),
             status_msg: None,
+            status_is_error: false,
             status_expiry: None,
             pending_results: rx,
             result_sender: tx,
@@ -285,7 +287,7 @@ impl App {
             return;
         };
         if entry.is_current {
-            self.set_status("Cannot delete the active profile".to_string(), 3);
+            self.set_status_error("Cannot delete the active profile".to_string(), 3);
             return;
         }
         self.confirm = Some(ConfirmAction::Delete(entry.alias.clone()));
@@ -533,7 +535,7 @@ impl App {
             Ok(p) => p,
             Err(e) => {
                 self.warmup_tasks.remove(&task_id);
-                self.set_status(format!("Path error for {alias}: {e}"), 5);
+                self.set_status_error(format!("Path error for {alias}: {e}"), 5);
                 return;
             }
         };
@@ -600,7 +602,7 @@ impl App {
                     to_refresh.insert(alias);
                 }
                 Err(e) => {
-                    self.set_status(format!("Warmup failed ({alias}): {e}"), 6);
+                    self.set_status_error(format!("Warmup failed ({alias}): {e}"), 6);
                 }
             }
         }
@@ -637,7 +639,7 @@ impl App {
                     to_refresh.insert(alias);
                 }
                 Err(e) => {
-                    self.set_status(format!("Reset card failed ({alias}): {e}"), 7);
+                    self.set_status_error(format!("Reset card failed ({alias}): {e}"), 7);
                 }
             }
         }
@@ -688,7 +690,7 @@ impl App {
         let path = match profile_auth_path(&alias) {
             Ok(p) => p,
             Err(e) => {
-                self.set_status(format!("Path error for {alias}: {e}"), 5);
+                self.set_status_error(format!("Path error for {alias}: {e}"), 5);
                 return;
             }
         };
@@ -773,7 +775,7 @@ impl App {
                     }
                     self.set_status(format!("Switched to {alias}"), 3);
                 }
-                Err(e) => self.set_status(format!("Switch failed: {e}"), 5),
+                Err(e) => self.set_status_error(format!("Switch failed: {e}"), 5),
             }
         }
     }
@@ -786,11 +788,11 @@ impl App {
         match action {
             ConfirmAction::Delete(alias) => match cmd_delete(&alias) {
                 Ok(()) => {
-                    self.set_status(format!("Deleted {alias}"), 3);
+                    self.set_status(format!("Deleted {alias} (recoverable)"), 3);
                     self.load_profiles();
                     self.refresh(true);
                 }
-                Err(e) => self.set_status(format!("Delete failed: {e}"), 5),
+                Err(e) => self.set_status_error(format!("Delete failed: {e}"), 5),
             },
             ConfirmAction::BatchDelete(aliases) => {
                 let mut ok = 0usize;
@@ -810,11 +812,15 @@ impl App {
                 self.load_profiles();
                 self.refresh(true);
                 let msg = if errors.is_empty() {
-                    format!("Deleted {ok} account(s)")
+                    format!("Deleted {ok} account(s) (recoverable)")
                 } else {
                     format!("Deleted {ok} ok, {} failed", errors.len())
                 };
-                self.set_status(msg, 6);
+                if errors.is_empty() {
+                    self.set_status(msg, 6);
+                } else {
+                    self.set_status_error(msg, 6);
+                }
             }
             ConfirmAction::ConsumeResetCard { alias, .. } => {
                 self.consume_reset_card(&alias);
@@ -826,7 +832,7 @@ impl App {
         let path = match profile_auth_path(alias) {
             Ok(p) => p,
             Err(e) => {
-                self.set_status(format!("Path error for {alias}: {e}"), 5);
+                self.set_status_error(format!("Path error for {alias}: {e}"), 5);
                 return;
             }
         };
@@ -916,7 +922,7 @@ impl App {
                     return false;
                 }
                 if let Err(err) = validate_alias(&new) {
-                    self.set_status(format!("Invalid alias: {err}"), 3);
+                    self.set_status_error(format!("Invalid alias: {err}"), 3);
                     return false;
                 }
                 match rename_profile(&old, &new) {
@@ -935,7 +941,7 @@ impl App {
                         }
                         self.refresh(true);
                     }
-                    Err(e) => self.set_status(format!("Rename failed: {e}"), 5),
+                    Err(e) => self.set_status_error(format!("Rename failed: {e}"), 5),
                 }
                 return false;
             }
@@ -1055,6 +1061,13 @@ impl App {
 
     fn set_status(&mut self, msg: String, secs: u64) {
         self.status_msg = Some(msg);
+        self.status_is_error = false;
+        self.status_expiry = Some(Instant::now() + Duration::from_secs(secs));
+    }
+
+    fn set_status_error(&mut self, msg: String, secs: u64) {
+        self.status_msg = Some(msg);
+        self.status_is_error = true;
         self.status_expiry = Some(Instant::now() + Duration::from_secs(secs));
     }
 
@@ -1323,6 +1336,7 @@ async fn handle_menu_key(app: &mut App, terminal: &mut DefaultTerminal, code: Ke
     let action = menu.handle_key(code);
     use super::menu::MenuAction;
     match action {
+        MenuAction::Noop => {}
         MenuAction::Close => app.close_menu(),
         MenuAction::Use(alias) => {
             app.close_menu();
@@ -1468,7 +1482,7 @@ async fn perform_oauth(
             }
         }
         Err(e) => {
-            app.set_status(format!("OAuth failed: {e}"), 7);
+            app.set_status_error(format!("OAuth failed: {e}"), 7);
         }
     }
 }
@@ -1530,7 +1544,11 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     } else {
         format!("Batch re-login: {ok} ok, {} failed", failed.len())
     };
-    app.set_status(summary, 8);
+    if failed.is_empty() {
+        app.set_status(summary, 8);
+    } else {
+        app.set_status_error(summary, 8);
+    }
     app.load_profiles_preserving_selection();
     app.refresh(true);
     if app.auto_refresh_enabled {

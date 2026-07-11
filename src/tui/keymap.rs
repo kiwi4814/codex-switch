@@ -140,7 +140,7 @@ pub const KEYMAP: &[Binding] = &[
         keys: "a",
         section: Section::Global,
         label: "add new account",
-        in_status_bar: false,
+        in_status_bar: true,
     },
     Binding {
         keys: "r",
@@ -201,4 +201,16 @@ pub fn status_bar_items() -> Vec<(&'static str, &'static str)> {
         .filter(|b| b.in_status_bar)
         .map(|b| (b.keys, b.label))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn status_bar_surfaces_add_account_action() {
+        assert!(
+            super::status_bar_items()
+                .iter()
+                .any(|(keys, label)| *keys == "a" && label.contains("add"))
+        );
+    }
 }

@@ -400,6 +400,29 @@ const DEVICE_USERCODE_URL: &str = "https://auth.openai.com/api/accounts/deviceau
 const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 const DEVICE_VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
 const DEVICE_POLL_INTERVAL_SECS: u64 = 5;
+const MAX_CONSECUTIVE_DEVICE_POLL_FAILURES: u8 = 3;
+
+#[derive(Default)]
+struct DevicePollFailureBudget {
+    consecutive: u8,
+}
+
+impl DevicePollFailureBudget {
+    fn record(&mut self, detail: &str) -> Result<()> {
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.consecutive >= MAX_CONSECUTIVE_DEVICE_POLL_FAILURES {
+            bail!(
+                "Device authorization polling failed {} consecutive times: {detail}",
+                self.consecutive
+            );
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.consecutive = 0;
+    }
+}
 const DEVICE_TIMEOUT_SECS: u64 = 900; // 15 minutes
 
 #[derive(Debug, Deserialize)]
@@ -539,6 +562,7 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
     // Step 3: Poll for token (Ctrl+C safe)
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
     let mut poll_count = 0u32;
+    let mut poll_failures = DevicePollFailureBudget::default();
 
     loop {
         // Sleep with Ctrl+C support
@@ -570,6 +594,13 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
             Ok(r) => r,
             Err(e) => {
                 info!("Device poll network error (retrying): {e}");
+                let detail = format!("network error: {e}");
+                eprintln!(
+                    "\n  Device polling failed ({}/{}): {detail}",
+                    poll_failures.consecutive + 1,
+                    MAX_CONSECUTIVE_DEVICE_POLL_FAILURES
+                );
+                poll_failures.record(&detail)?;
                 continue;
             }
         };
@@ -578,17 +609,27 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
             Ok(v) => v,
             Err(e) => {
                 info!("Device poll parse error (retrying): {e}");
+                let detail = format!("invalid response: {e}");
+                eprintln!(
+                    "\n  Device polling failed ({}/{}): {detail}",
+                    poll_failures.consecutive + 1,
+                    MAX_CONSECUTIVE_DEVICE_POLL_FAILURES
+                );
+                poll_failures.record(&detail)?;
                 continue;
             }
         };
-
         let log_body = redacted_device_poll_log_body(&body);
         debug!("Device poll response: {log_body}");
 
         if let Some(action) = device_poll_error_action(&body) {
             match action {
-                DevicePollErrorAction::Continue => continue,
+                DevicePollErrorAction::Continue => {
+                    poll_failures.reset();
+                    continue;
+                }
                 DevicePollErrorAction::SlowDown => {
+                    poll_failures.reset();
                     interval_secs = interval_secs.saturating_add(5);
                     continue;
                 }
@@ -601,16 +642,20 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
                     bail!("Authorization was denied by the user.");
                 }
                 DevicePollErrorAction::RetryUnknown { code, message } => {
-                    debug!(
-                        "Device poll: unrecognized error code '{}' (message: '{}'), retrying",
-                        code, message
+                    let detail = format!("unrecognized server error '{code}': {message}");
+                    eprintln!(
+                        "\n  Device polling failed ({}/{}): {detail}",
+                        poll_failures.consecutive + 1,
+                        MAX_CONSECUTIVE_DEVICE_POLL_FAILURES
                     );
+                    poll_failures.record(&detail)?;
                     continue;
                 }
             }
         }
 
         // Success — got authorization_code, need to exchange for tokens.
+        poll_failures.reset();
         let (auth_code, verifier) = parse_device_poll_success(body)?;
 
         eprint!("\r                          \r");
@@ -1022,5 +1067,25 @@ mod tests {
         assert!(valid.starts_with("HTTP/1.1 200 OK"));
 
         assert_eq!(callback.await.unwrap().unwrap().code, "valid-code");
+    }
+
+    #[test]
+    fn device_poll_failures_stop_after_three_consecutive_errors() {
+        let mut failures = super::DevicePollFailureBudget::default();
+        assert!(failures.record("network error").is_ok());
+        assert!(failures.record("parse error").is_ok());
+        let err = failures.record("network error again").unwrap_err();
+        assert!(err.to_string().contains("3 consecutive times"));
+        assert!(err.to_string().contains("network error again"));
+    }
+
+    #[test]
+    fn valid_device_poll_response_resets_failure_budget() {
+        let mut failures = super::DevicePollFailureBudget::default();
+        assert!(failures.record("network error").is_ok());
+        assert!(failures.record("parse error").is_ok());
+        failures.reset();
+        assert!(failures.record("network error").is_ok());
+        assert!(failures.record("parse error").is_ok());
     }
 }

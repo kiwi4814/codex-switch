@@ -24,6 +24,52 @@ pub struct AccountInfo {
     pub organizations: Vec<OrgInfo>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanKind {
+    Free,
+    Go,
+    Plus,
+    ProLite,
+    Pro,
+    Team,
+    Business,
+    Enterprise,
+    Edu,
+    Unknown,
+}
+
+impl PlanKind {
+    pub fn from_wire(plan_type: Option<&str>) -> Self {
+        match plan_type {
+            Some("free") => Self::Free,
+            Some("go") => Self::Go,
+            Some("plus") => Self::Plus,
+            Some("prolite") => Self::ProLite,
+            Some("pro") => Self::Pro,
+            Some("team") => Self::Team,
+            Some("self_serve_business_usage_based" | "business") => Self::Business,
+            Some("enterprise_cbp_usage_based" | "enterprise") => Self::Enterprise,
+            Some("education" | "edu") => Self::Edu,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn display_name(self, raw: Option<&str>) -> String {
+        match self {
+            Self::Free => "Free".to_string(),
+            Self::Go => "Go".to_string(),
+            Self::Plus => "Plus".to_string(),
+            Self::ProLite => "Pro 5×".to_string(),
+            Self::Pro => "Pro 20×".to_string(),
+            Self::Team => "Team".to_string(),
+            Self::Business => "Business".to_string(),
+            Self::Enterprise => "Enterprise".to_string(),
+            Self::Edu => "Edu".to_string(),
+            Self::Unknown => raw.unwrap_or("?").to_string(),
+        }
+    }
+}
+
 impl AccountInfo {
     pub fn plan_label(&self) -> String {
         self.plan_label_with(self.plan_type.as_deref())
@@ -31,11 +77,7 @@ impl AccountInfo {
 
     /// Same as `plan_label` but with an overridden plan type (e.g. from API response).
     pub fn plan_label_with(&self, plan_type: Option<&str>) -> String {
-        let base = match plan_type {
-            Some("team") => "Team".to_string(),
-            Some(plan_type) => plan_type.to_string(),
-            None => "?".to_string(),
-        };
+        let base = PlanKind::from_wire(plan_type).display_name(plan_type);
         let titled_organization_count = self
             .organizations
             .iter()
@@ -405,6 +447,49 @@ mod tests {
         };
 
         assert_eq!(info.plan_label(), "Team - Personal (+2 orgs)");
+    }
+
+    #[test]
+    fn plan_label_normalizes_consumer_plan_names() {
+        let mut info = AccountInfo::default();
+
+        for (wire, expected) in [
+            ("free", "Free"),
+            ("go", "Go"),
+            ("plus", "Plus"),
+            ("prolite", "Pro 5×"),
+            ("pro", "Pro 20×"),
+        ] {
+            info.plan_type = Some(wire.to_string());
+            assert_eq!(info.plan_label(), expected);
+        }
+    }
+
+    #[test]
+    fn plan_label_normalizes_workspace_plan_names_and_preserves_unknown_values() {
+        let info = AccountInfo {
+            workspace_name: Some("Example Workspace".to_string()),
+            ..Default::default()
+        };
+
+        for (wire, expected) in [
+            ("team", "Team - Example Workspace"),
+            (
+                "self_serve_business_usage_based",
+                "Business - Example Workspace",
+            ),
+            ("business", "Business - Example Workspace"),
+            (
+                "enterprise_cbp_usage_based",
+                "Enterprise - Example Workspace",
+            ),
+            ("enterprise", "Enterprise - Example Workspace"),
+            ("education", "Edu - Example Workspace"),
+            ("edu", "Edu - Example Workspace"),
+            ("future_plan", "future_plan - Example Workspace"),
+        ] {
+            assert_eq!(info.plan_label_with(Some(wire)), expected);
+        }
     }
 
     #[test]

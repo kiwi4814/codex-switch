@@ -295,6 +295,149 @@ fn zero_max_concurrent_is_sanitized() {
     let output = run_with_timeout(&home, &["--json", "list"], Duration::from_secs(10));
     assert!(output.status.success());
     assert_eq!(parse_stdout_json(&output)["profiles"][0]["alias"], "dave");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("config.network.max_concurrent=0 is invalid; using 1 instead")
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn invalid_existing_config_fails_instead_of_using_defaults() {
+    let home = temp_home("invalid-config");
+    fs::create_dir_all(home.join(".codex-switch")).unwrap();
+    fs::write(
+        home.join(".codex-switch/config.toml"),
+        "[network]\nmax_concurrent = \"many\"\n",
+    )
+    .unwrap();
+
+    let output = run(&home, &["--json", "list"]);
+    assert!(!output.status.success());
+    let report = parse_stdout_json(&output);
+    assert_eq!(report["ok"], false);
+    assert!(report["error"].as_str().unwrap().contains("config.toml"));
+    assert!(report["error"].as_str().unwrap().contains("parse"));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn invalid_config_error_does_not_echo_proxy_credentials() {
+    let home = temp_home("invalid-config-secret");
+    fs::create_dir_all(home.join(".codex-switch")).unwrap();
+    fs::write(
+        home.join(".codex-switch/config.toml"),
+        "[proxy]\nurl = \"http://user:SENTINEL_PASSWORD@example.com\n",
+    )
+    .unwrap();
+
+    let output = run(&home, &["--json", "list"]);
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("failed to parse config file"));
+    assert!(!stdout.contains("SENTINEL_PASSWORD"));
+    assert!(!stderr.contains("SENTINEL_PASSWORD"));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_config_symlink_fails_instead_of_using_defaults() {
+    use std::os::unix::fs::symlink;
+
+    let home = temp_home("dangling-config-symlink");
+    fs::create_dir_all(home.join(".codex-switch")).unwrap();
+    symlink(
+        home.join("missing-config.toml"),
+        home.join(".codex-switch/config.toml"),
+    )
+    .unwrap();
+
+    let output = run(&home, &["--json", "list"]);
+    assert!(!output.status.success());
+    let report = parse_stdout_json(&output);
+    assert_eq!(report["ok"], false);
+    assert!(report["error"].as_str().unwrap().contains("config.toml"));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn json_delete_requires_explicit_yes_and_preserves_profile() {
+    let home = temp_home("delete-json-confirm");
+    write_json(
+        home.join(".codex-switch/profiles/gina/auth.json"),
+        &auth_json("gina@example.com", "acct_gina"),
+    );
+
+    let output = run(&home, &["--json", "delete", "gina"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        parse_stdout_json(&output),
+        serde_json::json!({
+            "ok": false,
+            "error": "confirmation required; rerun with --yes to delete profile 'gina'"
+        })
+    );
+    assert!(home.join(".codex-switch/profiles/gina/auth.json").exists());
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn non_interactive_delete_requires_explicit_yes_and_preserves_profile() {
+    let home = temp_home("delete-non-interactive-confirm");
+    write_json(
+        home.join(".codex-switch/profiles/gina/auth.json"),
+        &auth_json("gina@example.com", "acct_gina"),
+    );
+
+    let mut cmd = command(&home, &["delete", "gina"]);
+    cmd.stdin(Stdio::null());
+    let output = cmd.output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("confirmation required; rerun with --yes to delete profile 'gina'")
+    );
+    assert!(home.join(".codex-switch/profiles/gina/auth.json").exists());
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn delete_with_yes_archives_inactive_profile_for_recovery() {
+    let home = temp_home("delete-yes");
+    write_json(
+        home.join(".codex-switch/profiles/gina/auth.json"),
+        &auth_json("gina@example.com", "acct_gina"),
+    );
+
+    let output = run(&home, &["--json", "delete", "gina", "--yes"]);
+    assert!(output.status.success());
+    assert_eq!(
+        parse_stdout_json(&output),
+        serde_json::json!({"ok": true, "alias": "gina", "action": "deleted"})
+    );
+    assert!(!home.join(".codex-switch/profiles/gina").exists());
+    let deleted_dir = home.join(".codex-switch/deleted-profiles");
+    let archived: Vec<_> = fs::read_dir(&deleted_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(archived.len(), 1);
+    assert!(
+        archived[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("gina.backup-")
+    );
+    assert!(archived[0].join("auth.json").exists());
 
     let _ = fs::remove_dir_all(home);
 }
@@ -309,7 +452,7 @@ fn delete_rejects_active_profile() {
     fs::create_dir_all(home.join(".codex-switch")).unwrap();
     fs::write(home.join(".codex-switch/current"), "gina").unwrap();
 
-    let output = run(&home, &["delete", "gina"]);
+    let output = run(&home, &["delete", "gina", "--yes"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot delete the active profile"));
     assert!(home.join(".codex-switch/profiles/gina/auth.json").exists());
@@ -357,6 +500,75 @@ fn import_directory_recursively_validates_and_reports_results() {
         .collect();
     assert!(skipped_stages.contains(&"file_format"));
     assert!(skipped_stages.contains(&"structure"));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn import_directory_returns_nonzero_when_every_file_is_skipped() {
+    let home = temp_home("import-dir-all-skipped");
+    let root = home.join("to-import");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("broken.json"), "{invalid json").unwrap();
+    write_json(
+        root.join("invalid-structure.json"),
+        &serde_json::json!({"tokens": {}}),
+    );
+
+    let output = run_with_env(
+        &home,
+        &["--json", "import", root.to_str().unwrap()],
+        &[("CS_IMPORT_SKIP_USAGE_VALIDATION", "1")],
+    );
+    assert!(!output.status.success());
+    let report = parse_stdout_json(&output);
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["imported"].as_array().unwrap().len(), 0);
+    assert_eq!(report["skipped"].as_array().unwrap().len(), 2);
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn non_json_all_skipped_import_reports_each_failure_before_exiting() {
+    let home = temp_home("import-dir-all-skipped-details");
+    let root = home.join("to-import");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("broken.json"), "{invalid json").unwrap();
+    write_json(
+        root.join("invalid-structure.json"),
+        &serde_json::json!({"tokens": {}}),
+    );
+
+    let output = run_with_env(
+        &home,
+        &["import", root.to_str().unwrap()],
+        &[("CS_IMPORT_SKIP_USAGE_VALIDATION", "1")],
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("broken.json [file_format]"), "{stdout}");
+    assert!(
+        stdout.contains("invalid-structure.json [structure]"),
+        "{stdout}"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn automatic_use_without_profiles_explains_how_to_get_started() {
+    let home = temp_home("use-no-profiles");
+
+    let output = run(&home, &["--json", "use"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        parse_stdout_json(&output),
+        serde_json::json!({
+            "ok": false,
+            "error": "no saved profiles; run `codex-switch login` or `codex-switch import <path>` first"
+        })
+    );
 
     let _ = fs::remove_dir_all(home);
 }

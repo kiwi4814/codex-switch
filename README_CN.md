@@ -6,6 +6,35 @@
 
 > 当前正式版：`v0.0.21`。
 
+## 两分钟快速上手
+
+开始前需要安装 [Codex CLI](https://github.com/openai/codex)，并准备一个可以登录 Codex 的 ChatGPT 账号。`codex-switch` 使用 Codex 的文件型 `auth.json`；如果 Codex 配置选择了不兼容的凭据存储，程序会停止并给出修复说明，不会擅自修改认证状态。
+
+安装正式版：
+
+**macOS / Linux**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash
+```
+
+**Windows PowerShell**
+
+```powershell
+irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
+```
+
+然后添加第一个账号并打开仪表盘：
+
+```bash
+codex-switch login
+codex-switch tui
+```
+
+偏好普通命令行？运行 `codex-switch list` 查看账号，运行不带别名的 `codex-switch use` 自动选择当前最佳账号。
+
+> `codex-switch` 会在本机保存账号凭据。请勿分享 profile 文件或未经脱敏的 `--debug` 输出。
+
 ---
 
 ### TUI
@@ -39,21 +68,9 @@
 - **跨平台** — macOS、Linux、Windows（全 RGB 调色板确保 TUI 渲染一致）
 - **JSON 输出** — `--json` 参数支持脚本化和自动化
 
-## 安装
+## 更多安装方式
 
-### 一键安装（推荐）
-
-**macOS / Linux：**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash
-```
-
-**Windows（PowerShell）：**
-
-```powershell
-irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
-```
+大多数用户使用上面的快速安装即可。以下内容适用于包管理器安装、开发版测试、手动下载和源码编译。
 
 ### Homebrew（macOS / Linux）
 
@@ -62,6 +79,8 @@ brew install xjoker/tap/codex-switch
 ```
 
 ### 安装开发版（最新开发构建）
+
+开发版可能不稳定，仅建议用于在下一个正式版发布前参与测试。
 
 **macOS / Linux：**
 
@@ -115,9 +134,21 @@ cargo build --release
 sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 ```
 
-## 快速开始
+## 常用任务
 
-### Codex 认证前提
+| 目标 | 命令 |
+|------|------|
+| 添加账号 | `codex-switch login` |
+| 在无浏览器服务器上添加账号 | `codex-switch login --device` |
+| 查看账号和实时配额 | `codex-switch list` |
+| 打开交互式仪表盘 | `codex-switch tui` |
+| 切换到指定账号 | `codex-switch use <别名>` |
+| 自动选择最佳可用账号 | `codex-switch use` |
+| 使用最佳账号启动 Codex | `codex-switch launch` |
+| 导入已有认证文件 | `codex-switch import <路径>` |
+| 检查更新 | `codex-switch self-update --check` |
+
+### 认证与存储要求
 
 `codex-switch` 通过切换 Codex 的文件型 `auth.json` 工作。因此 Codex 必须使用默认的 file credential store，或在 `$CODEX_HOME/config.toml`（通常为 `~/.codex/config.toml`）中显式配置 `cli_auth_credentials_store = "file"`。显式的 `keyring`、`auto` 或 `ephemeral` 模式可能绕过实时认证文件，程序会直接拒绝。空的 `CODEX_HOME` 会回退到 `~/.codex`；非空值同时决定 `auth.json` 与 `config.toml` 的 Codex 主目录。
 
@@ -125,43 +156,7 @@ sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 
 本工具要求 ChatGPT 登录。如果受管 Codex 配置设置了 `forced_login_method = "api"`，程序会给出可操作错误并停止，不会修改认证状态。
 
-```bash
-# 1. 登录第一个 Codex 账号
-codex-switch login
-
-# 1b. 无浏览器的服务器环境，使用设备码登录：
-codex-switch login --device
-
-# 2. 登录另一个账号
-codex-switch login
-
-# 3. 查看所有账号及实时用量
-codex-switch list
-
-# 4. 使用某个账号最早过期的重置卡（会先确认）
-codex-switch reset-card alice
-
-# 5. 切换到指定账号
-codex-switch use alice
-
-# 6. 自动切换到最佳可用账号
-codex-switch use
-
-# 7. 启动交互式 TUI
-codex-switch tui
-
-# 8. 用最佳账号启动 Codex
-codex-switch launch
-
-# 9. 用指定账号启动 Codex
-codex-switch launch alice -- --model gpt-4o
-
-# 10. 启动后台守护进程（Beta，可选）
-codex-switch daemon start
-
-# 11. 手动检查新版本
-codex-switch self-update --check
-```
+将 `<别名>` 替换为 `work`、`personal` 等自定义名称。运行 `codex-switch <命令> --help` 可以查看该命令的选项和示例。
 
 ## 命令列表
 
@@ -174,7 +169,7 @@ codex-switch self-update --check
 | `codex-switch warmup [别名]` | 发送最小请求以触发 5h/7d 配额窗口倒计时。不带别名则预热所有账号 |
 | `codex-switch login [--device] [别名]` | OAuth 登录（`--device` 用于无浏览器的服务器）。若别名已存在则重新授权 |
 | `codex-switch rename <旧别名> <新别名>` | 重命名账号 |
-| `codex-switch delete <别名>` | 删除账号 |
+| `codex-switch delete <别名> [--yes]` | 从账号列表移除非激活 profile，并归档以便恢复；默认会先确认 |
 | `codex-switch import <路径> [别名]` | 导入单个 auth.json，或递归扫描目录下所有 JSON 文件并校验后导入 |
 | `codex-switch daemon start [--foreground]` | 启动自动切换守护进程（Beta）。默认后台运行；`--foreground` 用于服务管理器 |
 | `codex-switch daemon stop` | 停止运行的 Beta 守护进程 |
@@ -220,7 +215,8 @@ codex-switch self-update --check
 | `d`（账号菜单） | 删除选中账号（需确认） |
 | `r` / `w` / `l` / `d`（批量菜单） | 刷新、预热、重新登录或删除已标记账号 |
 | `h` | 显示帮助 |
-| `q` / `Esc` | 退出 |
+| `Esc` | 清除搜索/标记，或关闭当前弹窗 |
+| `q` | 退出 |
 
 ## 更新方式
 
@@ -376,14 +372,37 @@ codex-switch launch -- --model gpt-5.4
 
 ## 故障排查
 
-遇到错误时，使用 `--debug` 查看详细的 HTTP 请求、API 响应和缓存状态：
+优先按照错误信息操作：配置、登录和权限错误都会给出具体路径或下一条命令。
+
+| 现象 | 处理方式 |
+|------|----------|
+| 没有已保存账号 | 运行 `codex-switch login` 或 `codex-switch import <路径>` |
+| 凭据存储不是 file 模式 | 在 `$CODEX_HOME/config.toml` 设置 `cli_auth_credentials_store = "file"` |
+| Windows 安装 daemon 提示拒绝访问 | 以管理员身份打开 PowerShell 后重试 |
+| Git Bash 中 TUI 布局异常 | 改用 Windows Terminal 或 PowerShell |
+| 误删了 profile | 参见[恢复已删除的 profile](#恢复已删除的-profile) |
+
+遇到网络或 API 故障时，使用 `--debug` 重跑命令：
 
 ```bash
 codex-switch --debug list
 codex-switch --debug use
 ```
 
-如果问题持续存在，请附上 debug 输出（注意脱敏 Token 和邮箱等敏感信息）[提交 Issue](https://github.com/xjoker/codex-switch/issues)。
+如果问题持续存在，请附上命令、操作系统、版本和脱敏后的 debug 输出[提交 Issue](https://github.com/xjoker/codex-switch/issues)。必须移除 Token、邮箱、account ID、工作区名称和代理凭据。
+
+### 恢复已删除的 profile
+
+删除操作可恢复：profile 目录会从 `profiles/` 移到 `deleted-profiles/`，不会直接擦除。先停止 daemon，将对应别名最新的备份目录移回，再确认账号出现：
+
+```bash
+codex-switch daemon stop
+# 将 ~/.codex-switch/deleted-profiles/<别名>.backup-<时间戳>
+# 移回 ~/.codex-switch/profiles/<别名>
+codex-switch list
+```
+
+Windows 的对应目录位于 `%USERPROFILE%\.codex-switch`。如果设置了 `CODEX_SWITCH_HOME`，请改用该目录。
 
 ## 工作原理
 
@@ -393,6 +412,7 @@ codex-switch --debug use
 |------|------|
 | `~/.codex/auth.json` | Codex CLI 认证文件（或 `$CODEX_HOME/auth.json`） |
 | `~/.codex-switch/profiles/<别名>/auth.json` | 保存的账号数据 |
+| `~/.codex-switch/deleted-profiles/<别名>.backup-<时间戳>/` | 可恢复的已删除 profile |
 | `~/.codex-switch/current` | 当前激活的账号名 |
 | `~/.codex-switch/auth.lock` | 文件锁（序列化 auth.json 切换操作） |
 | `~/.codex-switch/config.toml` | 配置文件 |
@@ -478,6 +498,7 @@ v0.0.13+ 不再有模式选择。此统一算法替代了之前的 `max-remainin
 ### 安全说明
 
 - CLI 和 TUI 都不允许删除当前激活账号
+- 删除非激活账号前必须确认，随后会移动到私有的可恢复目录
 - JSON 模式保证 stdout 只输出机器可读内容，进度和人类提示会走 stderr
 
 ## 平台说明

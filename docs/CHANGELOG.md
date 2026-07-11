@@ -11,6 +11,7 @@
 - **Daemon observability** — The daemon writes an atomic state snapshot (`daemon-state.json`: last poll, last switch, pending switch, last error, backoff) surfaced by `daemon status`, and logs to `~/.codex-switch/logs/` with daily rotation capped at 7 files; failure backoff now suspends only the poll timer instead of the whole loop.
 - **Windows switch notifications** — `daemon.notify = true` now shows a toast on Windows (WinRT via PowerShell), matching the existing macOS and Linux notifications.
 - **Unified candidate scoring** — CLI `use` and the daemon build and score switch candidates through one shared helper; the daemon now honors the API `plan_type` over stale JWT claims (plan downgrades) the same way the CLI does.
+- **Plan-aware labels and colors** — CLI and TUI now recognize Go, distinguish `Pro 5×` (`prolite`) from `Pro 20×` (`pro`), normalize workspace plan names, preserve unknown backend values, and use a shared semantic color family without relying on color alone.
 
 ### Changed
 
@@ -18,6 +19,7 @@
 - **File credential store requirement** — `codex-switch` now requires Codex's file-backed credential store and rejects explicit `keyring`, `auto`, or `ephemeral` modes because reliable profile switching depends on the live `auth.json`.
 - **Usage and reset-credit alignment** — Usage, models, and warmup requests carry workspace/FedRAMP routing headers; empty or structurally drifted usage responses are rejected; account-limited state is persisted; reset credits support no-expiry entries; consume retries reuse one redemption request ID and only `code=reset` is success.
 - **Cross-platform daemon lifecycle** — launchd, systemd user services, and Windows Task Scheduler preserve `CODEX_HOME`; PID files include executable identity and an active OS lock; stale or legacy PID data is never trusted for signaling; zero daemon intervals normalize to 60/300/300 seconds.
+- **Fail-fast configuration** — An existing unreadable, malformed, or dangling-symlink `config.toml` now reports the real error instead of silently starting with defaults; defaults remain limited to a genuinely missing file.
 
 ### Fixed
 
@@ -30,6 +32,8 @@
 - **Release supply-chain pinning** — Third-party GitHub Actions in the release workflow are pinned to commit SHAs and `cross` installs from a fixed revision.
 - **Safe uninstall order** — Installers stop and remove the daemon service before deleting the binary, PATH entry, or data; service cleanup failures abort removal so a running daemon is not orphaned.
 - **Documentation drift** — Removed nonexistent `use --force` and `codex --quiet` examples; documented self-update channel preservation, Windows `.zip` artifacts, Windows Task Scheduler support, daemon cache/warmup settings, and the file-auth prerequisite.
+- **Safer CLI and TUI feedback** — Profile deletion now defaults to `y/N`, requires `--yes` for JSON/non-interactive callers, refuses the active profile, and archives deleted credentials for recovery; all-skipped directory imports return a structured failure and nonzero exit; device login stops after three consecutive polling failures; empty account lists, TUI add discovery, menu key handling, and error coloring now provide actionable feedback.
+- **Platform-specific update guidance** — Homebrew dev-channel errors no longer recommend a mutable `master` pipe, and Windows privilege failures no longer suggest `sudo`.
 
 ## v0.0.21 — 2026-07-10
 

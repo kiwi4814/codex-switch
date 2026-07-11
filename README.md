@@ -6,6 +6,35 @@
 
 > Latest stable release: `v0.0.21`.
 
+## Get started in two minutes
+
+You need the [Codex CLI](https://github.com/openai/codex) and a ChatGPT account that can sign in to Codex. `codex-switch` uses Codex's file-backed `auth.json`; if your Codex configuration selects an incompatible credential store, startup stops with instructions instead of changing your authentication.
+
+Install the stable release:
+
+**macOS / Linux**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash
+```
+
+**Windows PowerShell**
+
+```powershell
+irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
+```
+
+Then add your first account and open the dashboard:
+
+```bash
+codex-switch login
+codex-switch tui
+```
+
+Prefer plain commands? Run `codex-switch list` to inspect accounts and `codex-switch use` to select the best available account automatically.
+
+> `codex-switch` stores account credentials locally. Do not share profile files or unredacted `--debug` output.
+
 ---
 
 ### TUI
@@ -39,21 +68,9 @@
 - **Cross-Platform** — macOS, Linux, Windows (full RGB color palette for consistent TUI rendering)
 - **JSON Output** — `--json` flag for scripting and automation
 
-## Installation
+## More installation options
 
-### One-Liner (Recommended)
-
-**macOS / Linux:**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash
-```
-
-**Windows (PowerShell):**
-
-```powershell
-irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
-```
+The quick start above is recommended for most users. The alternatives below cover package-manager installs, development builds, manual downloads, and source builds.
 
 ### Homebrew (macOS / Linux)
 
@@ -62,6 +79,8 @@ brew install xjoker/tap/codex-switch
 ```
 
 ### Dev Build (Latest Development Version)
+
+Development builds may be unstable and are intended for testing before the next stable release.
 
 **macOS / Linux:**
 
@@ -116,9 +135,21 @@ cargo build --release
 sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 ```
 
-## Quick Start
+## Common tasks
 
-### Codex authentication requirements
+| Goal | Command |
+|------|---------|
+| Add an account | `codex-switch login` |
+| Add an account on a headless server | `codex-switch login --device` |
+| View accounts and live quota | `codex-switch list` |
+| Open the interactive dashboard | `codex-switch tui` |
+| Switch to one account | `codex-switch use <alias>` |
+| Select the best available account | `codex-switch use` |
+| Launch Codex with the best account | `codex-switch launch` |
+| Import existing auth files | `codex-switch import <path>` |
+| Check for updates | `codex-switch self-update --check` |
+
+### Authentication and storage requirements
 
 `codex-switch` switches Codex's file-backed `auth.json`. Codex must therefore use its default file credential store, or explicitly set `cli_auth_credentials_store = "file"` in `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Explicit `keyring`, `auto`, or `ephemeral` modes are rejected because they can bypass the live file. An empty `CODEX_HOME` falls back to `~/.codex`; a non-empty value selects the Codex home used for both `auth.json` and `config.toml`.
 
@@ -126,43 +157,7 @@ sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 
 ChatGPT login is required. A managed Codex configuration with `forced_login_method = "api"` is incompatible and fails with an actionable error instead of modifying authentication state.
 
-```bash
-# 1. Log in to your first Codex account
-codex-switch login
-
-# 1b. On headless servers (no browser), use device code flow:
-codex-switch login --device
-
-# 2. Log in to another account
-codex-switch login
-
-# 3. See all accounts with live usage
-codex-switch list
-
-# 4. Use the earliest-expiring reset card for an account (prompts first)
-codex-switch reset-card alice
-
-# 5. Switch to a specific account
-codex-switch use alice
-
-# 6. Auto-switch to the best available account
-codex-switch use
-
-# 7. Launch interactive TUI
-codex-switch tui
-
-# 8. Launch Codex with the best available account
-codex-switch launch
-
-# 9. Launch Codex with a specific account
-codex-switch launch alice -- --model gpt-4o
-
-# 10. Start the background daemon (Beta, optional)
-codex-switch daemon start
-
-# 11. Check for a new release manually
-codex-switch self-update --check
-```
+Use aliases such as `work` or `personal` in place of `<alias>`. Run `codex-switch <command> --help` for command-specific options and examples.
 
 ## Commands
 
@@ -175,7 +170,7 @@ codex-switch self-update --check
 | `codex-switch warmup [alias]` | Send a minimal request to start the 5h/7d quota window countdown. Omit alias to warm up all profiles |
 | `codex-switch login [--device] [alias]` | Log in via OAuth (`--device` for headless servers). If alias exists, re-authorizes |
 | `codex-switch rename <old> <new>` | Rename a profile |
-| `codex-switch delete <alias>` | Delete a profile |
+| `codex-switch delete <alias> [--yes]` | Remove an inactive profile from the account list and archive it for recovery; prompts by default |
 | `codex-switch import <path> [alias]` | Import one auth.json file, or recursively validate and import all JSON files under a directory |
 | `codex-switch daemon start [--foreground]` | Start the auto-switch daemon (Beta). Detached by default; use `--foreground` for service managers |
 | `codex-switch daemon stop` | Stop a running Beta daemon |
@@ -221,7 +216,8 @@ Press `Enter` to open the selected account menu. If accounts are marked, `Enter`
 | `d` (account menu) | Delete selected profile (with confirmation) |
 | `r` / `w` / `l` / `d` (batch menu) | Refresh, warm up, re-login, or delete marked accounts |
 | `h` | Show help |
-| `q` / `Esc` | Quit |
+| `Esc` | Clear search/marks or close the active popup |
+| `q` | Quit |
 
 ## Updating
 
@@ -377,14 +373,37 @@ codex-switch launch -- --model gpt-5.4
 
 ## Troubleshooting
 
-If you encounter errors, run with `--debug` to see detailed HTTP requests, API responses, and cache status:
+Start with the error message: configuration, login, and permission failures include the path or next command to use.
+
+| Symptom | What to do |
+|---------|------------|
+| No saved profiles | Run `codex-switch login` or `codex-switch import <path>` |
+| Credential store is not file-backed | Set `cli_auth_credentials_store = "file"` in `$CODEX_HOME/config.toml` |
+| Windows daemon install reports access denied | Open PowerShell as Administrator and run the command again |
+| TUI layout is broken in Git Bash | Use Windows Terminal or PowerShell |
+| A profile was deleted by mistake | See [Recover a deleted profile](#recover-a-deleted-profile) |
+
+For network or API failures, rerun the command with `--debug`:
 
 ```bash
 codex-switch --debug list
 codex-switch --debug use
 ```
 
-If the issue persists, please [open an issue](https://github.com/xjoker/codex-switch/issues) with the debug output attached (remember to redact any sensitive information like tokens or emails).
+If the issue persists, [open an issue](https://github.com/xjoker/codex-switch/issues) with the command, operating system, version, and redacted debug output. Remove tokens, email addresses, account IDs, workspace names, and proxy credentials.
+
+### Recover a deleted profile
+
+Delete is recoverable: the profile directory is moved from `profiles/` to `deleted-profiles/` instead of being erased. Stop the daemon, move the newest matching backup directory back, then confirm it appears:
+
+```bash
+codex-switch daemon stop
+# Move ~/.codex-switch/deleted-profiles/<alias>.backup-<timestamp>
+# back to ~/.codex-switch/profiles/<alias>
+codex-switch list
+```
+
+On Windows, the same directories are under `%USERPROFILE%\.codex-switch`. If `CODEX_SWITCH_HOME` is set, use that directory instead.
 
 ## How It Works
 
@@ -394,6 +413,7 @@ If the issue persists, please [open an issue](https://github.com/xjoker/codex-sw
 |------|-------------|
 | `~/.codex/auth.json` | Live Codex CLI auth file (or `$CODEX_HOME/auth.json`) |
 | `~/.codex-switch/profiles/<alias>/auth.json` | Saved profile data |
+| `~/.codex-switch/deleted-profiles/<alias>.backup-<timestamp>/` | Recoverable deleted profiles |
 | `~/.codex-switch/current` | Currently active profile name |
 | `~/.codex-switch/auth.lock` | File lock that serializes live `auth.json` switches |
 | `~/.codex-switch/config.toml` | Configuration file |
@@ -479,6 +499,7 @@ When a usage query returns HTTP 401/403, the tool automatically attempts to refr
 ### Safety Notes
 
 - CLI and TUI both refuse to delete the active profile
+- Deleting an inactive profile requires confirmation and moves it to private recoverable storage
 - JSON mode keeps stdout machine-readable; human progress/messages go to stderr instead
 
 ## Platform Notes
