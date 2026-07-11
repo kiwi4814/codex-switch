@@ -968,17 +968,13 @@ async fn launch_cmd(alias: Option<&str>, args: Vec<String>, json: bool) -> Resul
     let status = child.wait().context("waiting for codex")?;
 
     // Compute exit code: prefer code(), fall back to 128+signal on Unix
+    #[cfg(unix)]
     let exit_code = status.code().unwrap_or_else(|| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            status.signal().map(|s| 128 + s).unwrap_or(1)
-        }
-        #[cfg(not(unix))]
-        {
-            1
-        }
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map(|s| 128 + s).unwrap_or(1)
     });
+    #[cfg(not(unix))]
+    let exit_code = status.code().unwrap_or(1);
 
     if json {
         print_json(&serde_json::json!({

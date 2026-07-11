@@ -503,6 +503,7 @@ fn cleanup_old_backups(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use serde_json::json;
 
     #[test]
