@@ -31,7 +31,11 @@ impl AccountInfo {
 
     /// Same as `plan_label` but with an overridden plan type (e.g. from API response).
     pub fn plan_label_with(&self, plan_type: Option<&str>) -> String {
-        let base = plan_type.unwrap_or("?").to_string();
+        let base = match plan_type {
+            Some("team") => "Team".to_string(),
+            Some(plan_type) => plan_type.to_string(),
+            None => "?".to_string(),
+        };
         let titled_organization_count = self
             .organizations
             .iter()
@@ -375,7 +379,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(info.plan_label(), "team - Platform Team (+1 org)");
+        assert_eq!(info.plan_label(), "Team - Platform Team (+1 org)");
     }
 
     #[test]
@@ -400,7 +404,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(info.plan_label(), "team - Personal (+2 orgs)");
+        assert_eq!(info.plan_label(), "Team - Personal (+2 orgs)");
     }
 
     #[test]
