@@ -113,9 +113,14 @@ struct AuthTransaction {
 }
 
 fn lock_auth_transaction() -> Result<AuthTransaction> {
+    lock_auth_transaction_after_launch(|| {})
+}
+
+fn lock_auth_transaction_after_launch(after_launch: impl FnOnce()) -> Result<AuthTransaction> {
     // Every writer uses this order. Launch holds the first lock across its
     // stage/start/restore window and only takes the auth lock for each write.
     let launch = lock_launch_session()?;
+    after_launch();
     let auth = lock_live_auth()?;
     Ok(AuthTransaction {
         _launch: launch,
@@ -231,9 +236,25 @@ pub fn update_profile_tokens_and_live_if_current(
     access_token: &str,
     refresh_token: &str,
 ) -> Result<()> {
+    update_profile_tokens_and_live_if_current_after_launch(
+        alias,
+        id_token,
+        access_token,
+        refresh_token,
+        || {},
+    )
+}
+
+fn update_profile_tokens_and_live_if_current_after_launch(
+    alias: &str,
+    id_token: &str,
+    access_token: &str,
+    refresh_token: &str,
+    after_launch: impl FnOnce(),
+) -> Result<()> {
     validate_alias(alias)?;
     let profile_path = profile_auth_path(alias)?;
-    let _transaction = lock_auth_transaction()?;
+    let _transaction = lock_auth_transaction_after_launch(after_launch)?;
     crate::auth::update_tokens(&profile_path, id_token, access_token, refresh_token)
         .with_context(|| format!("updating refreshed tokens for profile {alias}"))?;
     if read_current() == alias {
@@ -861,19 +882,25 @@ mod tests {
         _home: tempfile::TempDir,
         old_home: Option<OsString>,
         old_codex_home: Option<OsString>,
+        old_app_home: Option<OsString>,
     }
 
     impl TestEnv {
         fn new() -> Self {
-            let lock = ENV_LOCK.lock().unwrap();
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let home = tempfile::tempdir().unwrap();
             let codex_home = home.path().join(".codex");
+            let app_home = home.path().join(".codex-switch");
             let old_home = std::env::var_os("HOME");
             let old_codex_home = std::env::var_os("CODEX_HOME");
+            let old_app_home = std::env::var_os("CODEX_SWITCH_TEST_HOME");
 
             unsafe {
                 std::env::set_var("HOME", home.path());
                 std::env::set_var("CODEX_HOME", &codex_home);
+                std::env::set_var("CODEX_SWITCH_TEST_HOME", &app_home);
             }
 
             Self {
@@ -881,6 +908,7 @@ mod tests {
                 _home: home,
                 old_home,
                 old_codex_home,
+                old_app_home,
             }
         }
     }
@@ -895,6 +923,10 @@ mod tests {
                 match &self.old_codex_home {
                     Some(value) => std::env::set_var("CODEX_HOME", value),
                     None => std::env::remove_var("CODEX_HOME"),
+                }
+                match &self.old_app_home {
+                    Some(value) => std::env::set_var("CODEX_SWITCH_TEST_HOME", value),
+                    None => std::env::remove_var("CODEX_SWITCH_TEST_HOME"),
                 }
             }
         }
@@ -1096,34 +1128,22 @@ mod tests {
         super::switch_profile("alice").unwrap();
 
         let auth_gate = super::lock_live_auth().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let updater = std::thread::spawn(move || {
             done_tx
-                .send(super::update_profile_tokens_and_live_if_current(
-                    "alice",
-                    "a-id-new",
-                    "a-new",
-                    "a-ref-new",
-                ))
+                .send(
+                    super::update_profile_tokens_and_live_if_current_after_launch(
+                        "alice",
+                        "a-id-new",
+                        "a-new",
+                        "a-ref-new",
+                        || started_tx.send(()).unwrap(),
+                    ),
+                )
                 .unwrap();
         });
-
-        let lease_path = super::launch_lock_path().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        loop {
-            let probe = super::open_lock_file(&lease_path).unwrap();
-            if matches!(
-                FileExt::try_lock(&probe),
-                Err(fs4::TryLockError::WouldBlock)
-            ) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "updater never acquired launch lease"
-            );
-            std::thread::yield_now();
-        }
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         let switcher = std::thread::spawn(|| super::switch_profile("bob"));
         drop(auth_gate);

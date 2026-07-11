@@ -144,6 +144,11 @@ pub(crate) fn validate_managed_chatgpt_account(id_token: &str) -> Result<()> {
 
 /// ~/.codex-switch/
 pub fn app_home() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("CODEX_SWITCH_TEST_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
     Ok(home.join(".codex-switch"))
