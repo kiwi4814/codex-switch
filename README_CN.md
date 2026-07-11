@@ -209,6 +209,7 @@ codex-switch self-update --check
 | `a` | 添加新账号 |
 | `t` | 开关自动刷新 |
 | `W` | 开关自动预热 5h 窗口已过期的账号 |
+| `i` | 显示/隐藏账号详情面板 |
 | `s` | 切换排序（名称/配额/状态） |
 | `Space` | 标记/取消标记账号 |
 | `u`（账号菜单） | 切换到选中账号 |
@@ -292,8 +293,9 @@ switch_threshold = 80           # 触发切换的 5h 用量百分比（默认：
 cache_refresh_interval_secs = 300 # 刷新全部已保存账号缓存（秒，默认：300）
 auto_warmup = false             # 刷新缓存时预热未激活窗口（默认：false）
 token_check_interval_secs = 300 # Token 刷新检查间隔（秒，默认：300）
-notify = false                  # 切换时桌面通知（默认：false）
+notify = false                  # 切换时桌面通知（macOS/Linux/Windows，默认：false）
 log_level = "error"             # 守护进程日志级别（默认："error"）
+defer_switch_while_codex_running = true # Codex 交互会话运行中时挂起切换（默认：true）
 
 [launch]
 restore_delay_secs = 3          # codex 启动后多少秒还原 auth.json（默认：3）
@@ -347,6 +349,8 @@ codex-switch daemon uninstall
 ```
 
 Beta 守护进程使用与 `codex-switch use` 相同的自适应评分逻辑。它在每次轮询时刷新当前账号，仅在 `daemon.switch_threshold` 达到或超过阈值且存在更好的候选账号时才切换；按 `daemon.cache_refresh_interval_secs` 刷新所有已保存账号的缓存，并在独立定时器上刷新即将过期的 Token。`daemon.auto_warmup = true` 还会预热未激活的配额窗口，默认关闭。daemon 切换无法交互确认：未跟踪的实时 `auth.json` 会在正常轮转备份后被替换；需要保留为可直接选择的账号时，应先保存或导入。守护进程为未来的 Codex 启动做准备；已运行的 Codex 进程在切换后仍需重启。
+
+当交互式 Codex 会话（`codex`、`codex resume`、`codex exec`）正在运行时，daemon 会把切换挂起为 pending 并在下次轮询重试；MCP server、`app-server` 等常驻 Codex 基础设施不会阻塞切换。设置 `daemon.defer_switch_while_codex_running = false` 可无视会话立即切换。daemon 会把状态快照写入 `~/.codex-switch/daemon-state.json`（上次轮询/上次切换/挂起切换/最近错误），`codex-switch daemon status` 会展示；日志写入 `~/.codex-switch/logs/`，按天轮转、最多保留 7 个文件。
 
 ### 定时刷新 Token（可选）
 

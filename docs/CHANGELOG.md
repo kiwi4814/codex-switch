@@ -6,6 +6,11 @@
 
 - **Three-host CI quality gate** — A dedicated CI workflow now runs tests, Clippy, and debug builds on Linux, macOS, and Windows for `dev` pushes and pull requests. Linux additionally checks formatting, dependency advisories, and shell syntax; Windows parses the PowerShell installer.
 - **Verified installers** — Unix and PowerShell installers now download the matching `.sha256` asset and reject malformed or mismatched checksums before extracting release content.
+- **TUI detail panel toggle** — The `i` key shows or hides the account detail panel at the bottom of the TUI, giving the account list the reclaimed rows.
+- **Session-aware daemon switching** — The daemon holds a pending switch while an interactive Codex session (`codex`, `codex resume`, `codex exec`) is running and retries on the next poll; Codex MCP servers and `app-server` hosts do not block. Configurable via `daemon.defer_switch_while_codex_running` (default on).
+- **Daemon observability** — The daemon writes an atomic state snapshot (`daemon-state.json`: last poll, last switch, pending switch, last error, backoff) surfaced by `daemon status`, and logs to `~/.codex-switch/logs/` with daily rotation capped at 7 files; failure backoff now suspends only the poll timer instead of the whole loop.
+- **Windows switch notifications** — `daemon.notify = true` now shows a toast on Windows (WinRT via PowerShell), matching the existing macOS and Linux notifications.
+- **Unified candidate scoring** — CLI `use` and the daemon build and score switch candidates through one shared helper; the daemon now honors the API `plan_type` over stale JWT claims (plan downgrades) the same way the CLI does.
 
 ### Changed
 
@@ -21,6 +26,8 @@
 - **Windows daemon detection** — Task Scheduler installation checks now honor the command exit status, and `tasklist` PID parsing reads the correct CSV column.
 - **Non-interactive switching** — `--json use` and non-TTY callers now fail with an actionable error instead of emitting a hidden overwrite prompt when the live auth file is untracked.
 - **Application home override** — The cross-platform `CODEX_SWITCH_HOME` environment variable replaces the internal test-only name and consistently relocates profiles, cache, locks, and daemon state.
+- **Deeper Codex 0.144.1 contract alignment** — Token refreshes send the same JSON body as Codex and stamp `last_refresh`; logins persist `auth_mode` and run the post-login API key exchange; a missing `account_id` is stored as null; id_token email parsing falls back to the profile claim; forced workspaces pre-restrict the OAuth consent page via `allowed_workspace_id`; and the HTTP User-Agent matches the upstream `codex_cli_rs/<version>` shape.
+- **Release supply-chain pinning** — Third-party GitHub Actions in the release workflow are pinned to commit SHAs and `cross` installs from a fixed revision.
 - **Safe uninstall order** — Installers stop and remove the daemon service before deleting the binary, PATH entry, or data; service cleanup failures abort removal so a running daemon is not orphaned.
 - **Documentation drift** — Removed nonexistent `use --force` and `codex --quiet` examples; documented self-update channel preservation, Windows `.zip` artifacts, Windows Task Scheduler support, daemon cache/warmup settings, and the file-auth prerequisite.
 

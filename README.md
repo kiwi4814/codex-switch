@@ -210,6 +210,7 @@ Press `Enter` to open the selected account menu. If accounts are marked, `Enter`
 | `a` | Add a new account |
 | `t` | Toggle auto-refresh |
 | `W` | Toggle auto-warmup for accounts whose 5h window has expired |
+| `i` | Show / hide the account detail panel |
 | `s` | Cycle sort mode (name / quota / status) |
 | `Space` | Mark / unmark account for batch operations |
 | `u` (account menu) | Switch to selected account |
@@ -293,8 +294,9 @@ switch_threshold = 80           # Switch when current 5h usage >= this % (defaul
 cache_refresh_interval_secs = 300 # Refresh all saved profile caches (default: 300)
 auto_warmup = false             # Warm inactive windows during cache refresh (default: false)
 token_check_interval_secs = 300 # Background token refresh check interval (default: 300)
-notify = false                  # Desktop notification on switch (default: false)
+notify = false                  # Desktop notification on switch (macOS/Linux/Windows, default: false)
 log_level = "error"             # Daemon log level (default: "error")
+defer_switch_while_codex_running = true # Hold switches while an interactive Codex session runs (default: true)
 
 [launch]
 restore_delay_secs = 3          # Seconds to wait before restoring auth.json after codex starts (default: 3)
@@ -348,6 +350,8 @@ codex-switch daemon uninstall
 ```
 
 The Beta daemon uses the same adaptive scoring logic as `codex-switch use`. It refreshes the current account on each poll, switches only when `daemon.switch_threshold` is met or exceeded and a better candidate exists, refreshes all saved profile caches on `daemon.cache_refresh_interval_secs`, and refreshes expiring tokens on a separate timer. `daemon.auto_warmup = true` additionally warms inactive quota windows; it is off by default. Daemon switching is non-interactive: an untracked live `auth.json` may be replaced after its normal rotating backup is created. Save or import that account first if it must remain directly selectable. The daemon prepares future Codex launches; an already-running Codex process still needs to be restarted after a switch.
+
+While an interactive Codex session (`codex`, `codex resume`, `codex exec`) is running, the daemon holds the switch as pending and retries on the next poll; long-lived Codex infrastructure such as MCP servers and `app-server` hosts does not block switching. Set `daemon.defer_switch_while_codex_running = false` to switch immediately regardless. The daemon writes a state snapshot to `~/.codex-switch/daemon-state.json` (last poll, last switch, pending switch, last error) — shown by `codex-switch daemon status` — and logs to `~/.codex-switch/logs/` with daily rotation capped at 7 files.
 
 ### Scheduled token refresh via cron (optional)
 
