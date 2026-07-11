@@ -3,8 +3,13 @@ use std::path::PathBuf;
 
 fn repo_file(path: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    normalize_line_endings(&text)
+}
+
+fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n")
 }
 
 fn assert_before(text: &str, first: &str, second: &str) {
@@ -17,6 +22,14 @@ fn assert_before(text: &str, first: &str, second: &str) {
     assert!(
         first_pos < second_pos,
         "expected `{first}` to appear before `{second}`"
+    );
+}
+
+#[test]
+fn repository_text_normalizes_windows_line_endings() {
+    assert_eq!(
+        normalize_line_endings("first\r\nsecond\r\n"),
+        "first\nsecond\n"
     );
 }
 
