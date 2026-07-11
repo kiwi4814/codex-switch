@@ -12,6 +12,7 @@
 - **Windows switch notifications** — `daemon.notify = true` now shows a toast on Windows (WinRT via PowerShell), matching the existing macOS and Linux notifications.
 - **Unified candidate scoring** — CLI `use` and the daemon build and score switch candidates through one shared helper; the daemon now honors the API `plan_type` over stale JWT claims (plan downgrades) the same way the CLI does.
 - **Plan-aware labels and colors** — CLI and TUI now recognize Go, distinguish `Pro 5×` (`prolite`) from `Pro 20×` (`pro`), normalize workspace plan names, preserve unknown backend values, and use a shared semantic color family without relying on color alone.
+- **Authoritative workspace names** — Login and explicit account refreshes now mirror Codex's authenticated `accounts/check` request, match the selected account ID, cache the returned workspace name outside `auth.json`, and expose it in human and JSON output without guessing from an unrelated default organization.
 
 ### Changed
 

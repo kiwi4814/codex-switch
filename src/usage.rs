@@ -613,6 +613,9 @@ pub async fn validate_import_auth(
                     &tokens.refresh_token,
                 )?;
             }
+            if let Err(err) = crate::workspace::refresh_for_auth(val).await {
+                debug!("workspace metadata unavailable while importing: {err}");
+            }
             Ok((usage, refreshed))
         }
         (None, Some(rt)) => {
@@ -642,6 +645,9 @@ pub async fn validate_import_auth(
                     &tokens.access_token,
                     &tokens.refresh_token,
                 )?;
+            }
+            if let Err(err) = crate::workspace::refresh_for_auth(val).await {
+                debug!("workspace metadata unavailable while importing: {err}");
             }
             Ok((usage, refreshed_again.or(Some(refreshed))))
         }

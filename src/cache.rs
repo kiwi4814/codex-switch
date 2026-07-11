@@ -43,6 +43,9 @@ struct CacheFile {
     /// Tracks the last time each profile was selected by `use` (unix seconds).
     #[serde(default)]
     last_used: HashMap<String, i64>,
+    /// Workspace display names keyed by the stable ChatGPT account id.
+    #[serde(default)]
+    workspace_names: HashMap<String, String>,
 }
 
 fn cache_path() -> Result<PathBuf> {
@@ -222,6 +225,54 @@ pub fn put(alias: &str, usage: &UsageInfo) {
     }
 }
 
+pub fn get_workspace_name(account_id: &str) -> Option<String> {
+    match with_cache_lock(|| Ok(load_cache().workspace_names.get(account_id).cloned())) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("Failed to read cached workspace name: {err}");
+            None
+        }
+    }
+}
+
+pub fn set_workspace_name(account_id: &str, name: Option<&str>) -> Result<()> {
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return Ok(());
+    }
+    let name = name.map(str::trim).filter(|name| !name.is_empty());
+    with_cache_lock(|| {
+        let mut cache = load_cache();
+        let changed = update_workspace_name(&mut cache, account_id, name);
+        if changed {
+            save_cache(&cache)?;
+        }
+        Ok(())
+    })
+}
+
+fn update_workspace_name(cache: &mut CacheFile, account_id: &str, name: Option<&str>) -> bool {
+    match name {
+        Some(name) if cache.workspace_names.get(account_id).map(String::as_str) != Some(name) => {
+            cache
+                .workspace_names
+                .insert(account_id.to_string(), name.to_string());
+            true
+        }
+        None => cache.workspace_names.remove(account_id).is_some(),
+        Some(_) => false,
+    }
+}
+
+pub fn apply_workspace_name(info: &mut crate::jwt::AccountInfo) {
+    let Some(account_id) = info.account_id.as_deref() else {
+        return;
+    };
+    if let Some(name) = get_workspace_name(account_id) {
+        info.workspace_name = Some(name);
+    }
+}
+
 /// Remove cached usage for an alias while preserving last-used metadata.
 pub fn invalidate(alias: &str) -> Result<()> {
     with_cache_lock(|| {
@@ -337,6 +388,18 @@ mod tests {
         let entry = to_entry(&usage);
         assert!(entry.account_limited);
         assert!(from_entry(&entry).account_limited);
+    }
+
+    #[test]
+    fn authoritative_empty_workspace_name_clears_stale_cache() {
+        let mut cache = CacheFile::default();
+        assert!(update_workspace_name(
+            &mut cache,
+            "acct-team",
+            Some("Old Team")
+        ));
+        assert!(update_workspace_name(&mut cache, "acct-team", None));
+        assert!(!cache.workspace_names.contains_key("acct-team"));
     }
 
     #[test]

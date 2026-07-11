@@ -13,6 +13,7 @@ mod tui;
 mod update;
 mod usage;
 mod warmup;
+mod workspace;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -357,7 +358,14 @@ async fn list_cmd(force: bool, json: bool, auth_already_handled: bool) -> Result
 
     let mut tasks = tokio::task::JoinSet::new();
     for (idx, row) in rows.iter().enumerate() {
-        if row.usage_result.is_some() {
+        let needs_usage = row.usage_result.is_none();
+        let needs_workspace = force
+            || row
+                .info
+                .account_id
+                .as_deref()
+                .is_some_and(|id| cache::get_workspace_name(id).is_none());
+        if !needs_usage && !needs_workspace {
             continue;
         }
 
@@ -368,9 +376,11 @@ async fn list_cmd(force: bool, json: bool, auth_already_handled: bool) -> Result
             let Ok(_permit) = sem.acquire_owned().await else {
                 return (
                     idx,
-                    Err(usage::UsageError {
-                        summary: "limiter closed".into(),
-                        detail: "usage limiter closed".into(),
+                    needs_usage.then(|| {
+                        Err(usage::UsageError {
+                            summary: "limiter closed".into(),
+                            detail: "usage limiter closed".into(),
+                        })
                     }),
                 );
             };
@@ -379,18 +389,30 @@ async fn list_cmd(force: bool, json: bool, auth_already_handled: bool) -> Result
                 Err(e) => {
                     return (
                         idx,
-                        Err(usage::UsageError {
-                            summary: format!("path error: {e}"),
-                            detail: format!("failed to resolve profile path: {e}"),
+                        needs_usage.then(|| {
+                            Err(usage::UsageError {
+                                summary: format!("path error: {e}"),
+                                detail: format!("failed to resolve profile path: {e}"),
+                            })
                         }),
                     );
                 }
             };
-            let usage_result = if force {
-                usage::fetch_usage_retried_force(&alias, &path, &current).await
+            let usage_result = if needs_usage {
+                Some(if force {
+                    usage::fetch_usage_retried_force(&alias, &path, &current).await
+                } else {
+                    usage::fetch_usage_retried(&alias, &path, &current).await
+                })
             } else {
-                usage::fetch_usage_retried(&alias, &path, &current).await
+                None
             };
+            // Read auth after usage: that path may have refreshed and persisted the token.
+            if let Ok(auth) = auth::read_auth(&path)
+                && let Err(err) = workspace::refresh_for_auth_if_needed(&auth, force).await
+            {
+                tracing::debug!("[{alias}] workspace metadata unavailable: {err}");
+            }
             (idx, usage_result)
         });
     }
@@ -398,8 +420,11 @@ async fn list_cmd(force: bool, json: bool, auth_already_handled: bool) -> Result
     let mut completed = 0usize;
     while let Some(task) = tasks.join_next().await {
         let (idx, usage_result) = task.map_err(|e| anyhow::anyhow!("usage worker failed: {e}"))?;
-        rows[idx].usage_result = Some(usage_result);
-        completed += 1;
+        if let Some(usage_result) = usage_result {
+            rows[idx].usage_result = Some(usage_result);
+            completed += 1;
+        }
+        cache::apply_workspace_name(&mut rows[idx].info);
         if let Some(progress) = progress.as_mut() {
             progress.advance(completed);
         }
@@ -651,8 +676,13 @@ async fn login_cmd(alias: Option<&str>, device: bool, json: bool) -> Result<()> 
         login::run_device_auth().await?
     };
     let (auth_val, _info) = login::build_auth_from_tokens(&tokens);
+    let workspace_auth = auth_val.clone();
 
-    match profile::save_auth_value(auth_val, alias)? {
+    let action = profile::save_auth_value(auth_val, alias)?;
+    if let Err(err) = workspace::refresh_for_auth(&workspace_auth).await {
+        tracing::debug!("workspace metadata unavailable after login: {err}");
+    }
+    match action {
         profile::SaveAction::Created(a) => {
             if !json {
                 println!(
@@ -706,6 +736,9 @@ async fn reauth_profile(alias: &str, device: bool, json: bool) -> Result<()> {
     };
     let (auth_val, new_info) = login::build_auth_from_tokens(&tokens);
     profile::replace_profile_auth_and_live_if_current(alias, &auth_val)?;
+    if let Err(err) = workspace::refresh_for_auth(&auth_val).await {
+        tracing::debug!("workspace metadata unavailable after re-login: {err}");
+    }
 
     if json {
         print_json(&output::JsonOk {
@@ -1231,11 +1264,12 @@ async fn import_one_file(
                 error: e.to_string(),
             })?;
 
-    let account = auth::validate_auth_value(&val).map_err(|e| profile::ImportFailure {
+    let mut account = auth::validate_auth_value(&val).map_err(|e| profile::ImportFailure {
         source: source.to_path_buf(),
         stage: "structure",
         error: e.to_string(),
     })?;
+    cache::apply_workspace_name(&mut account);
 
     let action =
         profile::save_imported_auth_value(val, alias).map_err(|e| profile::ImportFailure {

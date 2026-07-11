@@ -84,6 +84,8 @@ pub struct App {
     pub status_expiry: Option<Instant>,
     pub pending_results: tokio::sync::mpsc::Receiver<(String, Result<UsageInfo, UsageError>)>,
     pub result_sender: tokio::sync::mpsc::Sender<(String, Result<UsageInfo, UsageError>)>,
+    pub pending_workspace: tokio::sync::mpsc::Receiver<String>,
+    pub workspace_sender: tokio::sync::mpsc::Sender<String>,
     pub pending_warmup: tokio::sync::mpsc::Receiver<(u64, String, Result<(), String>)>,
     pub warmup_sender: tokio::sync::mpsc::Sender<(u64, String, Result<(), String>)>,
     pub pending_reset_cards:
@@ -111,6 +113,7 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let (workspace_tx, workspace_rx) = tokio::sync::mpsc::channel(128);
         let (warmup_tx, warmup_rx) = tokio::sync::mpsc::channel(64);
         let (reset_card_tx, reset_card_rx) = tokio::sync::mpsc::channel(16);
         let cfg = crate::config::get();
@@ -127,6 +130,8 @@ impl App {
             status_expiry: None,
             pending_results: rx,
             result_sender: tx,
+            pending_workspace: workspace_rx,
+            workspace_sender: workspace_tx,
             pending_warmup: warmup_rx,
             warmup_sender: warmup_tx,
             pending_reset_cards: reset_card_rx,
@@ -682,7 +687,14 @@ impl App {
         if matches!(entry.usage, UsageStatus::Loading) {
             return;
         }
-        if !force && matches!(entry.usage, UsageStatus::Loaded(_)) {
+        let needs_usage = force || !matches!(entry.usage, UsageStatus::Loaded(_));
+        let needs_workspace = force
+            || entry
+                .info
+                .account_id
+                .as_deref()
+                .is_some_and(|id| crate::cache::get_workspace_name(id).is_none());
+        if !needs_usage && !needs_workspace {
             return;
         }
 
@@ -697,17 +709,33 @@ impl App {
         let current = read_current();
         let limiter = self.usage_limiter.clone();
 
-        self.accounts[idx].usage = UsageStatus::Loading;
+        if needs_usage {
+            self.accounts[idx].usage = UsageStatus::Loading;
+        }
 
-        let tx = self.result_sender.clone();
+        let usage_tx = self.result_sender.clone();
+        let workspace_tx = self.workspace_sender.clone();
         tokio::spawn(async move {
             let _permit = limiter.acquire().await;
-            let result = if force {
-                fetch_usage_retried_force(&alias, &path, &current).await
-            } else {
-                fetch_usage_retried(&alias, &path, &current).await
-            };
-            let _ = tx.send((alias, result)).await;
+            if needs_usage {
+                let result = if force {
+                    fetch_usage_retried_force(&alias, &path, &current).await
+                } else {
+                    fetch_usage_retried(&alias, &path, &current).await
+                };
+                // Usage is independent of best-effort workspace metadata.
+                let _ = usage_tx.send((alias.clone(), result)).await;
+            }
+            if needs_workspace {
+                // Read auth after usage because that path may have refreshed the token.
+                if let Ok(auth) = crate::auth::read_auth(&path)
+                    && let Err(err) =
+                        crate::workspace::refresh_for_auth_if_needed(&auth, force).await
+                {
+                    tracing::debug!("[{alias}] workspace metadata unavailable: {err}");
+                }
+                let _ = workspace_tx.send(alias).await;
+            }
         });
     }
 
@@ -753,7 +781,14 @@ impl App {
                 Ok(u) => UsageStatus::Loaded(u),
                 Err(e) => UsageStatus::Error(e),
             };
+            crate::cache::apply_workspace_name(&mut self.accounts[idx].info);
             changed = true;
+        }
+        while let Ok(alias) = self.pending_workspace.try_recv() {
+            if let Some(entry) = self.accounts.iter_mut().find(|entry| entry.alias == alias) {
+                crate::cache::apply_workspace_name(&mut entry.info);
+                changed = true;
+            }
         }
         if changed {
             self.update_view();
@@ -1566,7 +1601,10 @@ async fn run_oauth_inner(mode: OAuthMode, device: bool) -> Result<String> {
 
     match mode {
         OAuthMode::Add => {
-            let action = profile::save_auth_value(auth_val, None)?;
+            let action = profile::save_auth_value(auth_val.clone(), None)?;
+            if let Err(err) = crate::workspace::refresh_for_auth(&auth_val).await {
+                tracing::debug!("workspace metadata unavailable after TUI login: {err}");
+            }
             let alias = action.alias().to_string();
             let verb = action.action(); // "created" / "updated"
             let email_disp = info.email.as_deref().unwrap_or("unknown");
@@ -1575,6 +1613,9 @@ async fn run_oauth_inner(mode: OAuthMode, device: bool) -> Result<String> {
         }
         OAuthMode::Relogin(alias) => {
             profile::replace_profile_auth_and_live_if_current(&alias, &auth_val)?;
+            if let Err(err) = crate::workspace::refresh_for_auth(&auth_val).await {
+                tracing::debug!("workspace metadata unavailable after TUI re-login: {err}");
+            }
             let email_disp = info.email.as_deref().unwrap_or("unknown");
             println!("[ok] Re-logged in: {alias} ({email_disp})");
             Ok(format!("Re-logged in: {alias}"))

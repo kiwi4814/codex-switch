@@ -15,6 +15,7 @@ pub struct JsonAccount {
     pub email: Option<String>,
     pub plan: Option<String>,
     pub account_id: Option<String>,
+    pub workspace_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -139,6 +140,7 @@ pub fn account_to_json(info: &AccountInfo, api_plan: Option<&str>) -> JsonAccoun
             .map(|s| s.to_string())
             .or_else(|| info.plan_type.clone()),
         account_id: info.account_id.clone(),
+        workspace_name: info.workspace_name.clone(),
     }
 }
 

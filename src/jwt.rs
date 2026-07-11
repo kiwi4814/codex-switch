@@ -109,11 +109,6 @@ impl AccountInfo {
         {
             return format!("{base} - {name}{organization_suffix}");
         }
-        if let Some(org) = self.organizations.iter().find(|o| o.is_default)
-            && !org.title.is_empty()
-        {
-            return format!("{base} - {}{organization_suffix}", org.title);
-        }
         base
     }
 
@@ -180,8 +175,14 @@ pub fn parse_account_info(auth: &Value) -> AccountInfo {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let workspace_name = extract_workspace_name(&claims);
     let organizations = extract_organizations(&claims);
+    let workspace_name = (|| {
+        let account_id = account_id.as_deref()?;
+        organizations
+            .iter()
+            .find(|organization| organization.id == account_id && !organization.title.is_empty())
+            .map(|organization| organization.title.clone())
+    })();
 
     AccountInfo {
         email,
@@ -192,58 +193,6 @@ pub fn parse_account_info(auth: &Value) -> AccountInfo {
         workspace_name,
         organizations,
     }
-}
-
-/// Extract workspace name from JWT claims (team/org accounts)
-fn extract_workspace_name(claims: &Value) -> Option<String> {
-    // Top-level fields
-    for key in &[
-        "workspace_name",
-        "organization_name",
-        "org_name",
-        "team_name",
-    ] {
-        if let Some(v) = claims.get(key).and_then(|v| v.as_str()) {
-            let s = v.trim().to_string();
-            if !s.is_empty() {
-                return Some(s);
-            }
-        }
-    }
-    // Nested under auth claims
-    let auth = claims.get("https://api.openai.com/auth")?;
-    for key in &[
-        "workspace_name",
-        "organization_name",
-        "org_name",
-        "team_name",
-    ] {
-        if let Some(v) = auth.get(key).and_then(|v| v.as_str()) {
-            let s = v.trim().to_string();
-            if !s.is_empty() {
-                return Some(s);
-            }
-        }
-    }
-    // Fallback: default org title from organizations array
-    if let Some(orgs) = auth.get("organizations").and_then(|v| v.as_array()) {
-        let default = orgs.iter().find(|o| {
-            o.get("is_default")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        });
-        let candidate = default.or_else(|| orgs.first());
-        if let Some(title) = candidate
-            .and_then(|o| o.get("title"))
-            .and_then(|v| v.as_str())
-        {
-            let s = title.trim().to_string();
-            if !s.is_empty() {
-                return Some(s);
-            }
-        }
-    }
-    None
 }
 
 /// Extract organizations list from JWT claims
@@ -379,6 +328,55 @@ mod tests {
         let info = parse_account_info(&auth);
 
         assert!(info.is_fedramp);
+    }
+
+    #[test]
+    fn workspace_name_uses_only_the_selected_account_not_default_personal_org() {
+        let auth = json!({
+            "tokens": {
+                "id_token": make_jwt(&json!({
+                    "https://api.openai.com/auth": {
+                        "chatgpt_plan_type": "team",
+                        "chatgpt_account_id": "acct-team",
+                        "organization_name": "Personal",
+                        "organizations": [{
+                            "id": "acct-personal",
+                            "title": "Personal",
+                            "is_default": true
+                        }]
+                    }
+                }))
+            }
+        });
+
+        let info = parse_account_info(&auth);
+
+        assert!(info.workspace_name.is_none());
+        assert_eq!(info.plan_label(), "Team");
+    }
+
+    #[test]
+    fn workspace_name_accepts_org_title_when_id_matches_selected_account() {
+        let auth = json!({
+            "tokens": {
+                "id_token": make_jwt(&json!({
+                    "https://api.openai.com/auth": {
+                        "chatgpt_plan_type": "team",
+                        "chatgpt_account_id": "acct-team",
+                        "organizations": [{
+                            "id": "acct-team",
+                            "title": "Platform Team",
+                            "is_default": false
+                        }]
+                    }
+                }))
+            }
+        });
+
+        let info = parse_account_info(&auth);
+
+        assert_eq!(info.workspace_name.as_deref(), Some("Platform Team"));
+        assert_eq!(info.plan_label(), "Team - Platform Team");
     }
 
     #[test]

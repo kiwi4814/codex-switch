@@ -17,3 +17,4 @@ mod tui;
 mod update;
 pub mod usage;
 mod warmup;
+pub mod workspace;

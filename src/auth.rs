@@ -353,7 +353,11 @@ pub fn now_unix_secs() -> i64 {
 /// Read auth.json and parse AccountInfo in one step (returns default on error).
 pub fn read_account_info(path: &Path) -> crate::jwt::AccountInfo {
     read_auth(path)
-        .map(|v| crate::jwt::parse_account_info(&v))
+        .map(|v| {
+            let mut info = crate::jwt::parse_account_info(&v);
+            crate::cache::apply_workspace_name(&mut info);
+            info
+        })
         .unwrap_or_default()
 }
 
