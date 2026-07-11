@@ -122,6 +122,8 @@ sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 
 `codex-switch` switches Codex's file-backed `auth.json`. Codex must therefore use its default file credential store, or explicitly set `cli_auth_credentials_store = "file"` in `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Explicit `keyring`, `auto`, or `ephemeral` modes are rejected because they can bypass the live file. An empty `CODEX_HOME` falls back to `~/.codex`; a non-empty value selects the Codex home used for both `auth.json` and `config.toml`.
 
+`CODEX_SWITCH_HOME` optionally relocates codex-switch's own profiles, cache, locks, and daemon state from `~/.codex-switch`; it does not change Codex's `auth.json` location.
+
 ChatGPT login is required. A managed Codex configuration with `forced_login_method = "api"` is incompatible and fails with an actionable error instead of modifying authentication state.
 
 ```bash
@@ -300,6 +302,8 @@ restore_delay_secs = 3          # Seconds to wait before restoring auth.json aft
 
 For the three daemon interval fields, `0` is treated as unset and normalized to the documented defaults: polling `60`, cache refresh `300`, and token check `300` seconds.
 
+`launch.restore_delay_secs` is a compatibility delay, not a handshake with Codex. Increase it if Codex on the local machine reads `auth.json` more than three seconds after launch.
+
 ### Examples
 
 ```bash
@@ -343,7 +347,7 @@ codex-switch daemon install
 codex-switch daemon uninstall
 ```
 
-The Beta daemon uses the same adaptive scoring logic as `codex-switch use`. It refreshes the current account on each poll, switches only when `daemon.switch_threshold` is met or exceeded and a better candidate exists, refreshes all saved profile caches on `daemon.cache_refresh_interval_secs`, and refreshes expiring tokens on a separate timer. `daemon.auto_warmup = true` additionally warms inactive quota windows; it is off by default. The daemon prepares future Codex launches; an already-running Codex process still needs to be restarted after a switch.
+The Beta daemon uses the same adaptive scoring logic as `codex-switch use`. It refreshes the current account on each poll, switches only when `daemon.switch_threshold` is met or exceeded and a better candidate exists, refreshes all saved profile caches on `daemon.cache_refresh_interval_secs`, and refreshes expiring tokens on a separate timer. `daemon.auto_warmup = true` additionally warms inactive quota windows; it is off by default. Daemon switching is non-interactive: an untracked live `auth.json` may be replaced after its normal rotating backup is created. Save or import that account first if it must remain directly selectable. The daemon prepares future Codex launches; an already-running Codex process still needs to be restarted after a switch.
 
 ### Scheduled token refresh via cron (optional)
 

@@ -121,6 +121,8 @@ sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 
 `codex-switch` 通过切换 Codex 的文件型 `auth.json` 工作。因此 Codex 必须使用默认的 file credential store，或在 `$CODEX_HOME/config.toml`（通常为 `~/.codex/config.toml`）中显式配置 `cli_auth_credentials_store = "file"`。显式的 `keyring`、`auto` 或 `ephemeral` 模式可能绕过实时认证文件，程序会直接拒绝。空的 `CODEX_HOME` 会回退到 `~/.codex`；非空值同时决定 `auth.json` 与 `config.toml` 的 Codex 主目录。
 
+`CODEX_SWITCH_HOME` 可将 codex-switch 自身的 profiles、cache、锁与 daemon 状态从 `~/.codex-switch` 迁到其他目录；它不会改变 Codex `auth.json` 的位置。
+
 本工具要求 ChatGPT 登录。如果受管 Codex 配置设置了 `forced_login_method = "api"`，程序会给出可操作错误并停止，不会修改认证状态。
 
 ```bash
@@ -299,6 +301,8 @@ restore_delay_secs = 3          # codex 启动后多少秒还原 auth.json（默
 
 三个 daemon 间隔字段若设为 `0`，会按“未设置”处理并归一化为文档默认值：轮询 `60` 秒、缓存刷新 `300` 秒、Token 检查 `300` 秒。
 
+`launch.restore_delay_secs` 是兼容性延迟，并非与 Codex 的握手。如果本机 Codex 在启动三秒后才读取 `auth.json`，请增大该值。
+
 ### 示例
 
 ```bash
@@ -342,7 +346,7 @@ codex-switch daemon install
 codex-switch daemon uninstall
 ```
 
-Beta 守护进程使用与 `codex-switch use` 相同的自适应评分逻辑。它在每次轮询时刷新当前账号，仅在 `daemon.switch_threshold` 达到或超过阈值且存在更好的候选账号时才切换；按 `daemon.cache_refresh_interval_secs` 刷新所有已保存账号的缓存，并在独立定时器上刷新即将过期的 Token。`daemon.auto_warmup = true` 还会预热未激活的配额窗口，默认关闭。守护进程为未来的 Codex 启动做准备；已运行的 Codex 进程在切换后仍需重启。
+Beta 守护进程使用与 `codex-switch use` 相同的自适应评分逻辑。它在每次轮询时刷新当前账号，仅在 `daemon.switch_threshold` 达到或超过阈值且存在更好的候选账号时才切换；按 `daemon.cache_refresh_interval_secs` 刷新所有已保存账号的缓存，并在独立定时器上刷新即将过期的 Token。`daemon.auto_warmup = true` 还会预热未激活的配额窗口，默认关闭。daemon 切换无法交互确认：未跟踪的实时 `auth.json` 会在正常轮转备份后被替换；需要保留为可直接选择的账号时，应先保存或导入。守护进程为未来的 Codex 启动做准备；已运行的 Codex 进程在切换后仍需重启。
 
 ### 定时刷新 Token（可选）
 

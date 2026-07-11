@@ -689,7 +689,7 @@ fn make_unique_alias(base: &str) -> Result<String> {
     }
 }
 
-pub fn cmd_use(alias: &str) -> Result<()> {
+pub fn cmd_use(alias: &str, allow_prompt: bool) -> Result<()> {
     validate_alias(alias)?;
     let src = profile_auth_path(alias)?;
     if !src.exists() {
@@ -699,6 +699,11 @@ pub fn cmd_use(alias: &str) -> Result<()> {
     let dst = codex_auth_path()?;
 
     if dst.exists() && find_matching_profile(&dst).is_none() {
+        if !allow_prompt {
+            anyhow::bail!(
+                "current auth.json is not tracked; interactive confirmation is required before overwriting it"
+            );
+        }
         user_print(
             "Current auth.json does not belong to any saved profile -- switching will overwrite it. Continue? [y/N] ",
         );
@@ -918,12 +923,12 @@ mod tests {
             let app_home = home.path().join(".codex-switch");
             let old_home = std::env::var_os("HOME");
             let old_codex_home = std::env::var_os("CODEX_HOME");
-            let old_app_home = std::env::var_os("CODEX_SWITCH_TEST_HOME");
+            let old_app_home = std::env::var_os("CODEX_SWITCH_HOME");
 
             unsafe {
                 std::env::set_var("HOME", home.path());
                 std::env::set_var("CODEX_HOME", &codex_home);
-                std::env::set_var("CODEX_SWITCH_TEST_HOME", &app_home);
+                std::env::set_var("CODEX_SWITCH_HOME", &app_home);
             }
 
             Self {
@@ -948,8 +953,8 @@ mod tests {
                     None => std::env::remove_var("CODEX_HOME"),
                 }
                 match &self.old_app_home {
-                    Some(value) => std::env::set_var("CODEX_SWITCH_TEST_HOME", value),
-                    None => std::env::remove_var("CODEX_SWITCH_TEST_HOME"),
+                    Some(value) => std::env::set_var("CODEX_SWITCH_HOME", value),
+                    None => std::env::remove_var("CODEX_SWITCH_HOME"),
                 }
             }
         }
@@ -987,7 +992,7 @@ mod tests {
 
         for alias in ["../escape", "with/slash"] {
             assert_invalid_alias(
-                cmd_use(alias),
+                cmd_use(alias, true),
                 "alias may only contain ASCII letters, digits, '_', '-', '.'",
             );
             assert_invalid_alias(
@@ -1004,7 +1009,7 @@ mod tests {
             );
         }
 
-        assert_invalid_alias(cmd_use(""), "alias cannot be empty");
+        assert_invalid_alias(cmd_use("", true), "alias cannot be empty");
         assert_invalid_alias(switch_profile(""), "alias cannot be empty");
         assert_invalid_alias(cmd_delete(""), "alias cannot be empty");
         assert_invalid_alias(rename_profile("", "valid-alias"), "alias cannot be empty");

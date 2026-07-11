@@ -95,7 +95,7 @@ fn command(home: &Path, args: &[&str]) -> Command {
     cmd.stderr(Stdio::piped());
     cmd.env("HOME", home);
     cmd.env("CODEX_HOME", home.join(".codex"));
-    cmd.env("CODEX_SWITCH_TEST_HOME", home.join(".codex-switch"));
+    cmd.env("CODEX_SWITCH_HOME", home.join(".codex-switch"));
     cmd.env_remove("HTTP_PROXY");
     cmd.env_remove("HTTPS_PROXY");
     cmd.env_remove("ALL_PROXY");
@@ -104,7 +104,7 @@ fn command(home: &Path, args: &[&str]) -> Command {
 }
 
 #[test]
-fn spawned_binary_honors_test_app_home_override() {
+fn spawned_binary_honors_app_home_override() {
     let home = temp_home("app-home-override");
     let app_home = home.join("isolated-app-home");
     let sample = home.join("sample-auth.json");
@@ -117,7 +117,7 @@ fn spawned_binary_honors_test_app_home_override() {
         &home,
         &["--json", "import", sample.to_str().unwrap(), "override"],
     );
-    cmd.env("CODEX_SWITCH_TEST_HOME", &app_home);
+    cmd.env("CODEX_SWITCH_HOME", &app_home);
     cmd.env("CS_IMPORT_SKIP_USAGE_VALIDATION", "1");
     let output = cmd.output().unwrap();
     assert!(output.status.success());
@@ -182,6 +182,32 @@ fn json_use_keeps_stdout_machine_readable() {
         serde_json::json!({"ok": true, "alias": "alice", "action": "switched"})
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("Switched to profile: alice"));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn json_use_rejects_untracked_live_auth_without_prompting() {
+    let home = temp_home("json-use-untracked");
+    write_json(
+        home.join(".codex-switch/profiles/alice/auth.json"),
+        &auth_json("alice@example.com", "acct_alice"),
+    );
+    write_json(
+        home.join(".codex/auth.json"),
+        &auth_json("bob@example.com", "acct_bob"),
+    );
+
+    let output = run(&home, &["--json", "use", "alice"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        parse_stdout_json(&output),
+        serde_json::json!({
+            "ok": false,
+            "error": "current auth.json is not tracked; interactive confirmation is required before overwriting it"
+        })
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
 
     let _ = fs::remove_dir_all(home);
 }

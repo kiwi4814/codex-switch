@@ -19,6 +19,8 @@
 - **Cross-process auth transactions** — Switch, launch staging/restoration, refresh, warmup, re-login, import, rename, and delete paths serialize through stable OS file locks. Lock timeout reports the holder without unlinking a live lock, launch does not hold the auth write lock while the Codex child runs, and refreshed tokens cannot be written into another account after a concurrent switch.
 - **Cross-process cache writes** — Cache read/modify/write operations now use an OS file lock and unique temporary files; auth, current-profile, and cache replacements use a cross-platform atomic replace path that can overwrite existing files on Windows.
 - **Windows daemon detection** — Task Scheduler installation checks now honor the command exit status, and `tasklist` PID parsing reads the correct CSV column.
+- **Non-interactive switching** — `--json use` and non-TTY callers now fail with an actionable error instead of emitting a hidden overwrite prompt when the live auth file is untracked.
+- **Application home override** — The cross-platform `CODEX_SWITCH_HOME` environment variable replaces the internal test-only name and consistently relocates profiles, cache, locks, and daemon state.
 - **Safe uninstall order** — Installers stop and remove the daemon service before deleting the binary, PATH entry, or data; service cleanup failures abort removal so a running daemon is not orphaned.
 - **Documentation drift** — Removed nonexistent `use --force` and `codex --quiet` examples; documented self-update channel preservation, Windows `.zip` artifacts, Windows Task Scheduler support, daemon cache/warmup settings, and the file-auth prerequisite.
 

@@ -234,9 +234,11 @@ fn confirm(prompt: &str) -> bool {
 // ── use ──────────────────────────────────────────────────
 
 async fn use_cmd(alias: Option<&str>, json: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
     match alias {
         Some(a) => {
-            profile::cmd_use(a)?;
+            profile::cmd_use(a, !json && std::io::stdin().is_terminal())?;
             cache::set_last_used(a)?;
             if json {
                 print_json(&output::JsonOk {
