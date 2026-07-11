@@ -95,11 +95,35 @@ fn command(home: &Path, args: &[&str]) -> Command {
     cmd.stderr(Stdio::piped());
     cmd.env("HOME", home);
     cmd.env("CODEX_HOME", home.join(".codex"));
+    cmd.env("CODEX_SWITCH_TEST_HOME", home.join(".codex-switch"));
     cmd.env_remove("HTTP_PROXY");
     cmd.env_remove("HTTPS_PROXY");
     cmd.env_remove("ALL_PROXY");
     cmd.env_remove("CS_PROXY");
     cmd
+}
+
+#[test]
+fn spawned_binary_honors_test_app_home_override() {
+    let home = temp_home("app-home-override");
+    let app_home = home.join("isolated-app-home");
+    let sample = home.join("sample-auth.json");
+    write_json(
+        &sample,
+        &auth_json_with_access("override@example.com", "acct_override"),
+    );
+
+    let mut cmd = command(
+        &home,
+        &["--json", "import", sample.to_str().unwrap(), "override"],
+    );
+    cmd.env("CODEX_SWITCH_TEST_HOME", &app_home);
+    cmd.env("CS_IMPORT_SKIP_USAGE_VALIDATION", "1");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    assert!(app_home.join("profiles/override/auth.json").exists());
+
+    let _ = fs::remove_dir_all(home);
 }
 
 fn run(home: &Path, args: &[&str]) -> Output {

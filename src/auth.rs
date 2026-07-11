@@ -144,8 +144,9 @@ pub(crate) fn validate_managed_chatgpt_account(id_token: &str) -> Result<()> {
 
 /// ~/.codex-switch/
 pub fn app_home() -> Result<PathBuf> {
-    #[cfg(test)]
-    if let Some(path) = std::env::var_os("CODEX_SWITCH_TEST_HOME") {
+    // Integration tests spawn the real binary, so cfg(test) cannot isolate its app home.
+    if let Some(path) = std::env::var_os("CODEX_SWITCH_TEST_HOME").filter(|value| !value.is_empty())
+    {
         return Ok(PathBuf::from(path));
     }
 
