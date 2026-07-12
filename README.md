@@ -49,7 +49,7 @@ Prefer plain commands? Run `codex-switch list` to inspect accounts and `codex-sw
 
 - **Profile Management** — Save, switch, rename, delete Codex accounts
 - **Auto-Detection** — Automatically discovers and tracks the current `auth.json`
-- **Usage Dashboard** — Live quota monitoring with color-coded 5h/7d progress bars for the main quota and every additional model quota pool returned by the API; the account page pairs quota visuals with the official model names and descriptions
+- **Usage Dashboard** — Live quota monitoring with color-coded 5h/7d progress bars for the main quota and every additional model quota pool returned by the API; the account page keeps identity, quota, reset-card, and model-capability information in one scrollable view
 - **Reset Cards (v0.0.20)** — Show Codex reset card counts and expiry times, then consume the earliest-expiring available card from CLI or TUI after confirmation
 - **Adaptive Auto-Switch** — `codex-switch use` without arguments ranks accounts with a unified 5-component scoring algorithm, with Team accounts prioritized by default
 - **Background Daemon (Beta)** — Optional `daemon` command uses LaunchAgent on macOS, a systemd user service on Linux, and Task Scheduler on Windows
@@ -57,10 +57,10 @@ Prefer plain commands? Run `codex-switch list` to inspect accounts and `codex-sw
 - **Progress Display** — Long-running `use`, `list`, and directory `import` operations show a single-line cross-platform progress indicator
 - **Interactive TUI** — Full terminal UI with live usage data, color-coded status, and keyboard shortcuts
 - **OAuth Login** — Built-in PKCE browser login flow, no manual token copying
-- **Token Auto-Refresh** — Automatically refreshes expired tokens using refresh_token
+- **Token Auto-Refresh** — Refreshes either expiring access or ID tokens using refresh_token before a request needs to fail
 - **Validated Bulk Import** — Import a single `auth.json` or recursively scan a directory, validate files, and auto-assign unique aliases
-- **Pace Marker** — Visual indicator on usage bars showing expected consumption based on elapsed window time
-- **Warmup** — `warmup` activates the main window and every model-specific `codex_*` quota pool that can be matched to the authenticated models response, while skipping already-active accounts
+- **Pace Marker** — High-contrast marker on usage bars showing expected consumption based on elapsed window time
+- **Warmup** — `warmup` activates the main window and every matching model-specific quota pool returned for that account (including Pro 20× Spark), while skipping already-active accounts
 - **Manual Self-Update** — `self-update --check` checks GitHub Releases on demand; `self-update` installs the latest release (supports stable and dev channels)
 - **Launch with Profile** — `launch` starts Codex CLI with a specific (or best) profile's auth, transparently forwarding all arguments. Auth is swapped only during startup, then immediately restored
 - **Over-Pace Warning** — Red `!` indicator on 5h/7d columns when usage exceeds expected pace
@@ -167,7 +167,7 @@ Use aliases such as `work` or `personal` in place of `<alias>`. Run `codex-switc
 | `codex-switch list [-f]` | List all profiles with account info, usage, and availability (`-f` force refresh) |
 | `codex-switch reset-card <alias> [--yes]` | Consume the earliest-expiring available Codex reset card for a profile. Prompts for confirmation unless `--yes` is used; JSON mode requires `--yes` |
 | `codex-switch launch [alias] [--consume-card] [-- args...]` | Launch Codex CLI with a profile's auth. Omit alias to auto-select with adaptive scoring, with the same `--consume-card` reset-card revival behavior as `use`. All arguments after `--` are forwarded to codex |
-| `codex-switch warmup [alias]` | Send a minimal request to start the 5h/7d quota window countdown. Omit alias to warm up all profiles |
+| `codex-switch warmup [alias]` | Send minimal requests to start the main and matching model-specific 5h/7d quota windows. Omit alias to warm up all profiles |
 | `codex-switch login [--device] [alias]` | Log in via OAuth (`--device` for headless servers). If alias exists, re-authorizes |
 | `codex-switch rename <old> <new>` | Rename a profile |
 | `codex-switch delete <alias> [--yes]` | Remove an inactive profile from the account list and archive it for recovery; prompts by default |
@@ -194,7 +194,7 @@ Use aliases such as `work` or `personal` in place of `<alias>`. Run `codex-switc
 
 ## TUI Keyboard Shortcuts
 
-Press `Enter` to open the selected account menu. If accounts are marked, `Enter` opens the batch menu instead.
+Press `Enter` to open a selected account's scrollable details and actions. If accounts are marked, `Enter` opens the batch menu instead.
 
 | Key | Action |
 |-----|--------|
@@ -205,7 +205,7 @@ Press `Enter` to open the selected account menu. If accounts are marked, `Enter`
 | `a` | Add a new account |
 | `t` | Toggle auto-refresh |
 | `W` | Toggle auto-warmup for accounts whose 5h window has expired |
-| `i` | Show / hide the account detail panel |
+| `i` | Show / hide the compact quota panel on the home screen |
 | `s` | Cycle sort mode (name / quota / status) |
 | `Space` | Mark / unmark account for batch operations |
 | `u` (account menu) | Switch to selected account |
@@ -218,6 +218,14 @@ Press `Enter` to open the selected account menu. If accounts are marked, `Enter`
 | `h` | Show help |
 | `Esc` | Clear search/marks or close the active popup |
 | `q` | Quit |
+
+### Account details
+
+The account detail view is a single scrollable page. It shows identity and organization labels, local-time ID/access-token expiry, every quota pool, available reset cards, and the available models.
+
+- Each quota row shows the remaining percentage, a high-contrast pace marker, an over-pace/rest hint only when it applies, and the local reset time.
+- Model names and reasoning capabilities are fetched from the authenticated official Codex models response rather than being hardcoded. The list shows only the model name, its default reasoning level, and allowed levels. `low`, `medium`, `high`, `xhigh`, `max`, and `ultra` use green, cyan, yellow, light-purple, red, and purple respectively.
+- Token times use the system timezone. `expires` is the JWT expiry, not its issuance time. An ID token has a shorter lifetime than the access token and is refreshed when the authentication service returns a replacement; re-login obtains fresh credentials if it cannot be renewed.
 
 ## Updating
 
@@ -348,7 +356,7 @@ codex-switch daemon uninstall
 
 The Beta daemon uses the same adaptive scoring logic as `codex-switch use`. It refreshes the current account on each poll, switches only when `daemon.switch_threshold` is met or exceeded and a better candidate exists, refreshes all saved profile caches on `daemon.cache_refresh_interval_secs`, and refreshes expiring tokens on a separate timer. `daemon.auto_warmup = true` additionally warms inactive quota windows; it is off by default. Daemon switching is non-interactive: an untracked live `auth.json` may be replaced after its normal rotating backup is created. Save or import that account first if it must remain directly selectable. The daemon prepares future Codex launches; an already-running Codex process still needs to be restarted after a switch.
 
-While an interactive Codex session (`codex`, `codex resume`, `codex exec`) is running, the daemon holds the switch as pending and retries on the next poll; long-lived Codex infrastructure such as MCP servers and `app-server` hosts does not block switching. Set `daemon.defer_switch_while_codex_running = false` to switch immediately regardless. The daemon writes a state snapshot to `~/.codex-switch/daemon-state.json` (last poll, last switch, pending switch, last error) — shown by `codex-switch daemon status` — and logs to `~/.codex-switch/logs/` with daily rotation capped at 7 files.
+While an interactive Codex session (`codex`, `codex resume`, `codex exec`) is running, the daemon holds the switch as pending and retries on the next poll; long-lived Codex infrastructure such as MCP servers and `app-server` hosts does not block switching. Set `daemon.defer_switch_while_codex_running = false` to switch immediately regardless. The daemon writes a state snapshot to `~/.codex-switch/daemon-state.json` (last poll, last switch, pending switch, last error) — shown by `codex-switch daemon status`. All commands write diagnostic logs to `~/.codex-switch/logs/`; logs retain the latest three calendar days and never exceed 10 MiB in total.
 
 ### Scheduled token refresh via cron (optional)
 
@@ -494,7 +502,7 @@ Legacy `mode` and `min_remaining` are ignored with a warning in v0.0.13+.
 
 ### Token Auto-Refresh
 
-When a usage query returns HTTP 401/403, the tool automatically attempts to refresh the token using the stored `refresh_token`. If successful, the new tokens are persisted back to the profile and the live auth.json.
+Before usage and warmup requests, the tool refreshes an access token or ID token that is expired or about to expire. It also retries a request that returns HTTP 401/403. Successful refreshes are persisted back to the profile and the live `auth.json`; if a refresh response omits an ID token, the existing one is retained until a later refresh or re-login replaces it.
 
 ### Safety Notes
 

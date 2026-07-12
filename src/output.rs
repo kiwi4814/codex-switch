@@ -308,6 +308,20 @@ pub fn format_local_timestamp(ts: i64) -> String {
         .unwrap_or_else(|| "--".into())
 }
 
+/// Format a token expiry with an explicit state so past JWT `exp` values are
+/// never presented as a future expiration.
+pub fn format_token_expiry(ts: i64) -> String {
+    let Some(dt) = Local.timestamp_opt(ts, 0).single() else {
+        return "not reported".into();
+    };
+    let timestamp = dt.format("%Y-%m-%d %H:%M %:z");
+    if dt <= Local::now() {
+        format!("expired {timestamp}")
+    } else {
+        format!("expires {timestamp}")
+    }
+}
+
 pub fn format_local_datetime(value: &str) -> String {
     DateTime::parse_from_rfc3339(value)
         .map(|dt| {
@@ -590,5 +604,11 @@ mod tests {
 
         assert_eq!(rendered, expected);
         assert_eq!(format_local_datetime("not-a-date"), "unknown");
+    }
+
+    #[test]
+    fn token_expiry_marks_past_timestamps_as_expired() {
+        let text = format_token_expiry(crate::auth::now_unix_secs() - 60);
+        assert!(text.starts_with("expired "));
     }
 }

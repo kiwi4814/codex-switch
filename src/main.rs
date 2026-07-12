@@ -7,6 +7,7 @@ mod config;
 mod daemon;
 mod error;
 mod jwt;
+mod logging;
 mod login;
 mod output;
 mod profile;
@@ -68,21 +69,25 @@ async fn main() {
     } else {
         EnvFilter::new("codex_switch=error")
     };
-    // The daemon runs with stdio discarded (launchd / detached spawn), so its
-    // loop also logs to a rotating file. Everything else logs to stderr only.
-    let daemon_foreground = matches!(
-        &cli.command,
-        Commands::Daemon(cli::DaemonCommand::Start { foreground: true })
-    );
-    let mut _log_guard = None;
-    if daemon_foreground && let Ok((file_writer, guard)) = daemon::file_log_writer() {
+    // Keep diagnostic logs even when the daemon detaches and discards stdio.
+    // File logging failure must not prevent normal account switching.
+    let file_writer = match logging::file_log_writer() {
+        Ok(writer) => Some(writer),
+        Err(error) => {
+            eprintln!(
+                "{}",
+                color::warn(&format!("Warning: file logging is unavailable: {error}"))
+            );
+            None
+        }
+    };
+    if let Some(file_writer) = file_writer {
         use tracing_subscriber::fmt::writer::MakeWriterExt;
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_ansi(false)
             .with_writer(std::io::stderr.and(file_writer))
             .init();
-        _log_guard = Some(guard);
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -97,12 +102,13 @@ async fn main() {
     let result = dispatch(cli.command, use_json).await;
 
     if let Err(e) = result {
+        tracing::error!(error = %format!("{e:#}"), "command failed");
         if use_json {
             if e.downcast_ref::<OutputAlreadyReported>().is_none() {
-                print_error(&e.to_string());
+                print_error(&format!("{e:#}"));
             }
         } else {
-            eprintln!("{}", color::error(&format!("Error: {e}")));
+            eprintln!("{}", color::error(&format!("Error: {e:#}")));
         }
         std::process::exit(1);
     }

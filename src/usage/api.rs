@@ -37,6 +37,12 @@ fn usage_url() -> String {
     std::env::var("CS_USAGE_URL").unwrap_or_else(|_| USAGE_URL.to_string())
 }
 
+fn token_needs_refresh(access_token: &str, id_token: Option<&str>, margin_secs: i64) -> bool {
+    crate::jwt::is_token_expiring(access_token, margin_secs).unwrap_or(false)
+        || id_token
+            .is_some_and(|token| crate::jwt::is_token_expiring(token, margin_secs).unwrap_or(false))
+}
+
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 /// Extract a short summary from an error message for user-facing display.
@@ -218,11 +224,12 @@ pub async fn fetch_usage_with_refresh(
     let client = auth::build_http_client()?;
     let usage_url = usage_url();
 
-    // Pre-refresh: if access_token expires within 60 seconds, refresh proactively.
+    // Refresh when either JWT is near expiry so account identity metadata does
+    // not remain stale while the access token is still usable.
     if let Some(rt) = refresh_token
-        && crate::jwt::is_token_expiring(access_token, 60).unwrap_or(false)
+        && token_needs_refresh(access_token, id_token, 60)
     {
-        info!("[{alias}] access token expiring soon, proactively refreshing");
+        info!("[{alias}] token expiring soon, proactively refreshing");
 
         match do_refresh_token(alias, &client, id_token, Some(access_token), rt).await {
             Ok(new_tokens) => {
@@ -519,7 +526,14 @@ pub async fn refresh_expiring_tokens() {
         let id_token = auth::extract_id_token(&val);
         let Some(at) = access_token else { continue };
         let Some(rt) = refresh_token else { continue };
-        let Some(exp) = crate::jwt::token_expires_at(&at) else {
+        let expiry = [
+            crate::jwt::token_expires_at(&at),
+            id_token.as_deref().and_then(crate::jwt::token_expires_at),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let Some(exp) = expiry else {
             continue;
         };
         let remaining = exp - now;
@@ -587,7 +601,22 @@ pub async fn refresh_expiring_tokens() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::json;
+
+    fn jwt_with_exp(exp: i64) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": exp}).to_string());
+        format!("header.{payload}.signature")
+    }
+
+    #[test]
+    fn expired_id_token_triggers_refresh_before_access_token_expires() {
+        let now = crate::auth::now_unix_secs();
+        let access = jwt_with_exp(now + 86_400);
+        let id = jwt_with_exp(now - 60);
+
+        assert!(token_needs_refresh(&access, Some(&id), 60));
+    }
 
     #[test]
     fn test_refresh_request_uses_json_body_like_codex() {

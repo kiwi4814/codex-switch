@@ -217,12 +217,12 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
                 }
             }
             Err(e) => {
+                let detail = format!("{e:#}");
+                tracing::error!(alias = %alias, error = %detail, "warmup failed");
                 if json {
-                    results.push(
-                        serde_json::json!({"alias": alias, "ok": false, "error": e.to_string()}),
-                    );
+                    results.push(serde_json::json!({"alias": alias, "ok": false, "error": detail}));
                 } else {
-                    user_println(&format!("  {} failed: {}", color::error(&alias), e));
+                    user_println(&format!("  {} failed: {}", color::error(&alias), detail));
                 }
                 had_error = true;
             }

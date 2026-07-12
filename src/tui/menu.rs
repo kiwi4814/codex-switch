@@ -9,7 +9,7 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use super::popup::{PopupState, render_popup, render_responsive_split_popup};
+use super::popup::{PopupState, render_popup};
 
 const C_WHITE: Color = Color::Rgb(240, 240, 240);
 const DIM: Color = Color::Rgb(120, 120, 120);
@@ -17,6 +17,7 @@ const C_RED: Color = Color::Rgb(255, 90, 90);
 const C_GREEN: Color = Color::Rgb(80, 220, 120);
 const C_YELLOW: Color = Color::Rgb(255, 220, 80);
 const C_CYAN: Color = Color::Rgb(100, 210, 255);
+const C_PURPLE: Color = Color::Rgb(145, 90, 220);
 
 /// Active menu state. Only one menu is visible at a time.
 pub enum MenuState {
@@ -119,26 +120,6 @@ fn quota_window_lines(
     } else {
         C_GREEN
     };
-    let mut spans = vec![Span::styled(
-        format!("{label:<3} "),
-        Style::default().fg(C_WHITE),
-    )];
-    spans.push(Span::styled(
-        "█".repeat(used_width),
-        Style::default().fg(used_color),
-    ));
-    spans.push(Span::styled(
-        "░".repeat(BAR_WIDTH.saturating_sub(used_width)),
-        Style::default().fg(DIM),
-    ));
-    spans.push(Span::styled(
-        format!("  {remaining:.0}% left"),
-        Style::default().fg(if remaining <= 10.0 { C_RED } else { C_YELLOW }),
-    ));
-    let reset = window
-        .resets_at
-        .map(crate::output::format_local_timestamp)
-        .unwrap_or_else(|| "--".to_string());
     let window_secs = window
         .window_minutes
         .map(|minutes| minutes.saturating_mul(60))
@@ -150,43 +131,90 @@ fn quota_window_lines(
             }
         });
     let pace = crate::usage::pace_percent(window, window_secs);
-    let pace_line = pace.map(|pace| {
-        let delta = used - pace;
-        let state = if delta > 0.0 {
-            format!("{delta:.0}% over")
-        } else if delta < 0.0 {
-            format!("{:.0}% under", -delta)
-        } else {
-            "on pace".to_string()
-        };
-        let rest = if delta > 0.0 {
-            let seconds = ((delta * window_secs as f64 / 100.0) as i64).max(1);
-            format!(" · Rest {} to pace", format_duration(seconds))
-        } else {
-            " · Rest not needed".to_string()
-        };
-        format!("    Pace {pace:.0}% expected · {state}{rest}")
+    let pace_index = pace.map(|value| {
+        ((value / 100.0) * BAR_WIDTH as f64)
+            .round()
+            .clamp(0.0, (BAR_WIDTH - 1) as f64) as usize
     });
+    let mut spans = vec![Span::styled(
+        format!("{label:<3} "),
+        Style::default().fg(C_WHITE),
+    )];
+    for index in 0..BAR_WIDTH {
+        let (symbol, style) = if Some(index) == pace_index {
+            (
+                "┃",
+                Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+            )
+        } else if index < used_width {
+            ("█", Style::default().fg(used_color))
+        } else {
+            ("░", Style::default().fg(DIM))
+        };
+        spans.push(Span::styled(symbol, style));
+    }
+    spans.push(Span::styled(
+        format!("  {remaining:.0}% left"),
+        Style::default().fg(if remaining <= 10.0 { C_RED } else { C_YELLOW }),
+    ));
+    if let Some(pace) = pace {
+        let delta = used - pace;
+        if delta > 0.0 {
+            let seconds = ((delta * window_secs as f64 / 100.0) as i64).max(1);
+            spans.push(Span::styled(
+                format!(
+                    " · {delta:.0}% over pace · rest {}",
+                    format_duration(seconds)
+                ),
+                Style::default().fg(C_YELLOW),
+            ));
+        }
+    }
     let reset_relative = window
         .resets_at
         .map(crate::output::format_reset_time)
         .unwrap_or_else(|| "--".to_string());
-    let mut lines = vec![Line::from(spans)];
-    if let Some(pace_line) = pace_line {
-        lines.push(Line::from(Span::styled(
-            pace_line,
-            Style::default().fg(if used > pace.unwrap_or(used) {
-                C_YELLOW
-            } else {
-                DIM
-            }),
-        )));
-    }
-    lines.push(Line::from(Span::styled(
-        format!("    Reset {reset} · {reset_relative}"),
+    spans.push(Span::styled(
+        format!(" · reset {reset_relative}"),
         Style::default().fg(DIM),
-    )));
-    lines
+    ));
+    vec![Line::from(spans)]
+}
+
+fn reasoning_style(effort: &str) -> Style {
+    match effort {
+        "low" => Style::default().fg(C_GREEN),
+        "medium" => Style::default().fg(C_CYAN),
+        "high" => Style::default().fg(C_YELLOW),
+        "xhigh" => Style::default().fg(Color::LightMagenta),
+        "max" => Style::default().fg(C_RED),
+        "ultra" => Style::default().fg(C_PURPLE),
+        _ => Style::default().fg(DIM),
+    }
+}
+
+fn model_line_spans(model: &str, label_style: Style) -> Vec<Span<'static>> {
+    let model = model.trim();
+    let Some((name, details)) = model.split_once(" · default ") else {
+        return vec![Span::styled(model.to_string(), label_style)];
+    };
+    let Some((default, allowed)) = details.split_once(" · allowed ") else {
+        return vec![Span::styled(model.to_string(), label_style)];
+    };
+
+    let mut spans = vec![
+        Span::styled(name.to_string(), label_style),
+        Span::styled(" · default ", Style::default().fg(DIM)),
+        Span::styled(default.to_string(), reasoning_style(default)),
+        Span::styled(" · allowed ", Style::default().fg(DIM)),
+    ];
+    for (index, effort) in allowed.split(", ").enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(", ", Style::default().fg(DIM)));
+        }
+        spans.push(Span::styled(effort.to_string(), reasoning_style(effort)));
+    }
+    spans
 }
 
 fn format_duration(seconds: i64) -> String {
@@ -490,27 +518,15 @@ impl MenuState {
                         Span::styled(note, dim),
                     ]));
                 }
-                let mut right_lines = vec![Line::from(Span::styled(
-                    "Models",
+                left_lines.push(Line::from(""));
+                left_lines.push(Line::from(Span::styled(
+                    format!("Models ({})", info.models.len()),
                     header_style.add_modifier(Modifier::BOLD),
-                ))];
-                let mut first_model = true;
+                )));
                 for model in &info.models {
-                    if model.starts_with("    ") {
-                        right_lines.push(Line::from(Span::styled(model.clone(), dim)));
-                    } else {
-                        if !first_model {
-                            right_lines.push(Line::from(""));
-                        }
-                        first_model = false;
-                        right_lines.push(Line::from(vec![
-                            Span::styled("● ", Style::default().fg(C_CYAN)),
-                            Span::styled(
-                                model.trim().to_string(),
-                                Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                    }
+                    let mut spans = vec![Span::styled("● ", Style::default().fg(C_CYAN))];
+                    spans.extend(model_line_spans(model, label_style));
+                    left_lines.push(Line::from(spans));
                 }
                 left_lines.push(Line::from(""));
                 left_lines.push(Line::from(Span::styled(
@@ -545,10 +561,10 @@ impl MenuState {
                 }
                 left_lines.push(Line::from(""));
                 left_lines.push(Line::from(Span::styled(
-                    "j k / arrows / PgUp PgDn scroll models · esc / q cancel",
+                    "j k / arrows / PgUp PgDn scroll details · esc / q cancel",
                     dim,
                 )));
-                render_responsive_split_popup(f, title, &left_lines, &right_lines, popup, area);
+                render_popup(f, title, &left_lines, popup, area);
             }
             MenuState::Add { popup } => {
                 let title = "Add new account";
@@ -661,9 +677,12 @@ fn menu_items(items: &[(&str, &str)], key_style: Style, label_style: Style) -> V
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{Terminal, backend::TestBackend, crossterm::event::KeyCode};
+    use ratatui::{Terminal, backend::TestBackend, crossterm::event::KeyCode, style::Color};
 
-    use super::{AccountMenuInfo, MenuAction, MenuState, quota_lines};
+    use super::{
+        AccountMenuInfo, C_CYAN, C_GREEN, C_PURPLE, C_RED, C_YELLOW, MenuAction, MenuState,
+        model_line_spans, quota_lines,
+    };
     use crate::usage::{AdditionalRateLimit, UsageInfo, WindowUsage};
 
     fn find_text(backend: &TestBackend, needle: &str) -> Option<(u16, u16)> {
@@ -750,15 +769,37 @@ mod tests {
         assert!(text.contains("Main"));
         assert!(text.contains("GPT-6-Codex-Burst"));
         assert!(text.contains('█'));
+        assert!(text.contains('┃'));
         assert!(text.contains("20% left"));
-        assert!(text.contains("Pace"));
-        assert!(text.contains("Reset"));
-        assert!(text.contains("Rest"));
-        assert!(text.contains("to pace"));
+        assert!(text.contains("reset"));
+        assert!(text.contains("over pace"));
+        assert!(!text.contains("Pace"));
+        assert!(!text.contains("Rest"));
     }
 
     #[test]
-    fn realistic_account_detail_keeps_models_in_the_right_column() {
+    fn model_reasoning_efforts_use_semantic_colors() {
+        let spans = model_line_spans(
+            "GPT-5.6-Sol · default medium · allowed low, medium, high, xhigh, max, ultra",
+            ratatui::style::Style::default(),
+        );
+        let color_for = |effort: &str| {
+            spans
+                .iter()
+                .find(|span| span.content == effort)
+                .and_then(|span| span.style.fg)
+        };
+
+        assert_eq!(color_for("low"), Some(C_GREEN));
+        assert_eq!(color_for("medium"), Some(C_CYAN));
+        assert_eq!(color_for("high"), Some(C_YELLOW));
+        assert_eq!(color_for("xhigh"), Some(Color::LightMagenta));
+        assert_eq!(color_for("max"), Some(C_RED));
+        assert_eq!(color_for("ultra"), Some(C_PURPLE));
+    }
+
+    #[test]
+    fn realistic_account_detail_keeps_models_in_the_single_column() {
         let now = crate::auth::now_unix_secs();
         let window = WindowUsage {
             used_percent: Some(50.0),
@@ -806,6 +847,6 @@ mod tests {
             .unwrap();
 
         let models = find_text(terminal.backend(), "Models").expect("models heading");
-        assert!(models.0 > 80, "models should remain in the right column");
+        assert!(models.0 < 80, "models should follow the account details");
     }
 }

@@ -19,6 +19,8 @@ mod daemon;
 mod error;
 pub mod jwt;
 #[allow(dead_code)]
+mod logging;
+#[allow(dead_code)]
 mod login;
 #[allow(dead_code)]
 mod output;

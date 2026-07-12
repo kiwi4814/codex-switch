@@ -9,24 +9,6 @@ use crate::cli::DaemonCommand;
 use crate::output::{print_json, user_println};
 use anyhow::Result;
 
-/// Rolling file logger for the daemon (`~/.codex-switch/logs/daemon.log.*`),
-/// daily rotation capped at 7 files. launchd and the detached spawn discard
-/// stdio, so without this the daemon's tracing output is lost entirely.
-pub fn file_log_writer() -> Result<(
-    tracing_appender::non_blocking::NonBlocking,
-    tracing_appender::non_blocking::WorkerGuard,
-)> {
-    let dir = crate::auth::app_home()?.join("logs");
-    std::fs::create_dir_all(&dir)?;
-    let appender = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("daemon")
-        .filename_suffix("log")
-        .max_log_files(7)
-        .build(&dir)?;
-    Ok(tracing_appender::non_blocking(appender))
-}
-
 pub async fn dispatch(cmd: DaemonCommand, json: bool) -> Result<()> {
     match cmd {
         DaemonCommand::Start { foreground } => start(foreground).await,

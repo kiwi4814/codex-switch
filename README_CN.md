@@ -49,7 +49,7 @@ codex-switch tui
 
 - **账号管理** — 保存、切换、重命名、删除 Codex 账号
 - **自动探测** — 自动发现并追踪当前 `auth.json`
-- **用量仪表盘** — 主额度及 API 返回的每个附加模型额度池都使用彩色 5h/7d 进度条展示；账号详情页同时呈现额度图形与官方模型名称、介绍
+- **用量仪表盘** — 主额度及 API 返回的每个附加模型额度池都使用彩色 5h/7d 进度条展示；账号详情页以单列滚动方式集中呈现身份、额度、重置卡和模型能力
 - **重置卡（v0.0.20）** — 展示 Codex reset card 数量和过期时间，并可在 CLI 或 TUI 中确认后消耗最早过期的可用重置卡
 - **自适应智能切换** — `codex-switch use` 不带参数时通过统一的 5 组件自适应评分算法自动选择最优账号，Team 账号默认优先
 - **后台守护进程（Beta）** — 可选的 `daemon` 命令在 macOS 使用 LaunchAgent、Linux 使用 systemd 用户服务、Windows 使用任务计划程序（Task Scheduler）
@@ -57,10 +57,10 @@ codex-switch tui
 - **进度展示** — 大批量 `use`、`list`、目录 `import` 统一显示单行跨平台进度条
 - **交互式 TUI** — 完整的终端界面，实时用量数据、颜色状态、键盘快捷键
 - **OAuth 登录** — 内置 PKCE 浏览器登录流程，无需手动复制 token
-- **Token 自动刷新** — 使用 refresh_token 自动刷新过期 token
+- **Token 自动刷新** — 在请求失败前使用 refresh_token 刷新即将过期的 access 或 ID token
 - **批量导入校验** — 支持单文件导入，也支持递归扫描目录、分阶段校验并自动分配不重复别名
-- **配速标记** — 用量条上显示基于窗口已过时间的预期消耗位置，直观判断用量快慢
-- **预热** — `warmup` 会启动主额度窗口，并根据已认证模型列表预热所有可匹配的 `codex_*` 独立模型额度池；已激活账号自动跳过
+- **配速标记** — 用量条上以高对比度标记显示基于窗口已过时间的预期消耗位置
+- **预热** — `warmup` 会启动主额度窗口及该账号所有匹配的独立模型额度池（包括 Pro 20× Spark）；已激活账号自动跳过
 - **手动自更新** — `self-update --check` 按需检查 GitHub Releases，`self-update` 更新直装版本（支持 stable 和 dev 双渠道）
 - **启动 Codex** — `launch` 使用指定（或最佳）账号的认证启动 Codex CLI，透传所有参数。认证仅在启动时短暂替换，codex 读取后立即还原，不阻塞其他操作
 - **超速预警** — 当用量超过预期配速时，5h/7d 列显示红色 `!` 标记
@@ -166,7 +166,7 @@ sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 | `codex-switch list [-f]` | 显示所有账号信息、用量和可用状态（`-f` 强制刷新，忽略缓存） |
 | `codex-switch reset-card <别名> [--yes]` | 消耗该账号最早过期的可用 Codex reset card。默认会先确认；JSON 模式需要 `--yes` |
 | `codex-switch launch [别名] [--consume-card] [-- 参数...]` | 用指定账号的认证启动 Codex CLI。不带别名则自适应评分自动选择，`--consume-card` 行为与 `use` 相同。`--` 后的参数透传给 codex |
-| `codex-switch warmup [别名]` | 发送最小请求以触发 5h/7d 配额窗口倒计时。不带别名则预热所有账号 |
+| `codex-switch warmup [别名]` | 发送最小请求以触发主额度及匹配模型额度的 5h/7d 配额窗口倒计时。不带别名则预热所有账号 |
 | `codex-switch login [--device] [别名]` | OAuth 登录（`--device` 用于无浏览器的服务器）。若别名已存在则重新授权 |
 | `codex-switch rename <旧别名> <新别名>` | 重命名账号 |
 | `codex-switch delete <别名> [--yes]` | 从账号列表移除非激活 profile，并归档以便恢复；默认会先确认 |
@@ -193,7 +193,7 @@ sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 
 ## TUI 快捷键
 
-按 `Enter` 打开选中账号的操作菜单；如果已有账号被标记，则打开批量操作菜单。
+按 `Enter` 打开选中账号的可滚动详情与操作；如果已有账号被标记，则打开批量操作菜单。
 
 | 按键 | 操作 |
 |------|------|
@@ -204,7 +204,7 @@ sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 | `a` | 添加新账号 |
 | `t` | 开关自动刷新 |
 | `W` | 开关自动预热 5h 窗口已过期的账号 |
-| `i` | 显示/隐藏账号详情面板 |
+| `i` | 显示/隐藏首页的紧凑额度面板 |
 | `s` | 切换排序（名称/配额/状态） |
 | `Space` | 标记/取消标记账号 |
 | `u`（账号菜单） | 切换到选中账号 |
@@ -217,6 +217,14 @@ sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 | `h` | 显示帮助 |
 | `Esc` | 清除搜索/标记，或关闭当前弹窗 |
 | `q` | 退出 |
+
+### 账号详情
+
+账号详情为单列可滚动页面，展示身份与组织标签、按本机时区输出的 ID/access token 到期时间、全部额度池、可用重置卡以及可使用模型。
+
+- 每条额度行显示剩余百分比、高对比度配速标记；只有超出配速时才显示休息建议，并显示本地重置时间。
+- 模型名称与思考能力从已认证账号的官方 Codex models 响应动态获取，不写死在程序中。列表只展示模型名称、默认思考强度和允许强度。`low`、`medium`、`high`、`xhigh`、`max`、`ultra` 分别使用绿色、青色、黄色、浅紫色、红色、紫色。
+- Token 时间使用系统时区。`expires` 是 JWT 的到期时间而非签发时间。ID token 的有效期通常短于 access token；认证服务返回新版时会自动更新，无法续期时可重新登录获取新凭据。
 
 ## 更新方式
 
@@ -347,7 +355,7 @@ codex-switch daemon uninstall
 
 Beta 守护进程使用与 `codex-switch use` 相同的自适应评分逻辑。它在每次轮询时刷新当前账号，仅在 `daemon.switch_threshold` 达到或超过阈值且存在更好的候选账号时才切换；按 `daemon.cache_refresh_interval_secs` 刷新所有已保存账号的缓存，并在独立定时器上刷新即将过期的 Token。`daemon.auto_warmup = true` 还会预热未激活的配额窗口，默认关闭。daemon 切换无法交互确认：未跟踪的实时 `auth.json` 会在正常轮转备份后被替换；需要保留为可直接选择的账号时，应先保存或导入。守护进程为未来的 Codex 启动做准备；已运行的 Codex 进程在切换后仍需重启。
 
-当交互式 Codex 会话（`codex`、`codex resume`、`codex exec`）正在运行时，daemon 会把切换挂起为 pending 并在下次轮询重试；MCP server、`app-server` 等常驻 Codex 基础设施不会阻塞切换。设置 `daemon.defer_switch_while_codex_running = false` 可无视会话立即切换。daemon 会把状态快照写入 `~/.codex-switch/daemon-state.json`（上次轮询/上次切换/挂起切换/最近错误），`codex-switch daemon status` 会展示；日志写入 `~/.codex-switch/logs/`，按天轮转、最多保留 7 个文件。
+当交互式 Codex 会话（`codex`、`codex resume`、`codex exec`）正在运行时，daemon 会把切换挂起为 pending 并在下次轮询重试；MCP server、`app-server` 等常驻 Codex 基础设施不会阻塞切换。设置 `daemon.defer_switch_while_codex_running = false` 可无视会话立即切换。daemon 会把状态快照写入 `~/.codex-switch/daemon-state.json`（上次轮询/上次切换/挂起切换/最近错误），`codex-switch daemon status` 会展示。所有命令的诊断日志写入 `~/.codex-switch/logs/`，保留最近 3 个日历日，目录总量不超过 10 MiB。
 
 ### 定时刷新 Token（可选）
 
@@ -493,7 +501,7 @@ v0.0.13+ 不再有模式选择。此统一算法替代了之前的 `max-remainin
 
 ### Token 自动刷新
 
-当用量查询返回 HTTP 401/403 时，工具自动尝试使用存储的 `refresh_token` 刷新 token。刷新成功后，新 token 会写回 profile 文件和当前的 auth.json。
+在用量或预热请求前，工具会刷新已经到期或即将到期的 access token、ID token；遇到 HTTP 401/403 也会重试刷新。成功后的 token 会写回 profile 和实时 `auth.json`。若刷新响应没有提供 ID token，会保留现有值，直到后续刷新或重新登录替换。
 
 ### 安全说明
 

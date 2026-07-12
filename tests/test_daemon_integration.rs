@@ -281,12 +281,12 @@ async fn daemon_start_switch_status_and_stop() {
     );
 
     // The daemon runs with stdio discarded, so its loop must log to the
-    // rotating file under app_home/logs.
+    // capped daily file under app_home/logs.
     wait_until(Duration::from_secs(10), "daemon writes a log file", || {
         std::fs::read_dir(env.app_home().join("logs"))
             .map(|entries| {
                 entries.flatten().any(|e| {
-                    e.file_name().to_string_lossy().starts_with("daemon")
+                    e.file_name().to_string_lossy().starts_with("codex-switch.")
                         && e.metadata().is_ok_and(|m| m.len() > 0)
                 })
             })

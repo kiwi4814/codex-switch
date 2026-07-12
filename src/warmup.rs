@@ -274,7 +274,7 @@ fn select_warmup_models(
 ) -> Result<Vec<String>> {
     let visible: Vec<&ModelEntry> = models
         .iter()
-        .filter(|m| m.visibility.as_deref() != Some("hide") && m.supported_in_api != Some(false))
+        .filter(|m| m.visibility.as_deref() != Some("hide"))
         .collect();
 
     if visible.is_empty() {
@@ -338,7 +338,9 @@ fn select_warmup_models(
     let main_candidates: Vec<&ModelEntry> = visible
         .iter()
         .copied()
-        .filter(|model| !additional_slugs.contains(model.slug.as_str()))
+        .filter(|model| {
+            model.supported_in_api != Some(false) && !additional_slugs.contains(model.slug.as_str())
+        })
         .collect();
 
     // Prefer mini (lightest), fall back to highest priority (lowest number).
@@ -908,7 +910,7 @@ mod tests {
                 display_name: None,
                 visibility: Some("List".to_string()),
                 priority: Some(26),
-                supported_in_api: Some(true),
+                supported_in_api: Some(false),
                 ..Default::default()
             },
         ];

@@ -334,14 +334,13 @@ impl App {
         let usage_meta: Vec<String> = loaded_usage
             .map(|usage| {
                 let mut items = Vec::new();
-                if let Some(fetched_at) = usage.fetched_at {
-                    items.push(format!("  updated {}", format_local_timestamp(fetched_at)));
-                }
-                if usage.account_limited {
-                    items.push("  Account access is currently limited".to_string());
-                }
-                if let Some(reason) = &usage.rate_limit_reached_type {
-                    items.push(format!("  Reason: {}", reason.replace(['_', '-'], " ")));
+                if usage.account_limited || usage.rate_limit_reached_type.is_some() {
+                    let reason = usage
+                        .rate_limit_reached_type
+                        .as_deref()
+                        .map(|value| format!(" · {}", value.replace(['_', '-'], " ")))
+                        .unwrap_or_default();
+                    items.push(format!("  Status  limited{reason}"));
                 }
                 if usage.unlimited_credits == Some(true) {
                     items.push("  credits unlimited".to_string());
@@ -352,7 +351,7 @@ impl App {
                     items.push("  Reset-card details are temporarily unavailable".to_string());
                 }
                 if let Some(limit) = &usage.individual_limit {
-                    let mut parts = vec!["  Monthly API limit".to_string()];
+                    let mut parts = vec!["  Monthly API".to_string()];
                     if let Some(value) = &limit.limit {
                         parts.push(format!("{value} total"));
                     }
@@ -368,7 +367,9 @@ impl App {
                     if let Some(value) = limit.resets_at {
                         parts.push(format!("resets {}", format_local_timestamp(value)));
                     }
-                    items.push(parts.join(" · "));
+                    if parts.len() > 1 {
+                        items.push(parts.join(" · "));
+                    }
                 }
                 items
             })
@@ -379,15 +380,11 @@ impl App {
         let models: Vec<String> = match self.model_cache.get(&entry.alias) {
             Some(ModelStatus::Loaded(models)) => crate::warmup::sorted_models_for_display(models)
                 .into_iter()
-                .flat_map(|model| {
+                .map(|model| {
                     let label = match &model.display_name {
-                        Some(name) => format!("  {name}"),
-                        None => format!("  {}", model.slug),
+                        Some(name) => name.clone(),
+                        None => model.slug.clone(),
                     };
-                    let mut lines = vec![label];
-                    if let Some(description) = &model.description {
-                        lines.push(format!("    {description}"));
-                    }
                     let default = model
                         .default_reasoning_effort
                         .as_deref()
@@ -397,18 +394,12 @@ impl App {
                     } else {
                         model.supported_reasoning_efforts.join(", ")
                     };
-                    lines.push(format!(
-                        "    Reasoning  default {default} · allowed {allowed}"
-                    ));
-                    lines
+                    format!("  {label} · default {default} · allowed {allowed}")
                 })
                 .collect(),
             Some(ModelStatus::Error(error)) => vec![format!("  error: {error}")],
             _ => vec!["  loading...".to_string()],
-        }
-        .into_iter()
-        .flat_map(wrap_account_detail_line)
-        .collect();
+        };
         let auth_expiries = profile_auth_path(&entry.alias)
             .ok()
             .and_then(|path| auth::read_auth(&path).ok())
@@ -416,18 +407,18 @@ impl App {
                 let mut expiries = Vec::new();
                 if let Some(token) = auth::extract_id_token(&auth) {
                     let expiry = crate::jwt::token_expires_at(&token)
-                        .map(format_local_timestamp)
+                        .map(crate::output::format_token_expiry)
                         .unwrap_or_else(|| "not reported".into());
-                    expiries.push(format!("ID token · expires {}", expiry));
+                    expiries.push(format!("ID token · {expiry}"));
                 }
                 if let Some(token) = auth
                     .pointer("/tokens/access_token")
                     .and_then(serde_json::Value::as_str)
                 {
                     let expiry = crate::jwt::token_expires_at(token)
-                        .map(format_local_timestamp)
+                        .map(crate::output::format_token_expiry)
                         .unwrap_or_else(|| "not reported".into());
-                    expiries.push(format!("Access token · expires {}", expiry));
+                    expiries.push(format!("Access token · {expiry}"));
                 }
                 expiries
             })
@@ -838,7 +829,10 @@ impl App {
             let _permit = limiter.acquire().await;
             let result = crate::warmup::warmup_account(&alias, &path)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| {
+                    tracing::error!(alias = %alias, error = %format!("{e:#}"), "warmup failed");
+                    format!("{e:#}")
+                });
             let _ = tx.send((task_id, alias, result)).await;
         });
     }
@@ -1994,14 +1988,8 @@ mod tests {
         let Some(super::super::menu::MenuState::Account { info, .. }) = app.menu else {
             panic!("account detail should remain open");
         };
-        assert!(info.models.iter().any(|line| line == "  Official Name"));
-        assert!(
-            info.models
-                .iter()
-                .any(|line| line.trim() == "Official description")
-        );
         assert!(info.models.iter().any(|line| {
-            line.trim() == "Reasoning  default medium · allowed low, medium, high"
+            line.trim() == "Official Name · default medium · allowed low, medium, high"
         }));
         assert!(!info.models.iter().any(|line| {
             line.contains("official-slug")
