@@ -75,12 +75,48 @@ fn build_models_request(
     )
 }
 
-async fn fetch_warmup_model(
+/// One entry from the `/models` endpoint's `models[]` array.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ModelEntry {
+    pub slug: String,
+    pub display_name: Option<String>,
+    pub visibility: Option<String>,
+    pub priority: Option<i64>,
+    pub supported_in_api: Option<bool>,
+    pub context_window: Option<u64>,
+}
+
+/// Parse the `/models` endpoint's JSON body into a `Vec<ModelEntry>`. Entries
+/// missing a `slug` are skipped; other fields are treated as optional
+/// (defensively ignoring unknown fields per the upstream contract).
+fn parse_models_body(body: &serde_json::Value) -> Result<Vec<ModelEntry>> {
+    let models = body["models"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("no models array in response"))?;
+
+    Ok(models
+        .iter()
+        .filter_map(|m| {
+            let slug = m["slug"].as_str()?.to_string();
+            Some(ModelEntry {
+                slug,
+                display_name: m["display_name"].as_str().map(String::from),
+                visibility: m["visibility"].as_str().map(String::from),
+                priority: m["priority"].as_i64(),
+                supported_in_api: m["supported_in_api"].as_bool(),
+                context_window: m["context_window"].as_u64(),
+            })
+        })
+        .collect())
+}
+
+/// Fetch and parse the full model list from the `/models` endpoint.
+pub(crate) async fn fetch_models(
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
-) -> Result<String> {
+) -> Result<Vec<ModelEntry>> {
     let resp = build_models_request(
         client,
         access_token,
@@ -97,13 +133,20 @@ async fn fetch_warmup_model(
     }
 
     let body: serde_json::Value = resp.json().await?;
-    let models = body["models"]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("no models array in response"))?;
+    parse_models_body(&body)
+}
 
-    let visible: Vec<&serde_json::Value> = models
+async fn fetch_warmup_model(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+) -> Result<String> {
+    let models = fetch_models(client, access_token, account_id, is_fedramp).await?;
+
+    let visible: Vec<&ModelEntry> = models
         .iter()
-        .filter(|m| m["visibility"].as_str() != Some("hide"))
+        .filter(|m| m.visibility.as_deref() != Some("hide"))
         .collect();
 
     if visible.is_empty() {
@@ -113,13 +156,13 @@ async fn fetch_warmup_model(
     // Prefer mini (lightest), fall back to highest priority (lowest number)
     let selected = visible
         .iter()
-        .find(|m| m["slug"].as_str().is_some_and(|s| s.contains("mini")))
+        .find(|m| m.slug.contains("mini"))
         .or_else(|| {
             visible
                 .iter()
-                .min_by_key(|m| m["priority"].as_i64().unwrap_or(i64::MAX))
+                .min_by_key(|m| m.priority.unwrap_or(i64::MAX))
         })
-        .and_then(|m| m["slug"].as_str())
+        .map(|m| m.slug.as_str())
         .unwrap_or(FALLBACK_MODEL);
 
     debug!("warmup: model selected from API: {selected}");
@@ -398,6 +441,63 @@ mod tests {
             model_cache_get(&cache, "account-b"),
             Some("model-b".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_models_body_full_entry() {
+        let body = serde_json::json!({
+            "models": [{
+                "slug": "gpt-5.3-codex",
+                "display_name": "GPT-5.3 Codex",
+                "visibility": "List",
+                "priority": 1,
+                "supported_in_api": true,
+                "context_window": 128000
+            }]
+        });
+
+        let models = parse_models_body(&body).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0],
+            ModelEntry {
+                slug: "gpt-5.3-codex".to_string(),
+                display_name: Some("GPT-5.3 Codex".to_string()),
+                visibility: Some("List".to_string()),
+                priority: Some(1),
+                supported_in_api: Some(true),
+                context_window: Some(128000),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_models_body_missing_optional_fields() {
+        let body = serde_json::json!({
+            "models": [{"slug": "gpt-5-mini"}]
+        });
+
+        let models = parse_models_body(&body).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].slug, "gpt-5-mini");
+        assert_eq!(models[0].display_name, None);
+        assert_eq!(models[0].visibility, None);
+        assert_eq!(models[0].priority, None);
+        assert_eq!(models[0].supported_in_api, None);
+        assert_eq!(models[0].context_window, None);
+    }
+
+    #[test]
+    fn test_parse_models_body_empty_list() {
+        let body = serde_json::json!({"models": []});
+        let models = parse_models_body(&body).unwrap();
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn test_parse_models_body_missing_array_errors() {
+        let body = serde_json::json!({});
+        assert!(parse_models_body(&body).is_err());
     }
 
     #[test]

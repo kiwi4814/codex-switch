@@ -5,7 +5,7 @@ use tracing::{debug, warn};
 use crate::auth;
 
 use super::reset_credits::parse_reset_credits_summary;
-use super::{UsageInfo, WindowUsage};
+use super::{AdditionalRateLimit, UsageInfo, WindowUsage};
 
 pub(super) fn parse_optional_u64(value: Option<&Value>) -> Option<u64> {
     match value? {
@@ -27,6 +27,46 @@ fn parse_window(val: &Value) -> Option<WindowUsage> {
         used_percent,
         resets_at,
     })
+}
+
+/// Parse `additional_rate_limits[]`. Malformed entries (missing/non-object
+/// `rate_limit`) are skipped rather than failing the whole parse.
+fn parse_additional_rate_limits(body: &Value) -> Vec<AdditionalRateLimit> {
+    let Some(items) = body.get("additional_rate_limits").and_then(Value::as_array) else {
+        return vec![];
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let rate_limit = item.get("rate_limit")?;
+            if !rate_limit.is_object() {
+                return None;
+            }
+            let primary = rate_limit
+                .get("primary_window")
+                .filter(|v| !v.is_null())
+                .and_then(parse_window);
+            let secondary = rate_limit
+                .get("secondary_window")
+                .filter(|v| !v.is_null())
+                .and_then(parse_window);
+            Some(AdditionalRateLimit {
+                limit_name: item
+                    .get("limit_name")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                metered_feature: item
+                    .get("metered_feature")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                allowed: rate_limit.get("allowed").and_then(Value::as_bool),
+                limit_reached: rate_limit.get("limit_reached").and_then(Value::as_bool),
+                primary,
+                secondary,
+            })
+        })
+        .collect()
 }
 
 fn known_rate_limit_reached_type(body: &Value) -> bool {
@@ -157,6 +197,8 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
         .map(parse_reset_credits_summary)
         .unwrap_or((None, vec![], false));
 
+    let additional_limits = parse_additional_rate_limits(body);
+
     UsageInfo {
         fetched_at: Some(auth::now_unix_secs()),
         primary,
@@ -168,6 +210,7 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
         reset_credits,
         reset_credits_error: None,
         account_limited,
+        additional_limits,
     }
 }
 
@@ -449,6 +492,121 @@ mod tests {
 
         assert!(usage.account_limited);
         assert!(!crate::usage::is_available(&usage));
+    }
+
+    #[test]
+    fn test_parse_usage_additional_rate_limits_parsed_alongside_top_level_window() {
+        // Real production shape (Pro 20x account, sanitized). Top-level 42%/84%
+        // plus an additional_rate_limits item with its own independent windows.
+        // A sibling `code_review_rate_limit` key (observed null) must not break parsing.
+        let body = json!({
+            "rate_limit": {
+                "primary_window": {"used_percent": 42.0, "reset_at": 1000},
+                "secondary_window": {"used_percent": 84.0, "reset_at": 2000}
+            },
+            "code_review_rate_limit": null,
+            "additional_rate_limits": [
+                {
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                    "metered_feature": "codex_bengalfox",
+                    "rate_limit": {
+                        "allowed": true,
+                        "limit_reached": false,
+                        "primary_window": {
+                            "used_percent": 0,
+                            "limit_window_seconds": 18000,
+                            "reset_after_seconds": 18000,
+                            "reset_at": 1783843614i64
+                        },
+                        "secondary_window": {
+                            "used_percent": 0,
+                            "limit_window_seconds": 604800,
+                            "reset_after_seconds": 604800,
+                            "reset_at": 1784430414i64
+                        }
+                    }
+                }
+            ]
+        });
+
+        let usage = parse_usage(&body);
+
+        // Top-level primary window unaffected by additional_rate_limits presence.
+        assert_eq!(
+            usage.primary.as_ref().and_then(|w| w.used_percent),
+            Some(42.0)
+        );
+        assert_eq!(
+            usage.secondary.as_ref().and_then(|w| w.used_percent),
+            Some(84.0)
+        );
+
+        assert_eq!(usage.additional_limits.len(), 1);
+        let extra = &usage.additional_limits[0];
+        assert_eq!(extra.metered_feature.as_deref(), Some("codex_bengalfox"));
+        assert_eq!(extra.limit_name.as_deref(), Some("GPT-5.3-Codex-Spark"));
+        assert_eq!(extra.allowed, Some(true));
+        assert_eq!(extra.limit_reached, Some(false));
+        assert_eq!(
+            extra.primary.as_ref().and_then(|w| w.used_percent),
+            Some(0.0)
+        );
+        assert_eq!(
+            extra.primary.as_ref().and_then(|w| w.resets_at),
+            Some(1783843614i64)
+        );
+        assert_eq!(
+            extra.secondary.as_ref().and_then(|w| w.used_percent),
+            Some(0.0)
+        );
+        assert_eq!(
+            extra.secondary.as_ref().and_then(|w| w.resets_at),
+            Some(1784430414i64)
+        );
+    }
+
+    #[test]
+    fn test_parse_usage_additional_rate_limits_missing_is_empty() {
+        let usage = parse_usage(&json!({
+            "rate_limit": {
+                "primary_window": {"used_percent": 10.0}
+            }
+        }));
+        assert!(usage.additional_limits.is_empty());
+    }
+
+    #[test]
+    fn test_parse_usage_additional_rate_limits_empty_array_is_empty() {
+        let usage = parse_usage(&json!({
+            "rate_limit": {
+                "primary_window": {"used_percent": 10.0}
+            },
+            "additional_rate_limits": []
+        }));
+        assert!(usage.additional_limits.is_empty());
+    }
+
+    #[test]
+    fn test_parse_usage_additional_rate_limits_skips_malformed_entries() {
+        let usage = parse_usage(&json!({
+            "additional_rate_limits": [
+                {"limit_name": "missing_rate_limit", "metered_feature": "codex_other"},
+                {"limit_name": "bad_shape", "rate_limit": "not-an-object"},
+                {
+                    "limit_name": "ok_one",
+                    "metered_feature": "codex_ok",
+                    "rate_limit": {
+                        "primary_window": {"used_percent": 33.0}
+                    }
+                }
+            ]
+        }));
+
+        assert_eq!(usage.additional_limits.len(), 1);
+        assert_eq!(
+            usage.additional_limits[0].metered_feature.as_deref(),
+            Some("codex_ok")
+        );
     }
 
     #[test]

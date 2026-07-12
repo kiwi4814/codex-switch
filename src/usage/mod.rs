@@ -32,6 +32,20 @@ pub struct WindowUsage {
     pub resets_at: Option<i64>,
 }
 
+/// One entry from the `additional_rate_limits` array in the usage API response.
+/// Represents a metered feature (e.g. `codex_other`) with its own independent windows.
+// Data layer only for now; consumers (display/scoring) land in a follow-up card.
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone)]
+pub struct AdditionalRateLimit {
+    pub limit_name: Option<String>,
+    pub metered_feature: Option<String>,
+    pub allowed: Option<bool>,
+    pub limit_reached: Option<bool>,
+    pub primary: Option<WindowUsage>,
+    pub secondary: Option<WindowUsage>,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ResetCredit {
     pub id: String,
@@ -61,6 +75,10 @@ pub struct UsageInfo {
     pub reset_credits_error: Option<String>,
     /// Explicit account/workspace-level restriction reported by the API.
     pub account_limited: bool,
+    /// Per-feature rate limits from `additional_rate_limits[]` (e.g. codex_other).
+    /// Data layer only for now; not yet consumed by display/scoring.
+    #[allow(dead_code)]
+    pub additional_limits: Vec<AdditionalRateLimit>,
 }
 
 /// All data needed to score an account. Pure data, no I/O.

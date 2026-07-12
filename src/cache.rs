@@ -191,6 +191,7 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         reset_credits: e.reset_credits.clone(),
         reset_credits_error: e.reset_credits_error.clone(),
         account_limited: e.account_limited,
+        additional_limits: vec![],
     }
 }
 

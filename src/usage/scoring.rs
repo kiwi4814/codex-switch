@@ -392,6 +392,7 @@ mod tests {
             reset_credits: vec![],
             reset_credits_error: None,
             account_limited: false,
+            additional_limits: vec![],
         }
     }
 
