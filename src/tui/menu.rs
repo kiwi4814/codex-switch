@@ -9,10 +9,12 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use super::popup::{PopupState, render_popup};
+use super::popup::{PopupState, render_popup, render_responsive_split_popup};
 
 const C_WHITE: Color = Color::Rgb(240, 240, 240);
 const DIM: Color = Color::Rgb(120, 120, 120);
+const C_RED: Color = Color::Rgb(255, 90, 90);
+const C_GREEN: Color = Color::Rgb(80, 220, 120);
 const C_YELLOW: Color = Color::Rgb(255, 220, 80);
 const C_CYAN: Color = Color::Rgb(100, 210, 255);
 
@@ -50,8 +52,8 @@ pub struct AccountMenuInfo {
     pub is_current: bool,
     pub organizations: Vec<String>,
     pub auth_expiries: Vec<String>,
+    pub usage: Option<Box<crate::usage::UsageInfo>>,
     pub usage_meta: Vec<String>,
-    pub quota_pools: Vec<String>,
     pub models: Vec<String>,
     pub reset_cards: Option<u64>,
     pub reset_card_expiries: Vec<String>,
@@ -94,6 +96,111 @@ pub enum MenuAction {
     BatchRelogin { device: bool },
     /// Request batch-delete confirmation.
     BatchDeleteRequest,
+}
+
+fn quota_window_lines(
+    window: &crate::usage::WindowUsage,
+    fallback_label: &str,
+) -> Vec<Line<'static>> {
+    const BAR_WIDTH: usize = 22;
+    let label = match window.window_minutes {
+        Some(minutes) if minutes % 1_440 == 0 => format!("{}d", minutes / 1_440),
+        Some(minutes) if minutes % 60 == 0 => format!("{}h", minutes / 60),
+        Some(minutes) => format!("{minutes}m"),
+        None => fallback_label.to_string(),
+    };
+    let used = window.used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
+    let remaining = (100.0 - used).max(0.0);
+    let used_width = ((used / 100.0) * BAR_WIDTH as f64).round() as usize;
+    let used_color = if used >= 90.0 {
+        C_RED
+    } else if used >= 70.0 {
+        C_YELLOW
+    } else {
+        C_GREEN
+    };
+    let mut spans = vec![Span::styled(
+        format!("{label:<3} "),
+        Style::default().fg(C_WHITE),
+    )];
+    spans.push(Span::styled(
+        "█".repeat(used_width),
+        Style::default().fg(used_color),
+    ));
+    spans.push(Span::styled(
+        "░".repeat(BAR_WIDTH.saturating_sub(used_width)),
+        Style::default().fg(DIM),
+    ));
+    spans.push(Span::styled(
+        format!("  {remaining:.0}% left"),
+        Style::default().fg(if remaining <= 10.0 { C_RED } else { C_YELLOW }),
+    ));
+    let reset = window
+        .resets_at
+        .map(crate::output::format_reset_time)
+        .unwrap_or_else(|| "--".to_string());
+    vec![
+        Line::from(spans),
+        Line::from(Span::styled(
+            format!("    resets in {reset}"),
+            Style::default().fg(DIM),
+        )),
+    ]
+}
+
+fn quota_lines(usage: Option<&crate::usage::UsageInfo>) -> Vec<Line<'static>> {
+    let Some(usage) = usage else {
+        return vec![Line::from(Span::styled(
+            "Usage not loaded",
+            Style::default().fg(DIM),
+        ))];
+    };
+    let mut lines = Vec::new();
+    let mut add_pool = |name: &str,
+                        primary: Option<&crate::usage::WindowUsage>,
+                        secondary: Option<&crate::usage::WindowUsage>,
+                        unavailable: bool| {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                name.to_string(),
+                Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if unavailable { "  unavailable" } else { "" },
+                Style::default().fg(C_RED),
+            ),
+        ]));
+        if let Some(window) = primary {
+            lines.extend(quota_window_lines(window, "5h"));
+        }
+        if let Some(window) = secondary {
+            lines.extend(quota_window_lines(window, "7d"));
+        }
+        if primary.is_none() && secondary.is_none() {
+            lines.push(Line::from(Span::styled(
+                "  No active window",
+                Style::default().fg(DIM),
+            )));
+        }
+    };
+    add_pool(
+        "Main",
+        usage.primary.as_ref(),
+        usage.secondary.as_ref(),
+        false,
+    );
+    for pool in &usage.additional_limits {
+        add_pool(
+            pool.limit_name.as_deref().unwrap_or("Additional"),
+            pool.primary.as_ref(),
+            pool.secondary.as_ref(),
+            pool.allowed == Some(false) || pool.limit_reached == Some(true),
+        );
+    }
+    lines
 }
 
 impl MenuState {
@@ -213,132 +320,173 @@ impl MenuState {
         match self {
             MenuState::Account { info, popup } => {
                 let title = "Account details";
-                let mut lines: Vec<Line<'static>> = Vec::new();
-                let active = if info.is_current { "  active" } else { "" };
-                lines.push(Line::from(Span::styled(
-                    format!("{}{}", info.alias, active),
-                    header_style,
-                )));
+                let mut left_lines = vec![Line::from(Span::styled(
+                    "Identity",
+                    header_style.add_modifier(Modifier::BOLD),
+                ))];
+                let mut identity = vec![
+                    Span::styled(
+                        info.alias.clone(),
+                        Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        info.plan_label.clone(),
+                        Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                if info.is_current {
+                    identity.push(Span::styled(
+                        "  ● active",
+                        Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                left_lines.push(Line::from(identity));
                 if let Some(email) = &info.email {
-                    lines.push(Line::from(vec![
-                        Span::styled("email  ", dim),
-                        Span::styled(email.clone(), label_style),
+                    left_lines.push(Line::from(vec![
+                        Span::styled("email      ", dim),
+                        Span::styled(email.clone(), Style::default().fg(C_WHITE)),
                     ]));
                 }
-                lines.push(Line::from(vec![
-                    Span::styled("plan   ", dim),
-                    Span::styled(info.plan_label.clone(), label_style),
-                ]));
+                if info.workspace_name.is_some() || info.plan_type.is_some() {
+                    left_lines.push(Line::from(vec![
+                        Span::styled("workspace  ", dim),
+                        Span::styled(
+                            info.workspace_name
+                                .clone()
+                                .unwrap_or_else(|| "Personal".into()),
+                            label_style,
+                        ),
+                        Span::styled(
+                            info.plan_type
+                                .as_ref()
+                                .map(|value| format!("  ·  {value}"))
+                                .unwrap_or_default(),
+                            dim,
+                        ),
+                    ]));
+                }
                 if let Some(account_id) = &info.account_id {
-                    lines.push(Line::from(vec![
-                        Span::styled("id     ", dim),
-                        Span::styled(account_id.clone(), label_style),
+                    left_lines.push(Line::from(vec![
+                        Span::styled("account id ", dim),
+                        Span::styled(account_id.clone(), dim),
                     ]));
                 }
                 if let Some(user_id) = &info.user_id {
-                    lines.push(Line::from(vec![
-                        Span::styled("user   ", dim),
-                        Span::styled(user_id.clone(), label_style),
-                    ]));
-                }
-                if let Some(workspace) = &info.workspace_name {
-                    lines.push(Line::from(vec![
-                        Span::styled("space  ", dim),
-                        Span::styled(workspace.clone(), label_style),
-                    ]));
-                }
-                if let Some(plan_type) = &info.plan_type {
-                    lines.push(Line::from(vec![
-                        Span::styled("type   ", dim),
-                        Span::styled(plan_type.clone(), label_style),
+                    left_lines.push(Line::from(vec![
+                        Span::styled("user id    ", dim),
+                        Span::styled(user_id.clone(), dim),
                     ]));
                 }
                 if info.is_fedramp {
-                    lines.push(Line::from(vec![
-                        Span::styled("route  ", dim),
-                        Span::styled("FedRAMP", label_style),
+                    left_lines.push(Line::from(vec![
+                        Span::styled("route      ", dim),
+                        Span::styled("FedRAMP", Style::default().fg(C_YELLOW)),
                     ]));
                 }
                 for organization in &info.organizations {
-                    lines.push(Line::from(vec![
-                        Span::styled("org    ", dim),
+                    left_lines.push(Line::from(vec![
+                        Span::styled("org        ", dim),
                         Span::styled(organization.clone(), label_style),
                     ]));
                 }
                 for expiry in &info.auth_expiries {
-                    lines.push(Line::from(vec![
-                        Span::styled("expiry ", dim),
-                        Span::styled(expiry.clone(), label_style),
+                    left_lines.push(Line::from(vec![
+                        Span::styled("token      ", dim),
+                        Span::styled(expiry.clone(), dim),
                     ]));
                 }
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("Quota", header_style)));
+                left_lines.push(Line::from(""));
+                left_lines.push(Line::from(Span::styled(
+                    "Quota pools",
+                    header_style.add_modifier(Modifier::BOLD),
+                )));
+                left_lines.extend(quota_lines(info.usage.as_deref()));
                 for item in &info.usage_meta {
-                    lines.push(Line::from(Span::styled(item.clone(), dim)));
-                }
-                for pool in &info.quota_pools {
-                    lines.push(Line::from(Span::styled(pool.clone(), label_style)));
+                    left_lines.push(Line::from(Span::styled(item.clone(), dim)));
                 }
                 let cards = info
                     .reset_cards
                     .map(|count| count.to_string())
                     .unwrap_or_else(|| "--".to_string());
-                lines.push(Line::from(vec![
-                    Span::styled("cards  ", dim),
-                    Span::styled(cards, label_style),
+                left_lines.push(Line::from(vec![
+                    Span::styled("reset cards  ", dim),
+                    Span::styled(
+                        cards,
+                        Style::default().fg(if info.can_consume_reset_card {
+                            C_GREEN
+                        } else {
+                            DIM
+                        }),
+                    ),
                 ]));
                 for (idx, expiry) in info.reset_card_expiries.iter().enumerate() {
                     let note = if idx == 0 { "  next" } else { "" };
-                    lines.push(Line::from(vec![
+                    left_lines.push(Line::from(vec![
                         Span::styled(format!("  #{}  ", idx + 1), dim),
                         Span::styled(expiry.clone(), label_style),
                         Span::styled(note, dim),
                     ]));
                 }
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("Models", header_style)));
+                let mut right_lines = vec![Line::from(Span::styled(
+                    "Models",
+                    header_style.add_modifier(Modifier::BOLD),
+                ))];
+                let mut first_model = true;
                 for model in &info.models {
-                    lines.push(Line::from(Span::styled(model.clone(), label_style)));
+                    if model.starts_with("    ") {
+                        right_lines.push(Line::from(Span::styled(model.clone(), dim)));
+                    } else {
+                        if !first_model {
+                            right_lines.push(Line::from(""));
+                        }
+                        first_model = false;
+                        right_lines.push(Line::from(vec![
+                            Span::styled("● ", Style::default().fg(C_CYAN)),
+                            Span::styled(
+                                model.trim().to_string(),
+                                Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    }
                 }
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("Primary", header_style)));
-                lines.extend(menu_items(
-                    &[("u", "Use (switch to)")],
-                    key_style,
-                    label_style,
-                ));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("Quota actions", header_style)));
-                lines.extend(menu_items_stateful(
-                    &[
-                        ("r", "Refresh account details", true),
-                        (
-                            "c",
-                            "Confirm earliest reset card",
-                            info.can_consume_reset_card,
-                        ),
-                        ("w", "Warmup", true),
-                    ],
-                    key_style,
-                    label_style,
-                    dim,
-                ));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("Auth", header_style)));
-                lines.extend(menu_items(&[("l", "re-Login")], key_style, label_style));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("Manage", header_style)));
-                lines.extend(menu_items(
-                    &[("n", "reName"), ("d", "Delete")],
-                    key_style,
-                    label_style,
-                ));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "j k / arrows / PgUp PgDn to scroll · esc / q to cancel",
+                left_lines.push(Line::from(""));
+                left_lines.push(Line::from(Span::styled(
+                    "Actions",
+                    header_style.add_modifier(Modifier::BOLD),
+                )));
+                let actions = [
+                    ("u", "use", true),
+                    ("r", "refresh", true),
+                    ("w", "warmup", true),
+                    ("c", "card", info.can_consume_reset_card),
+                    ("l", "login", true),
+                    ("n", "rename", true),
+                    ("d", "delete", true),
+                ];
+                for row in [&actions[..4], &actions[4..]] {
+                    let mut action_spans = Vec::new();
+                    for (idx, (key, label, enabled)) in row.iter().enumerate() {
+                        if idx > 0 {
+                            action_spans.push(Span::styled("  ·  ", dim));
+                        }
+                        action_spans.push(Span::styled(
+                            (*key).to_string(),
+                            if *enabled { key_style } else { dim },
+                        ));
+                        action_spans.push(Span::styled(
+                            format!(" {label}"),
+                            if *enabled { label_style } else { dim },
+                        ));
+                    }
+                    left_lines.push(Line::from(action_spans));
+                }
+                left_lines.push(Line::from(""));
+                left_lines.push(Line::from(Span::styled(
+                    "j k / arrows / PgUp PgDn scroll models · esc / q cancel",
                     dim,
                 )));
-                render_popup(f, title, &lines, popup, area);
+                render_responsive_split_popup(f, title, &left_lines, &right_lines, popup, area);
             }
             MenuState::Add { popup } => {
                 let title = "Add new account";
@@ -449,45 +597,12 @@ fn menu_items(items: &[(&str, &str)], key_style: Style, label_style: Style) -> V
         .collect()
 }
 
-fn menu_items_stateful(
-    items: &[(&str, &str, bool)],
-    key_style: Style,
-    label_style: Style,
-    disabled_style: Style,
-) -> Vec<Line<'static>> {
-    let key_w = items
-        .iter()
-        .map(|(k, _, _)| k.chars().count())
-        .max()
-        .unwrap_or(1);
-    items
-        .iter()
-        .map(|(k, label, enabled)| {
-            let pad = key_w.saturating_sub(k.chars().count());
-            let style = if *enabled {
-                label_style
-            } else {
-                disabled_style
-            };
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    (*k).to_string(),
-                    if *enabled { key_style } else { disabled_style },
-                ),
-                Span::raw(" ".repeat(pad)),
-                Span::raw("  "),
-                Span::styled((*label).to_string(), style),
-            ])
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use ratatui::crossterm::event::KeyCode;
 
-    use super::{AccountMenuInfo, MenuAction, MenuState};
+    use super::{AccountMenuInfo, MenuAction, MenuState, quota_lines};
+    use crate::usage::{AdditionalRateLimit, UsageInfo, WindowUsage};
 
     #[test]
     fn unknown_key_keeps_menu_open() {
@@ -512,8 +627,8 @@ mod tests {
             is_current: false,
             organizations: Vec::new(),
             auth_expiries: Vec::new(),
+            usage: None,
             usage_meta: Vec::new(),
-            quota_pools: Vec::new(),
             models: Vec::new(),
             reset_cards: None,
             reset_card_expiries: Vec::new(),
@@ -525,5 +640,34 @@ mod tests {
             unreachable!();
         };
         assert_eq!(popup.scroll, 1);
+    }
+
+    #[test]
+    fn quota_visuals_include_main_and_future_model_pools() {
+        let window = WindowUsage {
+            used_percent: Some(25.0),
+            resets_at: Some(1_000_000),
+            window_minutes: Some(300),
+        };
+        let usage = UsageInfo {
+            primary: Some(window.clone()),
+            additional_limits: vec![AdditionalRateLimit {
+                limit_name: Some("GPT-6-Codex-Burst".to_string()),
+                metered_feature: Some("codex_futureburst".to_string()),
+                primary: Some(window),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let text = quota_lines(Some(&usage))
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Main"));
+        assert!(text.contains("GPT-6-Codex-Burst"));
+        assert!(text.contains('█'));
+        assert!(text.contains("75% left"));
     }
 }

@@ -48,7 +48,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let status_height = status_bar_height(app, area.width);
 
     let detail_height = if app.detail_visible {
-        detail_panel_height(app)
+        detail_panel_height(app).min(
+            area.height
+                .saturating_sub(status_height as u16)
+                .saturating_sub(6),
+        )
     } else {
         0
     };
@@ -496,14 +500,41 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(table, area, &mut table_state);
 }
 
-const GAUGES_BLOCK_HEIGHT: u16 = 4;
+fn usage_gauges_height(usage: &UsageInfo) -> u16 {
+    let multi_pool = !usage.additional_limits.is_empty();
+    let mut height = 0u16;
+    let mut pool_count = 0u16;
+    let mut add_pool = |primary: bool, secondary: bool| {
+        if pool_count > 0 {
+            height = height.saturating_add(1);
+        }
+        if multi_pool {
+            height = height.saturating_add(1);
+        }
+        height = height.saturating_add(u16::from(primary) * 2);
+        height = height.saturating_add(u16::from(secondary) * 2);
+        if !primary && !secondary {
+            height = height.saturating_add(1);
+        }
+        pool_count = pool_count.saturating_add(1);
+    };
+    add_pool(usage.primary.is_some(), usage.secondary.is_some());
+    for pool in &usage.additional_limits {
+        add_pool(pool.primary.is_some(), pool.secondary.is_some());
+    }
+    height.max(1)
+}
 
-/// Total height needed for the detail panel: info row + gauges + the new
-/// "Quota pools" and "Models" sections + borders. Grows with the selected
-/// account's additional-pool count (capped) so Pro 20x-style accounts with
-/// a per-model pool get enough room without wasting space on plain accounts.
-fn detail_panel_height(_app: &App) -> u16 {
-    8
+fn detail_panel_height(app: &App) -> u16 {
+    let gauges = app
+        .selected_account_idx()
+        .and_then(|idx| app.accounts.get(idx))
+        .and_then(|entry| match &entry.usage {
+            UsageStatus::Loaded(usage) => Some(usage_gauges_height(usage)),
+            _ => None,
+        })
+        .unwrap_or(4);
+    gauges.saturating_add(4)
 }
 
 fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
@@ -532,7 +563,7 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(GAUGES_BLOCK_HEIGHT)])
+        .constraints([Constraint::Min(1)])
         .margin(1)
         .split(inner);
 
@@ -556,38 +587,94 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
+pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
     let now = crate::auth::now_unix_secs();
-    let mut constraints = vec![];
-    if u.primary.is_some() {
-        constraints.push(Constraint::Length(2));
-    }
-    if u.secondary.is_some() {
-        constraints.push(Constraint::Length(2));
-    }
-    if constraints.is_empty() {
-        constraints.push(Constraint::Min(1));
-    }
+    let multi_pool = !u.additional_limits.is_empty();
+    let mut y = area.y;
+    let mut render_pool = |f: &mut Frame,
+                           name: &str,
+                           primary: Option<&crate::usage::WindowUsage>,
+                           secondary: Option<&crate::usage::WindowUsage>,
+                           unavailable: bool| {
+        if y > area.y {
+            y = y.saturating_add(1);
+        }
+        if multi_pool && y < area.bottom() {
+            let title = if unavailable {
+                format!("{name}  unavailable")
+            } else {
+                name.to_string()
+            };
+            f.render_widget(
+                Paragraph::new(title).style(base().fg(if unavailable { C_RED } else { C_CYAN })),
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+            y = y.saturating_add(1);
+        }
+        if let Some(window) = primary
+            && y < area.bottom()
+        {
+            render_usage_gauge(
+                f,
+                window,
+                "5h",
+                crate::usage::WINDOW_5H_SECS,
+                now,
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 2,
+                },
+            );
+            y = y.saturating_add(2);
+        }
+        if let Some(window) = secondary
+            && y < area.bottom()
+        {
+            render_usage_gauge(
+                f,
+                window,
+                "7d",
+                crate::usage::WINDOW_7D_SECS,
+                now,
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 2,
+                },
+            );
+            y = y.saturating_add(2);
+        }
+        if primary.is_none() && secondary.is_none() && y < area.bottom() {
+            f.render_widget(
+                Paragraph::new("No active window").style(base().fg(DIM)),
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+            y = y.saturating_add(1);
+        }
+    };
 
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
-
-    let mut idx = 0;
-
-    if let Some(w) = &u.primary {
-        render_usage_gauge(f, w, "5h", crate::usage::WINDOW_5H_SECS, now, layout[idx]);
-        idx += 1;
-    }
-
-    if let Some(w) = &u.secondary {
-        render_usage_gauge(f, w, "7d", crate::usage::WINDOW_7D_SECS, now, layout[idx]);
-    }
-
-    if u.primary.is_none() && u.secondary.is_none() {
-        let p = Paragraph::new("No usage data").style(base().fg(DIM));
-        f.render_widget(p, layout[0]);
+    render_pool(f, "Main", u.primary.as_ref(), u.secondary.as_ref(), false);
+    for pool in &u.additional_limits {
+        render_pool(
+            f,
+            pool.limit_name.as_deref().unwrap_or("Additional"),
+            pool.primary.as_ref(),
+            pool.secondary.as_ref(),
+            pool.allowed == Some(false) || pool.limit_reached == Some(true),
+        );
     }
 }
 
@@ -1033,14 +1120,38 @@ fn status_bar_height(app: &App, width: u16) -> usize {
 mod tests {
     use super::{
         C_BLUE, C_CYAN, C_GRAY, C_MAGENTA, C_RED, C_YELLOW, plan_color, status_message_color,
-        table_text_widths,
+        table_text_widths, usage_gauges_height,
     };
+    use crate::usage::{AdditionalRateLimit, UsageInfo, WindowUsage};
     use ratatui::style::Modifier;
 
     #[test]
     fn status_message_color_distinguishes_errors_from_information() {
         assert_eq!(status_message_color(false), C_CYAN);
         assert_eq!(status_message_color(true), C_RED);
+    }
+
+    #[test]
+    fn additional_quota_pool_expands_the_main_detail_panel() {
+        let window = WindowUsage {
+            used_percent: Some(25.0),
+            resets_at: Some(1_000_000),
+            window_minutes: Some(300),
+        };
+        let usage = UsageInfo {
+            primary: Some(window.clone()),
+            secondary: Some(window.clone()),
+            additional_limits: vec![AdditionalRateLimit {
+                limit_name: Some("GPT-6-Codex-Burst".to_string()),
+                metered_feature: Some("codex_futureburst".to_string()),
+                primary: Some(window.clone()),
+                secondary: Some(window),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(usage_gauges_height(&usage), 11);
     }
 
     #[test]

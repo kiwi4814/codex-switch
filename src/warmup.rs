@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -9,7 +9,6 @@ use tracing::{debug, warn};
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 const FALLBACK_MODEL: &str = "gpt-5.3-codex";
-const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
 
 static CODEX_VERSION: OnceCell<String> = OnceCell::const_new();
 // tokio Mutex held across the await in resolve_model, ensuring only one fetch per process.
@@ -225,16 +224,35 @@ async fn fetch_warmup_model(
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
+    additional_limits: &[crate::usage::AdditionalRateLimit],
 ) -> Result<String> {
     let models = fetch_models(client, access_token, account_id, is_fedramp).await?;
 
-    Ok(select_warmup_models(&models)?
+    Ok(select_warmup_models(&models, additional_limits)?
         .into_iter()
         .next()
         .unwrap_or_else(|| FALLBACK_MODEL.to_string()))
 }
 
-fn select_warmup_models(models: &[ModelEntry]) -> Result<Vec<String>> {
+fn normalized_pool_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_model_quota_limit(limit: &crate::usage::AdditionalRateLimit) -> bool {
+    limit
+        .metered_feature
+        .as_deref()
+        .is_some_and(|feature| feature.starts_with("codex_"))
+}
+
+fn select_warmup_models(
+    models: &[ModelEntry],
+    additional_limits: &[crate::usage::AdditionalRateLimit],
+) -> Result<Vec<String>> {
     let visible: Vec<&ModelEntry> = models
         .iter()
         .filter(|m| m.visibility.as_deref() != Some("hide") && m.supported_in_api != Some(false))
@@ -244,14 +262,68 @@ fn select_warmup_models(models: &[ModelEntry]) -> Result<Vec<String>> {
         bail!("no visible models available");
     }
 
+    let model_limits: Vec<&crate::usage::AdditionalRateLimit> = additional_limits
+        .iter()
+        .filter(|limit| is_model_quota_limit(limit))
+        .collect();
+    let additional_models: Vec<&ModelEntry> = model_limits
+        .iter()
+        .filter_map(|limit| {
+            let pool_name = normalized_pool_name(limit.limit_name.as_deref()?);
+            visible.iter().copied().find(|model| {
+                let slug = normalized_pool_name(&model.slug);
+                let display = model
+                    .display_name
+                    .as_deref()
+                    .map(normalized_pool_name)
+                    .unwrap_or_default();
+                !pool_name.is_empty()
+                    && (pool_name == slug
+                        || pool_name == display
+                        || slug.contains(&pool_name)
+                        || display.contains(&pool_name))
+            })
+        })
+        .collect();
+    if additional_models.len() != model_limits.len() {
+        let unmatched = model_limits
+            .iter()
+            .filter(|limit| {
+                let Some(name) = limit.limit_name.as_deref() else {
+                    return true;
+                };
+                let pool_name = normalized_pool_name(name);
+                !visible.iter().any(|model| {
+                    let slug = normalized_pool_name(&model.slug);
+                    let display = model
+                        .display_name
+                        .as_deref()
+                        .map(normalized_pool_name)
+                        .unwrap_or_default();
+                    !pool_name.is_empty()
+                        && (pool_name == slug
+                            || pool_name == display
+                            || slug.contains(&pool_name)
+                            || display.contains(&pool_name))
+                })
+            })
+            .map(|limit| limit.limit_name.as_deref().unwrap_or("unnamed"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("no model matched quota pool(s): {unmatched}");
+    }
+    let additional_slugs: HashSet<&str> = additional_models
+        .iter()
+        .map(|model| model.slug.as_str())
+        .collect();
     let main_candidates: Vec<&ModelEntry> = visible
         .iter()
         .copied()
-        .filter(|model| model.slug != SPARK_MODEL)
+        .filter(|model| !additional_slugs.contains(model.slug.as_str()))
         .collect();
 
     // Prefer mini (lightest), fall back to highest priority (lowest number).
-    // Spark owns an additional pool and must not replace the main-pool request.
+    // Models mapped to additional pools must not replace the main-pool request.
     let main = main_candidates
         .iter()
         .find(|m| m.slug.contains("mini"))
@@ -263,8 +335,10 @@ fn select_warmup_models(models: &[ModelEntry]) -> Result<Vec<String>> {
         .map(|m| m.slug.clone());
 
     let mut selected: Vec<String> = main.into_iter().collect();
-    if visible.iter().any(|m| m.slug == SPARK_MODEL) {
-        selected.push(SPARK_MODEL.to_string());
+    for model in additional_models {
+        if !selected.contains(&model.slug) {
+            selected.push(model.slug.clone());
+        }
     }
 
     debug!("warmup: models selected from API: {selected:?}");
@@ -277,6 +351,7 @@ async fn resolve_model(
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
+    additional_limits: &[crate::usage::AdditionalRateLimit],
 ) -> String {
     let mut guard = MODEL_CACHE.lock().await;
     if let Some(model) = model_cache_get(&guard, cache_key) {
@@ -284,7 +359,15 @@ async fn resolve_model(
     }
     // Hold the lock across the fetch so concurrent callers wait here instead of
     // each issuing a redundant request.
-    match fetch_warmup_model(client, access_token, account_id, is_fedramp).await {
+    match fetch_warmup_model(
+        client,
+        access_token,
+        account_id,
+        is_fedramp,
+        additional_limits,
+    )
+    .await
+    {
         Ok(model) => {
             model_cache_set(&mut guard, cache_key, model.clone());
             model
@@ -337,9 +420,14 @@ async fn warmup_additional_models(
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
+    additional_limits: &[crate::usage::AdditionalRateLimit],
+    warmed_model: &str,
 ) -> Result<()> {
     let models = fetch_models(client, access_token, account_id, is_fedramp).await?;
-    for model in select_warmup_models(&models)?.into_iter().skip(1) {
+    for model in select_warmup_models(&models, additional_limits)?
+        .into_iter()
+        .filter(|model| model != warmed_model)
+    {
         let body = build_body(&model);
         debug!("warmup additional pool POST → {RESPONSES_URL} (model={model})");
         let mut resp = make_request(client, access_token, account_id, is_fedramp, &body)
@@ -363,6 +451,25 @@ async fn warmup_additional_models(
 /// This sends the lightest valid request ("ping") and discards the response body,
 /// which is enough for the server to stamp the window start time.
 pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
+    let usage = match crate::cache::get(alias) {
+        Some(usage) => Some(usage),
+        None => {
+            let current = crate::profile::read_current();
+            match crate::usage::fetch_usage_retried_force(alias, profile_path, &current).await {
+                Ok(usage) => Some(usage),
+                Err(error) => {
+                    warn!(
+                        "[{alias}] could not discover additional quota pools: {}",
+                        error.summary
+                    );
+                    None
+                }
+            }
+        }
+    };
+    let additional_limits = usage
+        .map(|usage| usage.additional_limits)
+        .unwrap_or_default();
     let val = crate::auth::read_auth(profile_path)
         .map_err(|e| anyhow::anyhow!("{alias}: cannot read auth: {e}"))?;
 
@@ -416,6 +523,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
         &access_token,
         account_id.as_deref(),
         is_fedramp,
+        &additional_limits,
     )
     .await;
     let body = build_body(&model);
@@ -441,8 +549,15 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
             // Quota window is triggered server-side on request receipt.
             // Read one chunk to confirm streaming started, then drop.
             let _ = resp.chunk().await;
-            warmup_additional_models(&client, &access_token, account_id.as_deref(), is_fedramp)
-                .await
+            warmup_additional_models(
+                &client,
+                &access_token,
+                account_id.as_deref(),
+                is_fedramp,
+                &additional_limits,
+                &model,
+            )
+            .await
         }
         400 => {
             let text = resp.text().await.unwrap_or_default();
@@ -458,6 +573,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                     &access_token,
                     account_id.as_deref(),
                     is_fedramp,
+                    &additional_limits,
                 )
                 .await;
                 let retry_body = build_body(&new_model);
@@ -479,6 +595,8 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                         &access_token,
                         account_id.as_deref(),
                         is_fedramp,
+                        &additional_limits,
+                        &new_model,
                     )
                     .await;
                 }
@@ -531,6 +649,8 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                                 &refreshed.access_token,
                                 account_id.as_deref(),
                                 is_fedramp,
+                                &additional_limits,
+                                &model,
                             )
                             .await;
                         }
@@ -777,9 +897,14 @@ mod tests {
                 ..Default::default()
             },
         ];
+        let limits = vec![crate::usage::AdditionalRateLimit {
+            limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+            metered_feature: Some("codex_bengalfox".to_string()),
+            ..Default::default()
+        }];
 
         assert_eq!(
-            select_warmup_models(&models).unwrap(),
+            select_warmup_models(&models, &limits).unwrap(),
             vec!["gpt-5.4-mini", "gpt-5.3-codex-spark"]
         );
     }
@@ -795,18 +920,89 @@ mod tests {
                 ..Default::default()
             },
             ModelEntry {
-                slug: SPARK_MODEL.to_string(),
+                slug: "gpt-5.3-codex-spark".to_string(),
                 visibility: Some("List".to_string()),
                 priority: Some(1),
                 supported_in_api: Some(true),
                 ..Default::default()
             },
         ];
+        let limits = vec![crate::usage::AdditionalRateLimit {
+            limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+            metered_feature: Some("codex_bengalfox".to_string()),
+            ..Default::default()
+        }];
 
         assert_eq!(
-            select_warmup_models(&models).unwrap(),
-            vec!["gpt-5.6-codex", SPARK_MODEL]
+            select_warmup_models(&models, &limits).unwrap(),
+            vec!["gpt-5.6-codex", "gpt-5.3-codex-spark"]
         );
+    }
+
+    #[test]
+    fn test_warmup_models_cover_all_matching_model_quota_pools() {
+        let models = vec![
+            ModelEntry {
+                slug: "gpt-5.4-mini".to_string(),
+                display_name: Some("GPT-5.4 Mini".to_string()),
+                visibility: Some("List".to_string()),
+                priority: Some(10),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+            ModelEntry {
+                slug: "gpt-5.3-codex-spark".to_string(),
+                display_name: Some("GPT-5.3-Codex-Spark".to_string()),
+                visibility: Some("List".to_string()),
+                priority: Some(2),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+            ModelEntry {
+                slug: "gpt-6-codex-burst".to_string(),
+                display_name: Some("GPT-6 Codex Burst".to_string()),
+                visibility: Some("List".to_string()),
+                priority: Some(1),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+        ];
+        let limits = vec![
+            crate::usage::AdditionalRateLimit {
+                limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+                metered_feature: Some("codex_bengalfox".to_string()),
+                ..Default::default()
+            },
+            crate::usage::AdditionalRateLimit {
+                limit_name: Some("GPT-6-Codex-Burst".to_string()),
+                metered_feature: Some("codex_futureburst".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            select_warmup_models(&models, &limits).unwrap(),
+            vec!["gpt-5.4-mini", "gpt-5.3-codex-spark", "gpt-6-codex-burst"]
+        );
+    }
+
+    #[test]
+    fn test_unmatched_model_quota_pool_is_reported() {
+        let models = vec![ModelEntry {
+            slug: "gpt-5.4-mini".to_string(),
+            display_name: Some("GPT-5.4 Mini".to_string()),
+            visibility: Some("List".to_string()),
+            supported_in_api: Some(true),
+            ..Default::default()
+        }];
+        let limits = vec![crate::usage::AdditionalRateLimit {
+            limit_name: Some("GPT-6-Codex-Burst".to_string()),
+            metered_feature: Some("codex_futureburst".to_string()),
+            ..Default::default()
+        }];
+
+        let error = select_warmup_models(&models, &limits).unwrap_err();
+        assert!(error.to_string().contains("GPT-6-Codex-Burst"));
     }
 
     #[test]

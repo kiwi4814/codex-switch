@@ -18,6 +18,8 @@ const C_CYAN: Color = Color::Rgb(100, 210, 255);
 /// Minimum terminal size below which we abort popup rendering.
 const MIN_TERM_W: u16 = 20;
 const MIN_TERM_H: u16 = 6;
+const SPLIT_MIN_TERM_W: u16 = 136;
+const SPLIT_MIN_TERM_H: u16 = 28;
 
 pub struct PopupState {
     pub scroll: u16,
@@ -150,6 +152,107 @@ pub fn render_popup(
     }
 }
 
+/// Render a wide account-detail popup with a fixed summary column and a
+/// scrollable detail column. Falls back to the standard single-column popup
+/// whenever the terminal or the summary content cannot fit safely.
+pub fn render_responsive_split_popup(
+    f: &mut Frame,
+    title: &str,
+    left_lines: &[Line<'_>],
+    right_lines: &[Line<'_>],
+    state: &mut PopupState,
+    screen: Rect,
+) {
+    let split_height = screen.height.saturating_sub(4);
+    if screen.width < SPLIT_MIN_TERM_W
+        || screen.height < SPLIT_MIN_TERM_H
+        || left_lines.len() > split_height as usize
+    {
+        let mut combined: Vec<Line<'static>> = left_lines.iter().map(owned_line).collect();
+        if !left_lines.is_empty() && !right_lines.is_empty() {
+            combined.push(Line::from(""));
+        }
+        combined.extend(right_lines.iter().map(owned_line));
+        render_popup(f, title, &combined, state, screen);
+        return;
+    }
+
+    let area = Rect {
+        x: screen.x.saturating_add(1),
+        y: screen.y.saturating_add(1),
+        width: screen.width.saturating_sub(2),
+        height: screen.height.saturating_sub(2),
+    };
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(format!(" {title} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_CYAN).bg(BG))
+        .style(Style::default().bg(BG).fg(C_WHITE));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let content_w = inner.width.saturating_sub(4);
+    let left_w = content_w.saturating_mul(48) / 100;
+    let right_w = content_w.saturating_sub(left_w);
+    let left_area = Rect {
+        x: inner.x.saturating_add(1),
+        y: inner.y,
+        width: left_w,
+        height: inner.height,
+    };
+    let divider_x = left_area.x.saturating_add(left_area.width);
+    let right_area = Rect {
+        x: divider_x.saturating_add(2),
+        y: inner.y,
+        width: right_w,
+        height: inner.height,
+    };
+
+    let left = left_lines
+        .iter()
+        .map(|line| truncate_line(line, left_area.width as usize))
+        .collect::<Vec<_>>();
+    f.render_widget(
+        Paragraph::new(left).style(Style::default().bg(BG)),
+        left_area,
+    );
+
+    let visible_h = right_area.height;
+    let total_lines = right_lines.len() as u16;
+    let max_scroll = total_lines.saturating_sub(visible_h);
+    let scroll = state.scroll.min(max_scroll);
+    state.scroll = scroll;
+    let right = right_lines
+        .iter()
+        .map(|line| truncate_line(line, right_area.width as usize))
+        .collect::<Vec<_>>();
+    let start = scroll as usize;
+    let end = (start + visible_h as usize).min(right.len());
+    f.render_widget(
+        Paragraph::new(right[start..end].to_vec()).style(Style::default().bg(BG)),
+        right_area,
+    );
+
+    let divider = (0..inner.height)
+        .map(|_| Line::from(Span::styled("│", Style::default().fg(DIM).bg(BG))))
+        .collect::<Vec<_>>();
+    f.render_widget(
+        Paragraph::new(divider),
+        Rect {
+            x: divider_x,
+            y: inner.y,
+            width: 1,
+            height: inner.height,
+        },
+    );
+
+    if total_lines > visible_h && visible_h > 0 {
+        render_scrollbar(f, inner, scroll, max_scroll, visible_h, total_lines);
+    }
+}
+
 fn render_scrollbar(
     f: &mut Frame,
     inner: Rect,
@@ -253,4 +356,63 @@ fn truncate_line(line: &Line<'_>, max_width: usize) -> Line<'static> {
         Style::default().fg(DIM),
     ));
     Line::from(acc)
+}
+
+fn owned_line(line: &Line<'_>) -> Line<'static> {
+    Line::from(
+        line.spans
+            .iter()
+            .map(|span| Span::styled(span.content.to_string(), span.style))
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{Terminal, backend::TestBackend, text::Line};
+
+    use super::{PopupState, render_responsive_split_popup};
+
+    fn find_text(backend: &TestBackend, needle: &str) -> Option<(u16, u16)> {
+        let area = backend.buffer().area;
+        for y in 0..area.height {
+            let row = (0..area.width)
+                .map(|x| {
+                    backend
+                        .buffer()
+                        .cell((x, y))
+                        .expect("cell inside test buffer")
+                        .symbol()
+                })
+                .collect::<String>();
+            if let Some(x) = row.find(needle) {
+                return Some((x as u16, y));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn wide_popup_places_summary_left_and_models_right() {
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut state = PopupState::new();
+        terminal
+            .draw(|frame| {
+                render_responsive_split_popup(
+                    frame,
+                    "Account details",
+                    &[Line::from("account-summary")],
+                    &[Line::from("Models"), Line::from("model-details")],
+                    &mut state,
+                    frame.area(),
+                );
+            })
+            .expect("render account details");
+
+        let summary = find_text(terminal.backend(), "account-summary").expect("summary");
+        let models = find_text(terminal.backend(), "Models").expect("models");
+        assert!(summary.0 < 80, "summary must stay in the left column");
+        assert!(models.0 > 80, "models must start in the right column");
+    }
 }

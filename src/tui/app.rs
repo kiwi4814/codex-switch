@@ -331,69 +331,6 @@ impl App {
         let can_consume_reset_card = loaded_usage
             .and_then(|u| crate::usage::earliest_reset_credit(&u.reset_credits))
             .is_some();
-        let window_text = |label: &str, window: Option<&crate::usage::WindowUsage>| {
-            window.map(|window| {
-                let label = match window.window_minutes {
-                    Some(minutes) if minutes % 1_440 == 0 => format!("{}d", minutes / 1_440),
-                    Some(minutes) if minutes % 60 == 0 => format!("{}h", minutes / 60),
-                    Some(minutes) => format!("{minutes}m"),
-                    None => label.to_string(),
-                };
-                let remaining = window
-                    .used_percent
-                    .map(|used| format!("{:.0}% left", (100.0 - used).max(0.0)))
-                    .unwrap_or_else(|| "--".to_string());
-                let reset = window
-                    .resets_at
-                    .map(format_iso8601)
-                    .unwrap_or_else(|| "--".to_string());
-                format!("{label} {remaining}, reset {reset}")
-            })
-        };
-        let quota_line = |name: &str,
-                          primary: Option<&crate::usage::WindowUsage>,
-                          secondary: Option<&crate::usage::WindowUsage>| {
-            let mut parts = vec![name.to_string()];
-            if let Some(text) = window_text("5h", primary) {
-                parts.push(text);
-            }
-            if let Some(text) = window_text("7d", secondary) {
-                parts.push(text);
-            }
-            format!("  {}", parts.join(" · "))
-        };
-        let quota_pools: Vec<String> = loaded_usage
-            .map(|usage| {
-                let mut pools = vec![quota_line(
-                    "Main",
-                    usage.primary.as_ref(),
-                    usage.secondary.as_ref(),
-                )];
-                pools.extend(usage.additional_limits.iter().map(|pool| {
-                    let name = pool.limit_name.as_deref().unwrap_or("Additional");
-                    let feature = pool
-                        .metered_feature
-                        .as_deref()
-                        .map(|value| format!(" [{value}]"))
-                        .unwrap_or_default();
-                    let state = if pool.allowed == Some(false) {
-                        " · disallowed"
-                    } else if pool.limit_reached == Some(true) {
-                        " · exhausted"
-                    } else {
-                        ""
-                    };
-                    format!(
-                        "{}{feature}{state}",
-                        quota_line(name, pool.primary.as_ref(), pool.secondary.as_ref())
-                    )
-                }));
-                pools
-            })
-            .unwrap_or_else(|| vec!["  usage not loaded".to_string()])
-            .into_iter()
-            .flat_map(wrap_account_detail_line)
-            .collect();
         let usage_meta: Vec<String> = loaded_usage
             .map(|usage| {
                 let mut items = Vec::new();
@@ -447,116 +384,12 @@ impl App {
                 .into_iter()
                 .flat_map(|model| {
                     let label = match &model.display_name {
-                        Some(name) => format!("  {name} ({})", model.slug),
+                        Some(name) => format!("  {name}"),
                         None => format!("  {}", model.slug),
                     };
-                    let visibility = model.visibility.as_deref().unwrap_or("unknown");
-                    let api = match model.supported_in_api {
-                        Some(true) => "yes",
-                        Some(false) => "no",
-                        None => "unknown",
-                    };
-                    let context = model
-                        .context_window
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "--".to_string());
-                    let priority = model
-                        .priority
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "--".to_string());
-                    let max_context = model
-                        .max_context_window
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "--".to_string());
-                    let mut lines = vec![
-                        label,
-                        format!(
-                            "    visibility={visibility} · api={api} · priority={priority} · context={context} · max={max_context}"
-                        ),
-                    ];
+                    let mut lines = vec![label];
                     if let Some(description) = &model.description {
                         lines.push(format!("    {description}"));
-                    }
-                    if model.default_reasoning_effort.is_some()
-                        || !model.supported_reasoning_efforts.is_empty()
-                    {
-                        lines.push(format!(
-                            "    reasoning default={} · supported={}",
-                            model.default_reasoning_effort.as_deref().unwrap_or("--"),
-                            if model.supported_reasoning_efforts.is_empty() {
-                                "--".to_string()
-                            } else {
-                                model.supported_reasoning_efforts.join(", ")
-                            }
-                        ));
-                    }
-                    if !model.input_modalities.is_empty()
-                        || !model.additional_speed_tiers.is_empty()
-                        || !model.service_tiers.is_empty()
-                    {
-                        lines.push(format!(
-                            "    modalities={} · speed={} · tiers={} · default tier={}",
-                            if model.input_modalities.is_empty() {
-                                "--".to_string()
-                            } else {
-                                model.input_modalities.join(", ")
-                            },
-                            if model.additional_speed_tiers.is_empty() {
-                                "--".to_string()
-                            } else {
-                                model.additional_speed_tiers.join(", ")
-                            },
-                            if model.service_tiers.is_empty() {
-                                "--".to_string()
-                            } else {
-                                model.service_tiers.join(", ")
-                            },
-                            model.default_service_tier.as_deref().unwrap_or("--")
-                        ));
-                    }
-                    if model.auto_compact_token_limit.is_some()
-                        || model.effective_context_window_percent.is_some()
-                    {
-                        lines.push(format!(
-                            "    auto compact={} · effective context={}{}",
-                            model
-                                .auto_compact_token_limit
-                                .map(|value| value.to_string())
-                                .unwrap_or_else(|| "--".to_string()),
-                            model
-                                .effective_context_window_percent
-                                .map(|value| value.to_string())
-                                .unwrap_or_else(|| "--".to_string()),
-                            if model.effective_context_window_percent.is_some() {
-                                "%"
-                            } else {
-                                ""
-                            }
-                        ));
-                    }
-                    if model.supports_parallel_tool_calls.is_some()
-                        || model.supports_image_detail_original.is_some()
-                        || model.supports_search_tool.is_some()
-                        || model.use_responses_lite.is_some()
-                        || !model.experimental_supported_tools.is_empty()
-                    {
-                        let flag = |value: Option<bool>| match value {
-                            Some(true) => "yes",
-                            Some(false) => "no",
-                            None => "--",
-                        };
-                        lines.push(format!(
-                            "    parallel={} · image-original={} · search={} · lite={} · tools={}",
-                            flag(model.supports_parallel_tool_calls),
-                            flag(model.supports_image_detail_original),
-                            flag(model.supports_search_tool),
-                            flag(model.use_responses_lite),
-                            if model.experimental_supported_tools.is_empty() {
-                                "--".to_string()
-                            } else {
-                                model.experimental_supported_tools.join(", ")
-                            }
-                        ));
                     }
                     lines
                 })
@@ -619,8 +452,8 @@ impl App {
                     .flat_map(wrap_account_detail_line)
                     .collect(),
                 auth_expiries,
+                usage: loaded_usage.cloned().map(Box::new),
                 usage_meta,
-                quota_pools,
                 models,
                 reset_cards,
                 reset_card_expiries,
@@ -2116,6 +1949,10 @@ mod tests {
                 Ok(vec![ModelEntry {
                     slug: "official-slug".into(),
                     display_name: Some("Official Name".into()),
+                    description: Some("Official description".into()),
+                    visibility: Some("list".into()),
+                    supported_in_api: Some(true),
+                    context_window: Some(372_000),
                     ..ModelEntry::default()
                 }]),
             ))
@@ -2125,11 +1962,17 @@ mod tests {
         let Some(super::super::menu::MenuState::Account { info, .. }) = app.menu else {
             panic!("account detail should remain open");
         };
+        assert!(info.models.iter().any(|line| line == "  Official Name"));
         assert!(
             info.models
                 .iter()
-                .any(|line| line.contains("Official Name (official-slug)"))
+                .any(|line| line.trim() == "Official description")
         );
+        assert!(!info.models.iter().any(|line| {
+            line.contains("official-slug")
+                || line.contains("visibility=")
+                || line.contains("context=")
+        }));
     }
 
     #[test]
@@ -2154,11 +1997,6 @@ mod tests {
         let Some(super::super::menu::MenuState::Account { info, .. }) = app.menu else {
             panic!("account detail should remain open");
         };
-        assert!(
-            !info
-                .quota_pools
-                .iter()
-                .any(|line| line == "  usage not loaded")
-        );
+        assert!(info.usage.is_some());
     }
 }

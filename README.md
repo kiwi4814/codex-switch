@@ -49,7 +49,7 @@ Prefer plain commands? Run `codex-switch list` to inspect accounts and `codex-sw
 
 - **Profile Management** — Save, switch, rename, delete Codex accounts
 - **Auto-Detection** — Automatically discovers and tracks the current `auth.json`
-- **Usage Dashboard** — Live quota monitoring (5h and 7d windows) with status indicators and per-account refresh timestamps; accounts with per-model quota pools (e.g. Pro 20×) show each pool as an indented sub-row, and the TUI detail panel lists the account's available models
+- **Usage Dashboard** — Live quota monitoring with color-coded 5h/7d progress bars for the main quota and every additional model quota pool returned by the API; the account page pairs quota visuals with the official model names and descriptions
 - **Reset Cards (v0.0.20)** — Show Codex reset card counts and expiry times, then consume the earliest-expiring available card from CLI or TUI after confirmation
 - **Adaptive Auto-Switch** — `codex-switch use` without arguments ranks accounts with a unified 5-component scoring algorithm, with Team accounts prioritized by default
 - **Background Daemon (Beta)** — Optional `daemon` command uses LaunchAgent on macOS, a systemd user service on Linux, and Task Scheduler on Windows
@@ -60,7 +60,7 @@ Prefer plain commands? Run `codex-switch list` to inspect accounts and `codex-sw
 - **Token Auto-Refresh** — Automatically refreshes expired tokens using refresh_token
 - **Validated Bulk Import** — Import a single `auth.json` or recursively scan a directory, validate files, and auto-assign unique aliases
 - **Pace Marker** — Visual indicator on usage bars showing expected consumption based on elapsed window time
-- **Warmup** — `warmup` sends a minimal request to activate the quota window countdown, skipping already-active accounts
+- **Warmup** — `warmup` activates the main window and every model-specific `codex_*` quota pool that can be matched to the authenticated models response, while skipping already-active accounts
 - **Manual Self-Update** — `self-update --check` checks GitHub Releases on demand; `self-update` installs the latest release (supports stable and dev channels)
 - **Launch with Profile** — `launch` starts Codex CLI with a specific (or best) profile's auth, transparently forwarding all arguments. Auth is swapped only during startup, then immediately restored
 - **Over-Pace Warning** — Red `!` indicator on 5h/7d columns when usage exceeds expected pace

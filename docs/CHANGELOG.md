@@ -14,7 +14,7 @@
 - **Plan-aware labels and colors** — CLI and TUI now recognize Go, distinguish `Pro 5×` (`prolite`) from `Pro 20×` (`pro`), normalize workspace plan names, preserve unknown backend values, and use a shared semantic color family without relying on color alone.
 - **Authoritative workspace names** — Login and explicit account refreshes now mirror Codex's authenticated `accounts/check` request, match the selected account ID, cache the returned workspace name outside `auth.json`, and expose it in human and JSON output without guessing from an unrelated default organization.
 - **Reset-card aware auto-switching** — `codex-switch use`/`launch` (no alias) now consider reset cards when the whole pool is exhausted: `--consume-card` (or an interactive y/N prompt) consumes the earliest-expiring card to revive an account instead of settling for an exhausted one; non-interactive/JSON runs without the flag surface a `hint` instead of consuming anything.
-- **Per-model quota pools** — `list`/`use`/`best` (human and JSON output) surface `additional_rate_limits[]` pools (e.g. Pro 20×'s per-model `GPT-5.3-Codex-Spark` pool), and warmup can activate both the main and eligible per-model quota windows.
+- **Per-model quota pools** — `list`/`use`/`best` surface `additional_rate_limits[]` pools; the TUI renders the main and every additional pool as separate 5h/7d progress bars. Warmup generically matches `codex_*` pool names to authenticated model names/slugs, so Pro 20× Spark and future model pools can each be activated without hardcoded model exceptions.
 
 ### Changed
 
@@ -26,7 +26,7 @@
 - **Cross-platform daemon lifecycle** — launchd, systemd user services, and Windows Task Scheduler preserve `CODEX_HOME`; PID files include executable identity and an active OS lock; stale or legacy PID data is never trusted for signaling; zero daemon intervals normalize to 60/300/300 seconds.
 - **Fail-fast configuration** — An existing unreadable, malformed, or dangling-symlink `config.toml` now reports the real error instead of silently starting with defaults; defaults remain limited to a genuinely missing file.
 - **Internal module layout** — The oversized `usage.rs` (2,645 lines) and `main.rs` (1,740 lines) were split into focused submodules (`usage/{scoring,api,reset_credits,parse}` and `commands/`) as a pure mechanical move; public paths, behavior, and tests are unchanged.
-- **TUI account information hierarchy** — The home screen keeps only the essential 5h/7d quota gauges, while Enter opens a scrollable account page with identity, organization, token expiry, quota/spend-control/reset-card details, and the complete model catalog returned by Codex's live models endpoint.
+- **TUI account information hierarchy** — The home screen keeps only the essential 5h/7d quota gauges. Enter opens a responsive account page: wide terminals keep identity/quota/actions on the left and official model names/descriptions on the right, while narrow or short terminals fall back to one safe scrollable column.
 
 ### Fixed
 

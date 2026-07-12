@@ -35,7 +35,12 @@ pub fn usage_has_active_warmup_window(u: &UsageInfo, now: i64) -> bool {
     let additional_active = u
         .additional_limits
         .iter()
-        .filter(|limit| limit.metered_feature.as_deref() == Some("codex_bengalfox"))
+        .filter(|limit| {
+            limit
+                .metered_feature
+                .as_deref()
+                .is_some_and(|feature| feature.starts_with("codex_"))
+        })
         .all(|limit| {
             if limit.allowed == Some(false) || limit.limit_reached == Some(true) {
                 return true;
@@ -985,16 +990,16 @@ mod tests {
     }
 
     #[test]
-    fn test_inactive_additional_pool_requires_warmup_even_when_main_pool_is_active() {
+    fn test_inactive_future_model_pool_requires_warmup_even_when_main_pool_is_active() {
         let now = 1_000_000i64;
         let active_5h = WindowUsage {
             used_percent: Some(20.0),
             resets_at: Some(now + WINDOW_5H_SECS - MIN_WARMUP_ELAPSED_SECS),
             window_minutes: None,
         };
-        let inactive_spark = super::super::AdditionalRateLimit {
-            limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
-            metered_feature: Some("codex_bengalfox".to_string()),
+        let inactive_future_pool = super::super::AdditionalRateLimit {
+            limit_name: Some("GPT-6-Codex-Burst".to_string()),
+            metered_feature: Some("codex_futureburst".to_string()),
             allowed: Some(true),
             limit_reached: Some(false),
             primary: None,
@@ -1002,7 +1007,7 @@ mod tests {
         };
         let u = UsageInfo {
             primary: Some(active_5h),
-            additional_limits: vec![inactive_spark],
+            additional_limits: vec![inactive_future_pool],
             ..Default::default()
         };
 
