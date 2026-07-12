@@ -1,6 +1,8 @@
 # Changelog
 
-## v20260712.1.0 — Unreleased
+## v20260712.2.0 — Unreleased
+
+- **Dev update compatibility** — Bumped the rolling dev base to `20260712.2.0` so clients already on the legacy timestamped `20260712.1.0-dev.*` build can upgrade to the short `20260712.2.0-dev` version.
 
 ### Added
 

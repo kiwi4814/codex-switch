@@ -242,7 +242,7 @@ codex-switch self-update --dev
 codex-switch self-update --stable
 
 # 安装指定正式版本（不支持降级）
-codex-switch self-update --version 20260712.1.0
+codex-switch self-update --version 20260712.2.0
 ```
 
 - Homebrew 安装不会被程序自行覆盖，请使用 `brew upgrade xjoker/tap/codex-switch`

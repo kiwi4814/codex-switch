@@ -243,7 +243,7 @@ codex-switch self-update --dev
 codex-switch self-update --stable
 
 # Install an exact stable release (downgrades are rejected)
-codex-switch self-update --version 20260712.1.0
+codex-switch self-update --version 20260712.2.0
 ```
 
 - Homebrew installs are not self-overwritten. Use `brew upgrade xjoker/tap/codex-switch`.

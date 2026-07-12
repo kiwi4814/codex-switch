@@ -200,7 +200,7 @@ fn release_docs_describe_platform_specific_archive_formats() {
 fn changelog_tracks_the_calendar_version_development_cycle() {
     let changelog = repo_file("docs/CHANGELOG.md");
     assert!(
-        changelog.contains("## v20260712.1.0 — Unreleased"),
+        changelog.contains("## v20260712.2.0 — Unreleased"),
         "the active calendar-version development cycle must be tracked before release"
     );
 }
