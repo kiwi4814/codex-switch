@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
 
-use super::app::{App, UsageStatus};
+use super::app::{App, ModelStatus, UsageStatus};
 use super::keymap;
 use super::popup;
 use crate::jwt::PlanKind;
@@ -14,7 +14,12 @@ use crate::output::{
     format_local_datetime, format_local_time, format_reset_short, format_reset_time,
     reset_credits_count,
 };
-use crate::usage::{UsageInfo, earliest_reset_credit, is_available};
+use crate::usage::{
+    PoolRow, UsageInfo, WindowUsage, additional_pool_rows, earliest_reset_credit, is_available,
+};
+use crate::warmup::{is_hidden_model, sorted_models_for_display};
+
+use super::app::AccountEntry;
 
 // ── RGB-only color palette ───────────────────────────────
 // All colors are explicit RGB to avoid mixing ANSI-16 + 24-bit,
@@ -48,7 +53,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     let status_height = status_bar_height(app, area.width);
 
-    let detail_height = if app.detail_visible { 12 } else { 0 };
+    let detail_height = if app.detail_visible {
+        detail_panel_height(app)
+    } else {
+        0
+    };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -164,12 +173,11 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
     ])
     .height(1);
 
-    let rows: Vec<Row> = app
-        .view_indices
-        .iter()
-        .enumerate()
-        .map(|(view_i, &acc_i)| {
-            let entry = &app.accounts[acc_i];
+    let mut rows: Vec<Row> = Vec::new();
+    let mut render_selected: usize = 0;
+    for (view_i, &acc_i) in app.view_indices.iter().enumerate() {
+        let entry = &app.accounts[acc_i];
+        let main_row = {
             let is_marked = app.marked.contains(&entry.alias);
             let marker = if is_marked {
                 ">"
@@ -354,8 +362,19 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(reset_cards).style(base().fg(reset_cards_color)),
             ])
             .height(1)
-        })
-        .collect();
+        };
+
+        if view_i == app.selected {
+            render_selected = rows.len();
+        }
+        rows.push(main_row);
+
+        if let UsageStatus::Loaded(u) = &entry.usage {
+            for pool in additional_pool_rows(&u.additional_limits) {
+                rows.push(pool_row(&pool));
+            }
+        }
+    }
 
     let loading_count = app.loading_count();
     let mut title = if let Some(s) = &app.search {
@@ -382,7 +401,7 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
     }
     title.push_str(&format!(" sort:{} ", app.sort_mode.as_str()));
 
-    let mut table_state = TableState::default().with_selected(app.selected);
+    let mut table_state = TableState::default().with_selected(render_selected);
 
     let table = Table::new(
         rows,
@@ -417,6 +436,81 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(table, area, &mut table_state);
 }
 
+/// Render one additional-limit pool as an indented, unselectable sub-row
+/// under its account's main row. Reuses the same cell-coloring helpers
+/// (`remaining_color`, `reset_color`, `format_reset_short`) as the main row.
+fn pool_row(pool: &PoolRow) -> Row<'static> {
+    let now = crate::auth::now_unix_secs();
+
+    let pct_cell = |w: &Option<crate::usage::WindowUsage>| -> (String, Color) {
+        match w.as_ref().and_then(|w| w.used_percent) {
+            Some(pct) => {
+                let remaining = (100.0 - pct).max(0.0);
+                (format!("{remaining:.0}%"), remaining_color(remaining))
+            }
+            None => ("--".to_string(), DIM),
+        }
+    };
+    let reset_cell = |w: &Option<crate::usage::WindowUsage>| -> (String, Color) {
+        match w.as_ref().and_then(|w| w.resets_at) {
+            Some(ts) => (format_reset_short(ts), reset_color(ts - now)),
+            None => ("--".to_string(), DIM),
+        }
+    };
+
+    let (p5, p5c) = pct_cell(&pool.primary);
+    let (p7, p7c) = pct_cell(&pool.secondary);
+    let (r5, r5c) = reset_cell(&pool.primary);
+    let (r7, r7c) = reset_cell(&pool.secondary);
+    let (status_text, status_color) = if pool.unavailable {
+        ("exhausted".to_string(), C_RED)
+    } else {
+        (String::new(), DIM)
+    };
+
+    Row::new(vec![
+        Cell::from(""),
+        Cell::from(format!("  \u{2514} {}", pool.limit_name)).style(base().fg(DIM)),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(status_text).style(base().fg(status_color)),
+        Cell::from(p5).style(base().fg(p5c)),
+        Cell::from(p7).style(base().fg(p7c)),
+        Cell::from(r5).style(base().fg(r5c)),
+        Cell::from(r7).style(base().fg(r7c)),
+        Cell::from(""),
+    ])
+    .height(1)
+}
+
+/// Number of additional-limit pools for the currently-selected account
+/// (0 when nothing is selected, usage isn't loaded, or there are none).
+/// Capped so a pathological pool count can't blow out the panel layout.
+fn quota_pool_count(app: &App) -> usize {
+    app.selected_account_idx()
+        .and_then(|idx| app.accounts.get(idx))
+        .map(|e| match &e.usage {
+            UsageStatus::Loaded(u) => additional_pool_rows(&u.additional_limits).len(),
+            _ => 0,
+        })
+        .unwrap_or(0)
+        .min(4)
+}
+
+const MODELS_BLOCK_HEIGHT: u16 = 6;
+const GAUGES_BLOCK_HEIGHT: u16 = 6;
+
+/// Total height needed for the detail panel: info row + gauges + the new
+/// "Quota pools" and "Models" sections + borders. Grows with the selected
+/// account's additional-pool count (capped) so Pro 20x-style accounts with
+/// a per-model pool get enough room without wasting space on plain accounts.
+fn detail_panel_height(app: &App) -> u16 {
+    let qpc = quota_pool_count(app) as u16;
+    let quota_block = qpc + 3; // header + main-pool line + additional pools + reset-card line
+    1 /* info */ + 1 /* spacer */ + GAUGES_BLOCK_HEIGHT + 1 /* spacer */
+        + quota_block + 1 /* spacer */ + MODELS_BLOCK_HEIGHT + 2 /* borders */
+}
+
 fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
     let entry = match app
         .selected_account_idx()
@@ -441,12 +535,17 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let qpc = quota_pool_count(app) as u16;
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // account info row
-            Constraint::Length(1), // spacer
-            Constraint::Min(4),    // usage gauges
+            Constraint::Length(1),                   // account info row
+            Constraint::Length(1),                   // spacer
+            Constraint::Length(GAUGES_BLOCK_HEIGHT), // usage gauges
+            Constraint::Length(1),                   // spacer
+            Constraint::Length(qpc + 3),             // quota pools section
+            Constraint::Length(1),                   // spacer
+            Constraint::Min(MODELS_BLOCK_HEIGHT),    // models section
         ])
         .margin(1)
         .split(inner);
@@ -499,6 +598,139 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             render_usage_gauges(f, u, layout[2]);
         }
     }
+
+    render_quota_pools_block(f, entry, layout[4]);
+    render_models_block(f, app, entry, layout[6]);
+}
+
+/// "Quota pools" section: one line for the main pool, one per
+/// additional-limit pool, then a reset-card summary line.
+fn render_quota_pools_block(f: &mut Frame, entry: &AccountEntry, area: Rect) {
+    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        "Quota pools",
+        base().fg(C_CYAN).add_modifier(Modifier::BOLD),
+    ))];
+
+    match &entry.usage {
+        UsageStatus::Loaded(u) => {
+            lines.push(quota_summary_line(
+                "Main",
+                u.primary.as_ref(),
+                u.secondary.as_ref(),
+                false,
+            ));
+            for pool in additional_pool_rows(&u.additional_limits) {
+                lines.push(quota_summary_line(
+                    &pool.limit_name,
+                    pool.primary.as_ref(),
+                    pool.secondary.as_ref(),
+                    pool.unavailable,
+                ));
+            }
+            if let Some(summary) = crate::output::reset_credits_compact(u) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {summary}"),
+                    base().fg(DIM),
+                )));
+            }
+        }
+        UsageStatus::Loading => {
+            lines.push(Line::from(Span::styled(
+                "  fetching usage...",
+                base().fg(C_YELLOW),
+            )));
+        }
+        UsageStatus::Error(_) | UsageStatus::Idle => {
+            lines.push(Line::from(Span::styled("  --", base().fg(DIM))));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines).style(base()), area);
+}
+
+fn quota_summary_line(
+    name: &str,
+    primary: Option<&WindowUsage>,
+    secondary: Option<&WindowUsage>,
+    unavailable: bool,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(format!("  {name}  "), base().fg(C_WHITE))];
+    if let Some(w) = primary {
+        let pct = w.used_percent.unwrap_or(0.0);
+        let remaining = (100.0 - pct).max(0.0);
+        spans.push(Span::styled(
+            format!("5h {remaining:.0}% left  "),
+            base().fg(remaining_color(remaining)),
+        ));
+    }
+    if let Some(w) = secondary {
+        let pct = w.used_percent.unwrap_or(0.0);
+        let remaining = (100.0 - pct).max(0.0);
+        spans.push(Span::styled(
+            format!("7d {remaining:.0}% left  "),
+            base().fg(remaining_color(remaining)),
+        ));
+    }
+    if unavailable {
+        spans.push(Span::styled(
+            "[exhausted]",
+            base().fg(C_RED).add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// "Models" section: the account's available model list (from the
+/// `/models` endpoint), sorted by priority ascending; hidden models are
+/// dimmed rather than dropped so their existence stays visible.
+fn render_models_block(f: &mut Frame, app: &App, entry: &AccountEntry, area: Rect) {
+    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        "Models",
+        base().fg(C_CYAN).add_modifier(Modifier::BOLD),
+    ))];
+
+    match app.model_cache.get(&entry.alias) {
+        None | Some(ModelStatus::Loading) => {
+            lines.push(Line::from(Span::styled(
+                "  loading models...",
+                base().fg(DIM),
+            )));
+        }
+        Some(ModelStatus::Error(e)) => {
+            lines.push(Line::from(Span::styled(
+                format!("  error: {e}"),
+                base().fg(C_RED),
+            )));
+        }
+        Some(ModelStatus::Loaded(models)) => {
+            if models.is_empty() {
+                lines.push(Line::from(Span::styled("  (no models)", base().fg(DIM))));
+            } else {
+                let sorted = sorted_models_for_display(models);
+                let max_rows = (area.height.saturating_sub(1) as usize).max(1);
+                for m in sorted.iter().take(max_rows) {
+                    let label = match &m.display_name {
+                        Some(name) => format!("{name} ({})", m.slug),
+                        None => m.slug.clone(),
+                    };
+                    let style = if is_hidden_model(m) {
+                        base().fg(DIM)
+                    } else {
+                        base().fg(C_GRAY)
+                    };
+                    lines.push(Line::from(Span::styled(format!("  {label}"), style)));
+                }
+                if sorted.len() > max_rows {
+                    lines.push(Line::from(Span::styled(
+                        format!("  ... {} more", sorted.len() - max_rows),
+                        base().fg(DIM),
+                    )));
+                }
+            }
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines).style(base()), area);
 }
 
 fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {

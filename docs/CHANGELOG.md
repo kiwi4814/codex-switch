@@ -14,6 +14,7 @@
 - **Plan-aware labels and colors** — CLI and TUI now recognize Go, distinguish `Pro 5×` (`prolite`) from `Pro 20×` (`pro`), normalize workspace plan names, preserve unknown backend values, and use a shared semantic color family without relying on color alone.
 - **Authoritative workspace names** — Login and explicit account refreshes now mirror Codex's authenticated `accounts/check` request, match the selected account ID, cache the returned workspace name outside `auth.json`, and expose it in human and JSON output without guessing from an unrelated default organization.
 - **Reset-card aware auto-switching** — `codex-switch use`/`launch` (no alias) now consider reset cards when the whole pool is exhausted: `--consume-card` (or an interactive y/N prompt) consumes the earliest-expiring card to revive an account instead of settling for an exhausted one; non-interactive/JSON runs without the flag surface a `hint` instead of consuming anything.
+- **Per-model quota pools** — `list`/`use`/`best` (human and JSON output) and the TUI now surface `additional_rate_limits[]` pools (e.g. Pro 20×'s per-model `GPT-5.3-Codex-Spark` pool) as indented sub-rows under the owning account, with exhausted pools flagged; the TUI detail panel (`i`) adds a Quota pools summary and a lazily-fetched, priority-sorted Models list per account.
 
 ### Changed
 

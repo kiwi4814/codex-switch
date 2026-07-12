@@ -49,7 +49,7 @@ Prefer plain commands? Run `codex-switch list` to inspect accounts and `codex-sw
 
 - **Profile Management** — Save, switch, rename, delete Codex accounts
 - **Auto-Detection** — Automatically discovers and tracks the current `auth.json`
-- **Usage Dashboard** — Live quota monitoring (5h and 7d windows) with status indicators and per-account refresh timestamps
+- **Usage Dashboard** — Live quota monitoring (5h and 7d windows) with status indicators and per-account refresh timestamps; accounts with per-model quota pools (e.g. Pro 20×) show each pool as an indented sub-row, and the TUI detail panel lists the account's available models
 - **Reset Cards (v0.0.20)** — Show Codex reset card counts and expiry times, then consume the earliest-expiring available card from CLI or TUI after confirmation
 - **Adaptive Auto-Switch** — `codex-switch use` without arguments ranks accounts with a unified 5-component scoring algorithm, with Team accounts prioritized by default
 - **Background Daemon (Beta)** — Optional `daemon` command uses LaunchAgent on macOS, a systemd user service on Linux, and Task Scheduler on Windows

@@ -6,7 +6,7 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::jwt::AccountInfo;
-use crate::usage::{ResetCredit, UsageInfo, WindowUsage};
+use crate::usage::{AdditionalRateLimit, ResetCredit, UsageInfo, WindowUsage};
 
 // ── JSON types ───────────────────────────────────────────
 
@@ -29,6 +29,18 @@ pub struct JsonWindow {
     pub pace_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub over_pace: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct JsonAdditionalLimit {
+    pub limit_name: Option<String>,
+    pub metered_feature: Option<String>,
+    pub allowed: Option<bool>,
+    pub limit_reached: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary: Option<Box<JsonWindow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<Box<JsonWindow>>,
 }
 
 #[derive(Serialize)]
@@ -56,6 +68,8 @@ pub enum JsonUsage {
         reset_credits: Vec<JsonResetCredit>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reset_credits_error: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        additional_limits: Vec<JsonAdditionalLimit>,
     },
     Err {
         error: String,
@@ -169,6 +183,23 @@ fn reset_credit_to_json(credit: &ResetCredit) -> JsonResetCredit {
     }
 }
 
+fn additional_limit_to_json(l: &AdditionalRateLimit) -> JsonAdditionalLimit {
+    JsonAdditionalLimit {
+        limit_name: l.limit_name.clone(),
+        metered_feature: l.metered_feature.clone(),
+        allowed: l.allowed,
+        limit_reached: l.limit_reached,
+        primary: l
+            .primary
+            .as_ref()
+            .map(|w| Box::new(window_to_json(w, "5h", crate::usage::WINDOW_5H_SECS))),
+        secondary: l
+            .secondary
+            .as_ref()
+            .map(|w| Box::new(window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS))),
+    }
+}
+
 pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
     match result {
         Err(e) => JsonUsage::Err {
@@ -194,6 +225,11 @@ pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
                 reset_credits_available_count: u.reset_credits_available_count,
                 reset_credits: u.reset_credits.iter().map(reset_credit_to_json).collect(),
                 reset_credits_error: u.reset_credits_error.clone(),
+                additional_limits: u
+                    .additional_limits
+                    .iter()
+                    .map(additional_limit_to_json)
+                    .collect(),
             }
         }
     }

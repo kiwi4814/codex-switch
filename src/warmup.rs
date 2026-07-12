@@ -110,6 +110,20 @@ fn parse_models_body(body: &serde_json::Value) -> Result<Vec<ModelEntry>> {
         .collect())
 }
 
+/// Sort models for display: ascending priority (lowest number first), unknown
+/// priority sorts last. Does not filter hidden models — callers decide how to
+/// present `visibility == "hide"` entries (e.g. dim them rather than drop them).
+pub(crate) fn sorted_models_for_display(models: &[ModelEntry]) -> Vec<&ModelEntry> {
+    let mut sorted: Vec<&ModelEntry> = models.iter().collect();
+    sorted.sort_by_key(|m| m.priority.unwrap_or(i64::MAX));
+    sorted
+}
+
+/// True when the model's `visibility` marks it hidden from normal listings.
+pub(crate) fn is_hidden_model(m: &ModelEntry) -> bool {
+    m.visibility.as_deref() == Some("hide")
+}
+
 /// Fetch and parse the full model list from the `/models` endpoint.
 pub(crate) async fn fetch_models(
     client: &reqwest::Client,
@@ -412,6 +426,54 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
     }
 }
 
+/// Fetch the full model list for a profile (for display, e.g. the TUI detail
+/// panel). Unlike `warmup_account`, this never sends a warmup ping — it only
+/// refreshes an expiring access token before calling the `/models` endpoint.
+pub(crate) async fn fetch_models_for_profile(
+    alias: &str,
+    profile_path: &Path,
+) -> Result<Vec<ModelEntry>> {
+    let val = crate::auth::read_auth(profile_path)
+        .map_err(|e| anyhow::anyhow!("{alias}: cannot read auth: {e}"))?;
+
+    let (at, rt) = crate::auth::extract_tokens(&val);
+    let id_token = crate::auth::extract_id_token(&val);
+    let mut access_token = at
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{alias}: no access_token in profile"))?;
+    let refresh_token = rt.filter(|s| !s.is_empty());
+
+    let info = crate::auth::read_account_info(profile_path);
+    let account_id = info.account_id;
+    let is_fedramp = info.is_fedramp;
+
+    let client = crate::auth::build_http_client()?;
+
+    if let Some(ref rt) = refresh_token
+        && crate::jwt::is_token_expiring(&access_token, 60) == Some(true)
+        && let Ok(refreshed) = crate::usage::do_refresh_token(
+            alias,
+            &client,
+            id_token.as_deref(),
+            Some(&access_token),
+            rt,
+        )
+        .await
+    {
+        if let Err(e) = crate::profile::update_profile_tokens_and_live_if_current(
+            alias,
+            &refreshed.id_token,
+            &refreshed.access_token,
+            &refreshed.refresh_token,
+        ) {
+            warn!("[{alias}] failed to persist refreshed tokens: {e}");
+        }
+        access_token = refreshed.access_token;
+    }
+
+    fetch_models(&client, &access_token, account_id.as_deref(), is_fedramp).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +560,67 @@ mod tests {
     fn test_parse_models_body_missing_array_errors() {
         let body = serde_json::json!({});
         assert!(parse_models_body(&body).is_err());
+    }
+
+    #[test]
+    fn test_sorted_models_for_display_orders_by_priority_ascending() {
+        let models = vec![
+            ModelEntry {
+                slug: "b".to_string(),
+                display_name: None,
+                visibility: None,
+                priority: Some(3),
+                supported_in_api: None,
+                context_window: None,
+            },
+            ModelEntry {
+                slug: "a".to_string(),
+                display_name: None,
+                visibility: None,
+                priority: Some(1),
+                supported_in_api: None,
+                context_window: None,
+            },
+            ModelEntry {
+                slug: "c-no-priority".to_string(),
+                display_name: None,
+                visibility: None,
+                priority: None,
+                supported_in_api: None,
+                context_window: None,
+            },
+        ];
+
+        let sorted = sorted_models_for_display(&models);
+        let slugs: Vec<&str> = sorted.iter().map(|m| m.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["a", "b", "c-no-priority"]);
+    }
+
+    #[test]
+    fn test_sorted_models_for_display_empty_list() {
+        assert!(sorted_models_for_display(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_is_hidden_model_detects_hide_visibility() {
+        let hidden = ModelEntry {
+            slug: "hidden".to_string(),
+            display_name: None,
+            visibility: Some("hide".to_string()),
+            priority: None,
+            supported_in_api: None,
+            context_window: None,
+        };
+        let visible = ModelEntry {
+            slug: "visible".to_string(),
+            display_name: None,
+            visibility: Some("List".to_string()),
+            priority: None,
+            supported_in_api: None,
+            context_window: None,
+        };
+        assert!(is_hidden_model(&hidden));
+        assert!(!is_hidden_model(&visible));
     }
 
     #[test]

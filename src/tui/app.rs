@@ -19,6 +19,7 @@ use crate::profile::{
 use crate::usage::{
     ConsumedResetCredit, UsageError, UsageInfo, fetch_usage_retried, fetch_usage_retried_force,
 };
+use crate::warmup::ModelEntry;
 
 #[derive(Debug, Clone)]
 pub struct AccountEntry {
@@ -34,6 +35,13 @@ pub enum UsageStatus {
     Loading,
     Loaded(UsageInfo),
     Error(UsageError),
+}
+
+#[derive(Debug, Clone)]
+pub enum ModelStatus {
+    Loading,
+    Loaded(Vec<ModelEntry>),
+    Error(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +116,11 @@ pub struct App {
     pub detail_visible: bool,
     pub help_popup: Option<super::popup::PopupState>,
     pub menu: Option<super::menu::MenuState>,
+    /// Session-level per-alias model list cache (no TTL). Populated lazily
+    /// when the detail panel is open and an account is selected.
+    pub model_cache: HashMap<String, ModelStatus>,
+    pub pending_models: tokio::sync::mpsc::Receiver<(String, Result<Vec<ModelEntry>, String>)>,
+    pub model_sender: tokio::sync::mpsc::Sender<(String, Result<Vec<ModelEntry>, String>)>,
 }
 
 impl App {
@@ -116,6 +129,7 @@ impl App {
         let (workspace_tx, workspace_rx) = tokio::sync::mpsc::channel(128);
         let (warmup_tx, warmup_rx) = tokio::sync::mpsc::channel(64);
         let (reset_card_tx, reset_card_rx) = tokio::sync::mpsc::channel(16);
+        let (model_tx, model_rx) = tokio::sync::mpsc::channel(32);
         let cfg = crate::config::get();
         App {
             accounts: vec![],
@@ -150,6 +164,64 @@ impl App {
             detail_visible: true,
             help_popup: None,
             menu: None,
+            model_cache: HashMap::new(),
+            pending_models: model_rx,
+            model_sender: model_tx,
+        }
+    }
+
+    /// Kick off a model-list fetch for `alias` if the detail panel needs it
+    /// and it isn't already loaded or in flight. Idempotent — safe to call
+    /// every frame.
+    pub fn ensure_models_loaded(&mut self, alias: &str) {
+        if matches!(
+            self.model_cache.get(alias),
+            Some(ModelStatus::Loaded(_)) | Some(ModelStatus::Loading)
+        ) {
+            return;
+        }
+        let path = match profile_auth_path(alias) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        self.model_cache
+            .insert(alias.to_string(), ModelStatus::Loading);
+        let alias_owned = alias.to_string();
+        let tx = self.model_sender.clone();
+        let limiter = self.usage_limiter.clone();
+        tokio::spawn(async move {
+            let _permit = limiter.acquire().await;
+            let result = crate::warmup::fetch_models_for_profile(&alias_owned, &path)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send((alias_owned, result)).await;
+        });
+    }
+
+    /// Fetch the model list for the currently-selected account, if the
+    /// detail panel is visible. No-op when nothing is selected.
+    pub fn ensure_models_loaded_for_selected(&mut self) {
+        if !self.detail_visible {
+            return;
+        }
+        if let Some(alias) = self
+            .selected_account_idx()
+            .and_then(|idx| self.accounts.get(idx))
+            .map(|e| e.alias.clone())
+        {
+            self.ensure_models_loaded(&alias);
+        }
+    }
+
+    pub fn poll_model_results(&mut self) {
+        while let Ok((alias, result)) = self.pending_models.try_recv() {
+            self.model_cache.insert(
+                alias,
+                match result {
+                    Ok(models) => ModelStatus::Loaded(models),
+                    Err(e) => ModelStatus::Error(e),
+                },
+            );
         }
     }
 
@@ -1249,9 +1321,11 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         app.poll_results();
         app.poll_warmup_results();
         app.poll_reset_card_results();
+        app.poll_model_results();
         app.poll_update();
         app.tick();
         app.run_due_auto_refresh();
+        app.ensure_models_loaded_for_selected();
 
         terminal
             .draw(|f| super::ui::render(f, &mut app))

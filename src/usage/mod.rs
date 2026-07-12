@@ -34,8 +34,6 @@ pub struct WindowUsage {
 
 /// One entry from the `additional_rate_limits` array in the usage API response.
 /// Represents a metered feature (e.g. `codex_other`) with its own independent windows.
-// Data layer only for now; consumers (display/scoring) land in a follow-up card.
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub struct AdditionalRateLimit {
     pub limit_name: Option<String>,
@@ -76,9 +74,33 @@ pub struct UsageInfo {
     /// Explicit account/workspace-level restriction reported by the API.
     pub account_limited: bool,
     /// Per-feature rate limits from `additional_rate_limits[]` (e.g. codex_other).
-    /// Data layer only for now; not yet consumed by display/scoring.
-    #[allow(dead_code)]
     pub additional_limits: Vec<AdditionalRateLimit>,
+}
+
+/// One assembled display row for an additional-limit pool. Pure data,
+/// derived from `AdditionalRateLimit` so CLI and TUI renderers can share
+/// the same assembly logic instead of each re-deriving `unavailable`.
+#[derive(Debug, Clone)]
+pub struct PoolRow {
+    pub limit_name: String,
+    /// True when the API reports the pool as exhausted or disallowed.
+    pub unavailable: bool,
+    pub primary: Option<WindowUsage>,
+    pub secondary: Option<WindowUsage>,
+}
+
+/// Assemble display rows from the raw `additional_limits` array. Returns an
+/// empty vec when there are no additional pools (the common case today).
+pub fn additional_pool_rows(limits: &[AdditionalRateLimit]) -> Vec<PoolRow> {
+    limits
+        .iter()
+        .map(|l| PoolRow {
+            limit_name: l.limit_name.clone().unwrap_or_else(|| "pool".to_string()),
+            unavailable: l.limit_reached == Some(true) || l.allowed == Some(false),
+            primary: l.primary.clone(),
+            secondary: l.secondary.clone(),
+        })
+        .collect()
 }
 
 /// All data needed to score an account. Pure data, no I/O.
@@ -206,4 +228,65 @@ pub struct ScoredCandidate {
     pub candidate: Candidate,
     pub usage: UsageInfo,
     pub score: f64,
+}
+
+#[cfg(test)]
+mod pool_row_tests {
+    use super::*;
+
+    #[test]
+    fn empty_additional_limits_yields_no_rows() {
+        assert!(additional_pool_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn pool_with_both_windows_produces_one_row() {
+        let limits = vec![AdditionalRateLimit {
+            limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+            metered_feature: Some("codex_other".to_string()),
+            allowed: Some(true),
+            limit_reached: Some(false),
+            primary: Some(WindowUsage {
+                used_percent: Some(42.0),
+                resets_at: Some(1000),
+            }),
+            secondary: Some(WindowUsage {
+                used_percent: Some(10.0),
+                resets_at: Some(2000),
+            }),
+        }];
+
+        let rows = additional_pool_rows(&limits);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].limit_name, "GPT-5.3-Codex-Spark");
+        assert!(!rows[0].unavailable);
+        assert_eq!(rows[0].primary.as_ref().unwrap().used_percent, Some(42.0));
+        assert_eq!(rows[0].secondary.as_ref().unwrap().used_percent, Some(10.0));
+    }
+
+    #[test]
+    fn limit_reached_pool_is_marked_unavailable() {
+        let limits = vec![AdditionalRateLimit {
+            limit_name: Some("exhausted-pool".to_string()),
+            limit_reached: Some(true),
+            allowed: Some(true),
+            ..Default::default()
+        }];
+
+        let rows = additional_pool_rows(&limits);
+        assert!(rows[0].unavailable);
+    }
+
+    #[test]
+    fn disallowed_pool_is_marked_unavailable() {
+        let limits = vec![AdditionalRateLimit {
+            limit_name: Some("disallowed-pool".to_string()),
+            allowed: Some(false),
+            limit_reached: Some(false),
+            ..Default::default()
+        }];
+
+        let rows = additional_pool_rows(&limits);
+        assert!(rows[0].unavailable);
+    }
 }

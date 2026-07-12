@@ -89,6 +89,44 @@ pub(crate) fn format_reset_short_relative(w: &usage::WindowUsage) -> String {
     }
 }
 
+/// Render one additional-limit pool's window as a compact segment, e.g.
+/// "5h [====------] 60% left". Reuses the same bar/color helpers as the
+/// primary account's usage line.
+fn pool_window_segment(label: &str, w: &usage::WindowUsage, window_secs: i64) -> String {
+    let pct = w.used_percent.unwrap_or(0.0);
+    let remaining_pct = (100.0 - pct).max(0.0);
+    let pace = usage::visible_pace_percent(w, window_secs);
+    let bar = render_progress_bar(pct, pace, 10);
+    format!(
+        "{} [{}] {}",
+        color::dim(label),
+        color::usage_pct(&bar, pct),
+        color::usage_pct(&format!("{remaining_pct:.0}% left"), pct),
+    )
+}
+
+/// Print one indented sub-line per additional-limit pool (e.g. per-model
+/// quota pools on Pro 20x accounts). No-op when there are no additional pools.
+pub(crate) fn print_additional_pool_lines(limits: &[usage::AdditionalRateLimit]) {
+    for row in usage::additional_pool_rows(limits) {
+        let mut segments = vec![format!(
+            "  {} {}",
+            color::dim("\u{2514}"),
+            color::dim(&row.limit_name)
+        )];
+        if let Some(w) = &row.primary {
+            segments.push(pool_window_segment("5h", w, usage::WINDOW_5H_SECS));
+        }
+        if let Some(w) = &row.secondary {
+            segments.push(pool_window_segment("7d", w, usage::WINDOW_7D_SECS));
+        }
+        if row.unavailable {
+            segments.push(color::error("[exhausted]"));
+        }
+        println!("{}", segments.join("  "));
+    }
+}
+
 pub(crate) fn print_usage_line(u: &usage::UsageInfo) {
     let width = term_width();
     // Each line: "  5h  bar  XXX% left  ~Xh" ≈ bar_width + 30
@@ -140,6 +178,7 @@ pub(crate) fn print_usage_line(u: &usage::UsageInfo) {
             color::dim(&reset),
         );
     }
+    print_additional_pool_lines(&u.additional_limits);
     if let Some(balance) = u.credits_balance {
         let unlimited = u.unlimited_credits == Some(true);
         let text = if unlimited {
