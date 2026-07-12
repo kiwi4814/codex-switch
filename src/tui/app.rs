@@ -11,7 +11,7 @@ use crate::auth;
 use crate::cache;
 use crate::jwt::AccountInfo;
 use crate::login;
-use crate::output::{format_iso8601, format_local_datetime, reset_credits_count};
+use crate::output::{format_local_datetime, format_local_timestamp, reset_credits_count};
 use crate::profile::{
     self, cmd_delete, list_profiles, profile_auth_path, read_current, rename_profile,
     switch_profile, sync_current_from_live, validate_alias,
@@ -317,13 +317,13 @@ impl App {
                             .granted_at
                             .as_deref()
                             .map(format_local_datetime)
-                            .unwrap_or_else(|| "--".to_string());
+                            .unwrap_or_else(|| "grant date unavailable".to_string());
                         let expires = credit
                             .expires_at
                             .as_deref()
                             .map(format_local_datetime)
-                            .unwrap_or_else(|| "no expiry".to_string());
-                        format!("granted {granted} · expires {expires} · id={}", credit.id)
+                            .unwrap_or_else(|| "no expiry date".to_string());
+                        format!("expires {expires} · granted {granted}")
                     })
                     .collect()
             })
@@ -335,41 +335,38 @@ impl App {
             .map(|usage| {
                 let mut items = Vec::new();
                 if let Some(fetched_at) = usage.fetched_at {
-                    items.push(format!("  fetched {}", format_iso8601(fetched_at)));
+                    items.push(format!("  updated {}", format_local_timestamp(fetched_at)));
                 }
                 if usage.account_limited {
-                    items.push("  account limited".to_string());
+                    items.push("  Account access is currently limited".to_string());
                 }
                 if let Some(reason) = &usage.rate_limit_reached_type {
-                    items.push(format!("  limit reason: {reason}"));
+                    items.push(format!("  Reason: {}", reason.replace(['_', '-'], " ")));
                 }
                 if usage.unlimited_credits == Some(true) {
                     items.push("  credits unlimited".to_string());
                 } else if let Some(balance) = usage.credits_balance {
                     items.push(format!("  credits ${balance:.2}"));
                 }
-                if let Some(error) = &usage.reset_credits_error {
-                    items.push(format!("  reset-card details unavailable: {error}"));
+                if usage.reset_credits_error.is_some() {
+                    items.push("  Reset-card details are temporarily unavailable".to_string());
                 }
                 if let Some(limit) = &usage.individual_limit {
-                    let mut parts = vec!["  monthly limit".to_string()];
+                    let mut parts = vec!["  Monthly API limit".to_string()];
                     if let Some(value) = &limit.limit {
-                        parts.push(format!("limit={value}"));
+                        parts.push(format!("{value} total"));
                     }
                     if let Some(value) = &limit.used {
-                        parts.push(format!("used={value}"));
+                        parts.push(format!("{value} used"));
                     }
                     if let Some(value) = &limit.remaining {
-                        parts.push(format!("remaining={value}"));
+                        parts.push(format!("{value} remaining"));
                     }
                     if let Some(value) = limit.remaining_percent {
                         parts.push(format!("{value:.0}% left"));
                     }
                     if let Some(value) = limit.resets_at {
-                        parts.push(format!("reset={}", format_iso8601(value)));
-                    }
-                    if let Some(value) = &limit.source {
-                        parts.push(format!("source={value}"));
+                        parts.push(format!("resets {}", format_local_timestamp(value)));
                     }
                     items.push(parts.join(" · "));
                 }
@@ -391,6 +388,18 @@ impl App {
                     if let Some(description) = &model.description {
                         lines.push(format!("    {description}"));
                     }
+                    let default = model
+                        .default_reasoning_effort
+                        .as_deref()
+                        .unwrap_or("not reported");
+                    let allowed = if model.supported_reasoning_efforts.is_empty() {
+                        "not reported".to_string()
+                    } else {
+                        model.supported_reasoning_efforts.join(", ")
+                    };
+                    lines.push(format!(
+                        "    Reasoning  default {default} · allowed {allowed}"
+                    ));
                     lines
                 })
                 .collect(),
@@ -405,17 +414,26 @@ impl App {
             .and_then(|path| auth::read_auth(&path).ok())
             .map(|auth| {
                 let mut expiries = Vec::new();
-                if let Some(token) = auth::extract_id_token(&auth)
-                    && let Some(expires_at) = crate::jwt::token_expires_at(&token)
-                {
-                    expiries.push(format!("ID token {}", format_iso8601(expires_at)));
+                if let Some(token) = auth::extract_id_token(&auth) {
+                    let expiry = crate::jwt::token_expires_at(&token)
+                        .map(format_local_timestamp)
+                        .unwrap_or_else(|| "not reported".into());
+                    expiries.push(format!(
+                        "ID token · proves account identity · expires {}",
+                        expiry
+                    ));
                 }
                 if let Some(token) = auth
                     .pointer("/tokens/access_token")
                     .and_then(serde_json::Value::as_str)
-                    && let Some(expires_at) = crate::jwt::token_expires_at(token)
                 {
-                    expiries.push(format!("access token {}", format_iso8601(expires_at)));
+                    let expiry = crate::jwt::token_expires_at(token)
+                        .map(format_local_timestamp)
+                        .unwrap_or_else(|| "not reported".into());
+                    expiries.push(format!(
+                        "Access token · authorizes API requests · expires {}",
+                        expiry
+                    ));
                 }
                 expiries
             })
@@ -437,13 +455,27 @@ impl App {
                     .iter()
                     .filter(|organization| !organization.title.is_empty())
                     .map(|organization| {
+                        let role = organization
+                            .role
+                            .split(['_', '-'])
+                            .filter(|part| !part.is_empty())
+                            .map(|part| {
+                                let mut chars = part.chars();
+                                chars
+                                    .next()
+                                    .map(|first| {
+                                        first.to_uppercase().collect::<String>() + chars.as_str()
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         format!(
-                            "{} · role={} · id={}{}",
+                            "{} · {}{}",
                             organization.title,
-                            organization.role,
-                            organization.id,
+                            if role.is_empty() { "Member" } else { &role },
                             if organization.is_default {
-                                " · default"
+                                " · default workspace"
                             } else {
                                 ""
                             }
@@ -1927,7 +1959,11 @@ fn char_to_byte(s: &str, char_pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{AccountEntry, App, ModelStatus, UsageStatus};
-    use crate::{jwt::AccountInfo, usage::UsageInfo, warmup::ModelEntry};
+    use crate::{
+        jwt::{AccountInfo, OrgInfo},
+        usage::{ResetCredit, UsageInfo},
+        warmup::ModelEntry,
+    };
 
     #[test]
     fn model_result_rebuilds_an_open_account_detail() {
@@ -1953,6 +1989,8 @@ mod tests {
                     visibility: Some("list".into()),
                     supported_in_api: Some(true),
                     context_window: Some(372_000),
+                    default_reasoning_effort: Some("medium".into()),
+                    supported_reasoning_efforts: vec!["low".into(), "medium".into(), "high".into()],
                     ..ModelEntry::default()
                 }]),
             ))
@@ -1968,6 +2006,9 @@ mod tests {
                 .iter()
                 .any(|line| line.trim() == "Official description")
         );
+        assert!(info.models.iter().any(|line| {
+            line.trim() == "Reasoning  default medium · allowed low, medium, high"
+        }));
         assert!(!info.models.iter().any(|line| {
             line.contains("official-slug")
                 || line.contains("visibility=")
@@ -1998,5 +2039,48 @@ mod tests {
             panic!("account detail should remain open");
         };
         assert!(info.usage.is_some());
+    }
+
+    #[test]
+    fn account_detail_formats_workspaces_and_reset_cards_without_raw_ids() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo {
+                organizations: vec![OrgInfo {
+                    id: "org-secret-looking-id".into(),
+                    title: "Night City".into(),
+                    role: "owner".into(),
+                    is_default: true,
+                }],
+                ..Default::default()
+            },
+            usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                reset_credits_available_count: Some(1),
+                reset_credits: vec![ResetCredit {
+                    id: "credit-secret-looking-id".into(),
+                    granted_at: Some("2026-07-01T08:00:00Z".into()),
+                    expires_at: Some("2026-07-20T08:00:00Z".into()),
+                }],
+                ..Default::default()
+            })),
+            is_current: false,
+        });
+        app.view_indices.push(0);
+        app.model_cache
+            .insert("account".into(), ModelStatus::Loaded(Vec::new()));
+
+        app.open_account_menu();
+
+        let Some(super::super::menu::MenuState::Account { info, .. }) = app.menu else {
+            panic!("account detail should open");
+        };
+        assert_eq!(
+            info.organizations,
+            vec!["Night City · Owner · default workspace"]
+        );
+        assert!(info.reset_card_expiries[0].contains("expires 2026-07-20"));
+        assert!(!info.reset_card_expiries[0].contains("credit-secret-looking-id"));
+        assert!(!info.organizations[0].contains("org-secret-looking-id"));
     }
 }

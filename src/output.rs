@@ -298,13 +298,23 @@ pub fn format_local_time(ts: i64) -> String {
     }
 }
 
+/// Full local timestamp for detail views. The UTC offset keeps the value
+/// unambiguous when screenshots or logs cross time zones.
+pub fn format_local_timestamp(ts: i64) -> String {
+    Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M %:z").to_string())
+        .unwrap_or_else(|| "--".into())
+}
+
 pub fn format_local_datetime(value: &str) -> String {
     DateTime::parse_from_rfc3339(value)
         .map(|dt| {
             let local = dt.with_timezone(&Local);
-            local.format("%m-%d %H:%M").to_string()
+            local.format("%Y-%m-%d %H:%M %:z").to_string()
         })
-        .unwrap_or_else(|_| value.to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 pub fn reset_credits_count(u: &UsageInfo) -> Option<u64> {
@@ -553,5 +563,32 @@ mod tests {
             json.pointer("/reset_credits/0/expires_at"),
             Some(&Value::Null)
         );
+    }
+
+    #[test]
+    fn local_timestamp_includes_date_time_and_system_offset() {
+        let rendered = format_local_timestamp(1_783_857_600);
+        let expected = Local
+            .timestamp_opt(1_783_857_600, 0)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%d %H:%M %:z")
+            .to_string();
+
+        assert_eq!(rendered, expected);
+        assert!(!rendered.ends_with('Z'));
+    }
+
+    #[test]
+    fn rfc3339_detail_date_is_converted_to_system_timezone() {
+        let rendered = format_local_datetime("2026-07-20T08:00:00Z");
+        let expected = DateTime::parse_from_rfc3339("2026-07-20T08:00:00Z")
+            .unwrap()
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M %:z")
+            .to_string();
+
+        assert_eq!(rendered, expected);
+        assert_eq!(format_local_datetime("not-a-date"), "unknown");
     }
 }

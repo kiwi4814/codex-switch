@@ -26,7 +26,8 @@
 - **Cross-platform daemon lifecycle** — launchd, systemd user services, and Windows Task Scheduler preserve `CODEX_HOME`; PID files include executable identity and an active OS lock; stale or legacy PID data is never trusted for signaling; zero daemon intervals normalize to 60/300/300 seconds.
 - **Fail-fast configuration** — An existing unreadable, malformed, or dangling-symlink `config.toml` now reports the real error instead of silently starting with defaults; defaults remain limited to a genuinely missing file.
 - **Internal module layout** — The oversized `usage.rs` (2,645 lines) and `main.rs` (1,740 lines) were split into focused submodules (`usage/{scoring,api,reset_credits,parse}` and `commands/`) as a pure mechanical move; public paths, behavior, and tests are unchanged.
-- **TUI account information hierarchy** — The home screen keeps only the essential 5h/7d quota gauges. Enter opens a responsive account page: wide terminals keep identity/quota/actions on the left and official model names/descriptions on the right, while narrow or short terminals fall back to one safe scrollable column.
+- **TUI account information hierarchy** — The home screen keeps focused 5h/7d gauges for the main and additional quota pools. Enter opens a responsive account page: wide terminals keep identity/quota/actions on the left and official model names/descriptions on the right, while narrow or short terminals fall back to one safe scrollable column.
+- **Readable account metadata** — Account details now label organizations, explain ID/access token purpose, hide raw reset-card and organization IDs, and format every displayed date in the host system timezone with an explicit UTC offset. Each quota window shows expected pace, exact local reset time, and the recommended rest interval needed to return to pace; models show official allowed/default reasoning levels.
 
 ### Fixed
 
