@@ -235,7 +235,7 @@ codex-switch self-update --dev
 codex-switch self-update --stable
 
 # Install an exact stable release (downgrades are rejected)
-codex-switch self-update --version 0.0.22
+codex-switch self-update --version 20260712.1.0
 ```
 
 - Homebrew installs are not self-overwritten. Use `brew upgrade xjoker/tap/codex-switch`.
@@ -328,7 +328,7 @@ codex-switch use && codex
 
 ### Keep the next session ready with the daemon (Beta)
 
-Use the Beta daemon when you want `codex-switch` to monitor the current account continuously and prepare the next Codex launch in the background. The 0.0.22 implementation installs a LaunchAgent on macOS, a systemd user service on Linux, or an on-logon Task Scheduler task on Windows.
+Use the Beta daemon when you want `codex-switch` to monitor the current account continuously and prepare the next Codex launch in the background. The current implementation installs a LaunchAgent on macOS, a systemd user service on Linux, or an on-logon Task Scheduler task on Windows.
 
 ```bash
 # Start a detached daemon

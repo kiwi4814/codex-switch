@@ -6,7 +6,7 @@ set -euo pipefail
 #   curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --dev          # install latest dev build
 #   curl -fsSL .../install.sh | bash -s -- --uninstall    # uninstall codex-switch
-#   CS_VERSION=0.0.11 curl -fsSL .../install.sh | bash    # install specific version
+#   CS_VERSION=20260712.1.0 curl -fsSL .../install.sh | bash  # install specific version
 
 REPO="xjoker/codex-switch"
 INSTALL_DIR="/usr/local/bin"

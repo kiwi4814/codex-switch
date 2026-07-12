@@ -656,6 +656,27 @@ mod tests {
     }
 
     #[test]
+    fn calendar_versions_remain_semver_comparable() {
+        assert!(Version::parse("20260712.1").is_err());
+        assert!(Version::parse("20260712.1.0").is_ok());
+        assert!(is_newer_version("20260712.1.0", "0.0.21"));
+        assert!(is_newer_version(
+            "20260712.1.0-dev.20260712000000",
+            "0.0.22-dev.20260711000000"
+        ));
+        assert!(is_newer_version("20260712.2.0", "20260712.1.0"));
+        assert!(is_newer_version("20260713.1.0", "20260712.9.0"));
+        assert!(is_newer_version(
+            "20260712.1.0",
+            "20260712.1.0-dev.20260712000000"
+        ));
+        assert!(is_dev_update_available(
+            "20260712.1.0-dev.20260712000000",
+            "20260712.1.0"
+        ));
+    }
+
+    #[test]
     fn release_api_url_uses_latest_or_tag_endpoint() {
         assert_eq!(
             release_api_url(None),

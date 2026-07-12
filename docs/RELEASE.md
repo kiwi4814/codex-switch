@@ -18,11 +18,19 @@
 
 ## 版本号策略
 
+基础版本采用兼容 SemVer 的 `YYYYMMDD.V.0`：
+
+- `YYYYMMDD` 是发布日期，例如 2026-07-12 为 `20260712`
+- `V` 是当天发布序号，从 `1` 开始；同日第二版为 `20260712.2.0`
+- 最后一段固定为 `0`，因为 Cargo/SemVer 要求 `major.minor.patch` 三段；不要使用无效的两段式 `20260712.1`
+- 日期必须按 `YYYYMMDD` 排列，不能使用会破坏时间排序的 `YYYYDDMM`
+- 从旧的 `0.0.x` 迁移是正常升级；迁移后不要再发布更小的 `0.x` 版本，否则 self-update 会将其视为降级
+
 | 推送的 tag | CI 输出版本号 | GitHub Release 名 | self-update 通道 | 触发 homebrew |
 |---|---|---|---|---|
-| `dev`（rolling，每次覆盖） | `<Cargo.toml base>-dev.<UTC时间戳>` | `dev` | `--dev` | 否 |
-| `vX.Y.Z-<suffix>`（永久 prerelease） | `X.Y.Z-<suffix>` | `vX.Y.Z-<suffix>` | 拿不到（客户端硬编码 tag=`dev`） | 否 |
-| `vX.Y.Z`（stable） | `X.Y.Z` | `vX.Y.Z` | 默认通道 | 是 |
+| `dev`（rolling，每次覆盖） | `YYYYMMDD.V.0-dev.<UTC时间戳>` | `dev` | `--dev` | 否 |
+| `vYYYYMMDD.V.0-<suffix>`（永久 prerelease） | `YYYYMMDD.V.0-<suffix>` | 同 tag | 拿不到（客户端硬编码 tag=`dev`） | 否 |
+| `vYYYYMMDD.V.0`（stable） | `YYYYMMDD.V.0` | 同 tag | 默认通道 | 是 |
 
 > Cargo.toml `version` 字段不带 `-dev` 后缀，由 CI 在 inject 步骤统一加。
 >
@@ -89,15 +97,16 @@ git push origin refs/tags/dev:refs/tags/dev
 # 1) 在 dev 分支充分验证后，合并到 master
 git checkout master && git merge --ff-only dev && git push origin master
 
-# 2) 在 master 上打版本 tag（注意：不要带 -dev / -rc 后缀，否则成 prerelease）
-git tag vX.Y.Z && git push origin refs/tags/vX.Y.Z:refs/tags/vX.Y.Z
+# 2) 在 master 上打版本 tag（示例：2026-07-12 当天首版）
+git tag v20260712.1.0
+git push origin refs/tags/v20260712.1.0:refs/tags/v20260712.1.0
 
-# 3) CI 会自动：构建 6 平台 + 创建 GitHub Release vX.Y.Z + 触发 homebrew job
+# 3) CI 会自动：构建 6 平台 + 创建对应 GitHub Release + 触发 homebrew job
 ```
 
 发布前别忘了：
-- `Cargo.toml` 版本号 bump 到 `X.Y.Z`
-- `docs/CHANGELOG.md` 顶部新增 `## vX.Y.Z — YYYY-MM-DD` 段
+- 先运行 `date` 获取本机真实日期，再把 `Cargo.toml` bump 到当天的 `YYYYMMDD.V.0`
+- `docs/CHANGELOG.md` 顶部新增对应的 `## vYYYYMMDD.V.0 — YYYY-MM-DD` 段
 
 ## 排错
 
@@ -111,4 +120,4 @@ git tag vX.Y.Z && git push origin refs/tags/vX.Y.Z:refs/tags/vX.Y.Z
 GitHub Release 名必须是字面 `dev`（小写）。如果误推成 `v0.0.15-dev` 这类带 `v` 前缀的独立 tag，会创建独立 prerelease，客户端通道看不到。
 
 **Cargo.toml 版本号该带 `-dev` 吗？**
-不带。CI 的 dev 路径会自动追加 `-dev.<timestamp>`，本地 `Cargo.toml` 始终保持 `X.Y.Z` 干净版本号。
+不带。CI 的 dev 路径会自动追加 `-dev.<timestamp>`，本地 `Cargo.toml` 始终保持 `YYYYMMDD.V.0` 干净版本号。

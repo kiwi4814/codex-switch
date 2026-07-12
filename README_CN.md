@@ -234,7 +234,7 @@ codex-switch self-update --dev
 codex-switch self-update --stable
 
 # 安装指定正式版本（不支持降级）
-codex-switch self-update --version 0.0.22
+codex-switch self-update --version 20260712.1.0
 ```
 
 - Homebrew 安装不会被程序自行覆盖，请使用 `brew upgrade xjoker/tap/codex-switch`
@@ -327,7 +327,7 @@ codex-switch use && codex
 
 ### 使用守护进程保持下一次会话就绪（Beta）
 
-当你希望 `codex-switch` 持续监控当前账号并在后台准备好下一次 Codex 启动时，可使用 Beta 守护进程。0.0.22 实现在 macOS 安装 LaunchAgent、在 Linux 安装 systemd 用户服务、在 Windows 安装登录时触发的任务计划程序（Task Scheduler）任务。
+当你希望 `codex-switch` 持续监控当前账号并在后台准备好下一次 Codex 启动时，可使用 Beta 守护进程。当前实现在 macOS 安装 LaunchAgent、在 Linux 安装 systemd 用户服务、在 Windows 安装登录时触发的任务计划程序（Task Scheduler）任务。
 
 ```bash
 # 启动后台守护进程

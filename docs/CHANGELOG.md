@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.0.22 — Unreleased
+## v20260712.1.0 — Unreleased
 
 ### Added
 
@@ -18,6 +18,7 @@
 
 ### Changed
 
+- **Calendar versioning** — Release bases now use SemVer-compatible `YYYYMMDD.V.0` values, starting with `20260712.1.0`; `V` starts at 1 each day and increments for additional same-day releases. Existing `0.0.x` stable and dev builds remain directly upgradable because the calendar version sorts higher under SemVer.
 - **Codex 0.144.1 authentication alignment** — Browser and device login follow the current Codex callback and polling contracts, refresh responses preserve omitted tokens, managed authentication policy is enforced, custom CA settings are honored, and `CODEX_HOME` uses the same empty-value fallback as Codex.
 - **File credential store requirement** — `codex-switch` now requires Codex's file-backed credential store and rejects explicit `keyring`, `auto`, or `ephemeral` modes because reliable profile switching depends on the live `auth.json`.
 - **Usage and reset-credit alignment** — Usage, models, and warmup requests carry workspace/FedRAMP routing headers; empty or structurally drifted usage responses are rejected; account-limited state is persisted; reset credits support no-expiry entries; consume retries reuse one redemption request ID and only `code=reset` is success.
