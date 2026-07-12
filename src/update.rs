@@ -95,8 +95,8 @@ pub async fn check_for_update(force: bool) -> Result<Option<UpdateInfo>> {
 
 /// Check whether a newer dev release exists on GitHub.
 ///
-/// Dev versions include a build timestamp (e.g. `0.0.11-dev.20260408143000`)
-/// so each build is unique and semver-comparable.
+/// Dev versions use a `dev` pre-release component. Older timestamped dev
+/// versions remain supported for updates from existing installations.
 pub async fn check_for_dev_update() -> Result<Option<UpdateInfo>> {
     let current_version = current_version().to_string();
     let release = match fetch_release_optional(Some("dev"))
@@ -209,10 +209,10 @@ pub async fn self_update_dev(show_progress: bool) -> Result<SelfUpdateResult> {
 /// Extract a semver-compatible version string from a GitHub Release.
 ///
 /// For dev releases (`is_dev = true`) the version is embedded in the release
-/// name (e.g. `"dev (0.0.11-dev.20260408)"`) because the tag itself is just
+/// name (e.g. `"dev (20260712.1.0-dev)"`) because the tag itself is just
 /// `"dev"`. For stable releases the tag carries the version directly.
 fn extract_release_version(release: &GithubRelease) -> String {
-    // Dev releases carry the version in the name: "dev (X.Y.Z-dev.TS)"
+    // Dev releases carry the version in the name: "dev (X.Y.Z-dev)"
     if release.tag_name == "dev"
         && let Some(v) = release
             .name
@@ -276,7 +276,7 @@ async fn download_and_replace(
 }
 
 /// Returns true if the given version string contains a pre-release component
-/// (e.g. `0.0.11-dev` or `0.0.11-dev.20260408143000`).
+/// (e.g. `20260712.1.0-dev`; legacy timestamped versions also match).
 pub fn is_dev_version(version: &str) -> bool {
     normalize_version(version).contains("-dev")
 }
@@ -601,10 +601,19 @@ fn is_dev_update_available(candidate: &str, current: &str) -> bool {
     if is_newer_version(candidate, current) {
         return true;
     }
+    if is_dev_version(current) && is_dev_version(candidate) {
+        let candidate = Version::parse(&normalize_version(candidate)).ok();
+        let current = Version::parse(&normalize_version(current)).ok();
+        return matches!((candidate, current), (Some(candidate), Some(current))
+            if candidate.major == current.major
+                && candidate.minor == current.minor
+                && candidate.patch == current.patch
+                && candidate.pre.as_str() == "dev"
+                && current.pre.as_str().starts_with("dev."));
+    }
     // Explicit --dev should be able to switch from a stable/base install to the
-    // rolling dev build with the same base version, e.g. 0.0.20 -> 0.0.20-dev.TS.
-    // Once already on dev, normal semver prerelease ordering handles timestamps.
-    if is_dev_version(current) || !is_dev_version(candidate) {
+    // rolling dev build with the same base version, e.g. 20260712.1.0 -> 20260712.1.0-dev.
+    if !is_dev_version(candidate) {
         return false;
     }
     let Some(candidate_base) = version_base(candidate) else {
@@ -728,6 +737,18 @@ mod tests {
         assert!(!is_dev_update_available(
             "0.0.20-dev.20260701094804",
             "0.0.21"
+        ));
+    }
+
+    #[test]
+    fn short_dev_version_replaces_legacy_timestamped_dev_on_the_same_base() {
+        assert!(is_dev_update_available(
+            "20260712.1.0-dev",
+            "20260712.1.0-dev.20260712055522"
+        ));
+        assert!(!is_dev_update_available(
+            "20260712.1.0-dev",
+            "20260712.1.0-dev"
         ));
     }
 

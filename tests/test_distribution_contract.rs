@@ -138,6 +138,15 @@ fn release_verifies_archives_before_creating_a_release() {
 }
 
 #[test]
+fn dev_release_uses_the_short_calendar_prerelease_version() {
+    let workflow = repo_file(".github/workflows/release.yml");
+
+    assert!(workflow.contains("version=${BASE}-dev"));
+    assert!(!workflow.contains("TIMESTAMP"));
+    assert!(!workflow.contains("-dev.${TIMESTAMP}"));
+}
+
+#[test]
 fn readmes_describe_current_cli_and_codex_requirements() {
     for path in ["README.md", "README_CN.md"] {
         let readme = repo_file(path);

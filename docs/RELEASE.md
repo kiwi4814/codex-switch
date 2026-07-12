@@ -28,7 +28,7 @@
 
 | 推送的 tag | CI 输出版本号 | GitHub Release 名 | self-update 通道 | 触发 homebrew |
 |---|---|---|---|---|
-| `dev`（rolling，每次覆盖） | `YYYYMMDD.V.0-dev.<UTC时间戳>` | `dev` | `--dev` | 否 |
+| `dev`（rolling，每次覆盖） | `YYYYMMDD.V.0-dev` | `dev` | `--dev` | 否 |
 | `vYYYYMMDD.V.0-<suffix>`（永久 prerelease） | `YYYYMMDD.V.0-<suffix>` | 同 tag | 拿不到（客户端硬编码 tag=`dev`） | 否 |
 | `vYYYYMMDD.V.0`（stable） | `YYYYMMDD.V.0` | 同 tag | 默认通道 | 是 |
 
@@ -120,4 +120,4 @@ git push origin refs/tags/v20260712.1.0:refs/tags/v20260712.1.0
 GitHub Release 名必须是字面 `dev`（小写）。如果误推成 `v0.0.15-dev` 这类带 `v` 前缀的独立 tag，会创建独立 prerelease，客户端通道看不到。
 
 **Cargo.toml 版本号该带 `-dev` 吗？**
-不带。CI 的 dev 路径会自动追加 `-dev.<timestamp>`，本地 `Cargo.toml` 始终保持 `YYYYMMDD.V.0` 干净版本号。
+不带。CI 的 dev 路径会自动追加 `-dev`，本地 `Cargo.toml` 始终保持 `YYYYMMDD.V.0` 干净版本号。同一天再次发布前必须递增 `V`，否则客户端会把相同版本判定为已是最新。
