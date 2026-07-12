@@ -392,6 +392,396 @@ async fn http_reset_card_consume_uses_earliest_expiry() {
     server.shutdown();
 }
 
+// ── reset-card-aware auto-switching (spawned binary, end-to-end) ──
+
+mod revival {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::mock;
+    use serde_json::{Value, json};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_home(name: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("codex-switch-revival-{name}-{ts}-{id}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn jwt(payload: &Value) -> String {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let json_bytes = serde_json::to_vec(payload).unwrap();
+        format!("x.{}.y", URL_SAFE_NO_PAD.encode(json_bytes))
+    }
+
+    fn auth_json_with_access(email: &str, account_id: &str, access_token: &str) -> Value {
+        let claims = json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "plus",
+                "chatgpt_account_id": account_id,
+                "chatgpt_user_id": format!("user_{account_id}"),
+                "organizations": [],
+            }
+        });
+        json!({
+            "tokens": {
+                "id_token": jwt(&claims),
+                "refresh_token": "dummy-refresh",
+                "access_token": access_token,
+                "account_id": account_id,
+            }
+        })
+    }
+
+    fn write_json(path: impl AsRef<Path>, value: &Value) {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Write a profile with a cached usage entry, bypassing any network fetch
+    /// for the initial pool scan.
+    fn write_cached_profile(
+        home: &Path,
+        alias: &str,
+        access_token: &str,
+        primary_used: f64,
+        reset_credits: &[(&str, Option<&str>)],
+    ) {
+        write_json(
+            home.join(format!(".codex-switch/profiles/{alias}/auth.json")),
+            &auth_json_with_access(
+                &format!("{alias}@mock.test"),
+                &format!("acct_{alias}"),
+                access_token,
+            ),
+        );
+
+        let credits: Vec<Value> = reset_credits
+            .iter()
+            .map(|(id, expires_at)| {
+                json!({
+                    "id": id,
+                    "granted_at": null,
+                    "expires_at": expires_at,
+                })
+            })
+            .collect();
+
+        let now = now_secs();
+        let cache_path = home.join(".codex-switch/cache.json");
+        let mut cache: Value = fs::read_to_string(&cache_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({"entries": {}}));
+        cache["entries"][alias] = json!({
+            "ts": now,
+            "primary_used": primary_used,
+            "primary_reset": now as i64 + 7200,
+            "secondary_used": 10.0,
+            "secondary_reset": now as i64 + 604800,
+            "plan_type": "plus",
+            "reset_credits_available_count": credits.len(),
+            "reset_credits": credits,
+        });
+        write_json(&cache_path, &cache);
+    }
+
+    fn write_long_ttl_config(home: &Path) {
+        fs::create_dir_all(home.join(".codex-switch")).unwrap();
+        fs::write(
+            home.join(".codex-switch/config.toml"),
+            "[cache]\nttl = 999999999\n",
+        )
+        .unwrap();
+    }
+
+    fn binary() -> &'static str {
+        env!("CARGO_BIN_EXE_codex-switch")
+    }
+
+    fn command(home: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new(binary());
+        cmd.args(args);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.stdin(Stdio::null()); // never a TTY: CardPolicy::Prompt cannot trigger here
+        cmd.env("HOME", home);
+        cmd.env("CODEX_HOME", home.join(".codex"));
+        cmd.env("CODEX_SWITCH_HOME", home.join(".codex-switch"));
+        cmd.env_remove("HTTP_PROXY");
+        cmd.env_remove("HTTPS_PROXY");
+        cmd.env_remove("ALL_PROXY");
+        cmd.env_remove("CS_PROXY");
+        cmd
+    }
+
+    fn run_with_env(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+        let mut cmd = command(home, args);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.output().unwrap()
+    }
+
+    fn parse_stdout_json(output: &Output) -> Value {
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    /// Unreachable loopback address: any accidental network call fails fast
+    /// instead of hanging or reaching a real host.
+    const UNROUTABLE_URL: &str = "http://127.0.0.1:1/unused";
+
+    /// Contract 5: an eligible top candidate short-circuits card logic
+    /// entirely -- the consume endpoint must never be reached, even though
+    /// another account in the pool holds a reset card.
+    #[test]
+    fn contract5_eligible_top_skips_card_logic_and_never_hits_consume() {
+        let home = temp_home("contract5");
+        write_long_ttl_config(&home);
+        write_cached_profile(&home, "eligible_top", "tok_eligible_top", 5.0, &[]);
+        write_cached_profile(
+            &home,
+            "other_holds_card",
+            "tok_other_holds_card",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+
+        let output = run_with_env(
+            &home,
+            &["--json", "use"],
+            &[
+                ("CS_USAGE_URL", UNROUTABLE_URL),
+                ("CS_RESET_CREDITS_URL", UNROUTABLE_URL),
+                ("CS_RESET_CREDITS_CONSUME_URL", UNROUTABLE_URL),
+            ],
+        );
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = parse_stdout_json(&output);
+        assert_eq!(json["switched_to"], "eligible_top");
+        assert!(
+            json.get("hint").is_none(),
+            "no hint expected when top candidate is eligible: {json}"
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// Contract 6: pool exhausted, one account holds a card, PreApproved
+    /// (--consume-card) -> consumes exactly one card and revives the account.
+    ///
+    /// Multi-thread runtime: the child process's blocking `Command::output()`
+    /// call must not starve the MockServer's own async task on the same thread.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contract6_consume_card_revives_exhausted_pool() {
+        let home = temp_home("contract6");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[
+                ("reset_credit_1", Some("2026-07-08T00:00:00Z")),
+                ("reset_credit_2", Some("2026-07-09T00:00:00Z")),
+            ],
+        );
+
+        // Real usage endpoint response used only for the post-consume force-refresh
+        // (the initial scan is served entirely from cache).
+        let entries = vec![(
+            "tok_card_holder".to_string(),
+            vec![mock::transformer::base_response(
+                "plus", 0.0, 18000, 10.0, 604800,
+            )],
+        )];
+        let server = mock::MockServer::start(entries).await;
+
+        let output = run_with_env(
+            &home,
+            &["--json", "use", "--consume-card"],
+            &[
+                ("CS_USAGE_URL", &server.usage_url()),
+                ("CS_RESET_CREDITS_URL", &server.reset_credits_url()),
+            ],
+        );
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = parse_stdout_json(&output);
+        assert_eq!(json["switched_to"], "card_holder");
+        assert!(
+            json.get("hint").is_none(),
+            "no hint expected after a successful revival: {json}"
+        );
+        assert_eq!(
+            json.pointer("/usage/primary/used_percent"),
+            Some(&serde_json::json!(0.0)),
+            "revived usage should reflect the post-consume fetch: {json}"
+        );
+
+        server.shutdown();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// Contract 7: consuming the card doesn't actually free quota (still
+    /// exhausted on recheck) -> falls back to the original scored candidate
+    /// without trying a second card.
+    ///
+    /// Multi-thread runtime: see `contract6_consume_card_revives_exhausted_pool`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contract7_falls_back_when_still_exhausted_after_consume() {
+        let home = temp_home("contract7");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+
+        // Post-consume force-refresh still reports 100% used.
+        let entries = vec![(
+            "tok_card_holder".to_string(),
+            vec![mock::transformer::base_response(
+                "plus", 100.0, 1800, 50.0, 604800,
+            )],
+        )];
+        let server = mock::MockServer::start(entries).await;
+
+        let output = run_with_env(
+            &home,
+            &["--json", "use", "--consume-card"],
+            &[
+                ("CS_USAGE_URL", &server.usage_url()),
+                ("CS_RESET_CREDITS_URL", &server.reset_credits_url()),
+            ],
+        );
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = parse_stdout_json(&output);
+        // Still exhausted -> falls back to the (only, still-exhausted) scored
+        // candidate rather than erroring out.
+        assert_eq!(json["switched_to"], "card_holder");
+        assert!(
+            json.get("hint").is_none(),
+            "contract 7 warns via logs, not a user hint: {json}"
+        );
+
+        server.shutdown();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// Contract 8: pool exhausted, a card is available, but no
+    /// --consume-card flag and no TTY -> Deny. Nothing is consumed; both the
+    /// JSON and human output carry the revival hint.
+    #[test]
+    fn contract8_deny_without_flag_emits_hint_and_consumes_nothing() {
+        let home = temp_home("contract8-json");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[
+                ("reset_credit_1", Some("2026-07-08T00:00:00Z")),
+                ("reset_credit_2", Some("2026-07-09T00:00:00Z")),
+            ],
+        );
+
+        let output = run_with_env(
+            &home,
+            &["--json", "use"],
+            &[
+                ("CS_USAGE_URL", UNROUTABLE_URL),
+                ("CS_RESET_CREDITS_URL", UNROUTABLE_URL),
+                ("CS_RESET_CREDITS_CONSUME_URL", UNROUTABLE_URL),
+            ],
+        );
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = parse_stdout_json(&output);
+        assert_eq!(json["switched_to"], "card_holder");
+        let hint = json["hint"].as_str().expect("hint field should be set");
+        assert!(hint.contains("card_holder"), "{hint}");
+        assert!(hint.contains("--consume-card"), "{hint}");
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn contract8_deny_without_flag_prints_human_hint() {
+        let home = temp_home("contract8-human");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+
+        let output = run_with_env(
+            &home,
+            &["use"],
+            &[
+                ("CS_USAGE_URL", UNROUTABLE_URL),
+                ("CS_RESET_CREDITS_URL", UNROUTABLE_URL),
+                ("CS_RESET_CREDITS_CONSUME_URL", UNROUTABLE_URL),
+            ],
+        );
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("card_holder"), "{stdout}");
+        assert!(stdout.contains("--consume-card"), "{stdout}");
+
+        let _ = fs::remove_dir_all(home);
+    }
+}
+
 #[tokio::test]
 async fn http_unknown_token_returns_401() {
     let entries = scenarios::healthy_pool();

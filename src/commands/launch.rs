@@ -2,7 +2,15 @@ use crate::output::{print_json, user_println};
 use crate::{auth, config, profile};
 use anyhow::{Context, Result};
 
-pub(crate) async fn launch_cmd(alias: Option<&str>, args: Vec<String>, json: bool) -> Result<()> {
+pub(crate) async fn launch_cmd(
+    alias: Option<&str>,
+    args: Vec<String>,
+    json: bool,
+    consume_card: bool,
+) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let mut revival_hint = None;
     let target_alias = match alias {
         Some(alias) => {
             let profiles = profile::list_profiles()?;
@@ -12,10 +20,23 @@ pub(crate) async fn launch_cmd(alias: Option<&str>, args: Vec<String>, json: boo
             alias.to_string()
         }
         None => {
-            let (alias, _, _) = super::profile::select_best_profile(json).await?;
-            alias
+            let card_policy = if consume_card {
+                super::profile::CardPolicy::PreApproved
+            } else if !json && std::io::stdin().is_terminal() {
+                super::profile::CardPolicy::Prompt
+            } else {
+                super::profile::CardPolicy::Deny
+            };
+            let outcome = super::profile::select_best_profile(json, card_policy).await?;
+            revival_hint = outcome.revival_hint;
+            outcome.alias
         }
     };
+    if let Some(hint) = &revival_hint
+        && !json
+    {
+        user_println(&super::profile::revival_hint_message(hint));
+    }
 
     match std::process::Command::new("codex")
         .arg("--version")
@@ -156,12 +177,16 @@ pub(crate) async fn launch_cmd(alias: Option<&str>, args: Vec<String>, json: boo
     let exit_code = status.code().unwrap_or(1);
 
     if json {
-        print_json(&serde_json::json!({
+        let mut payload = serde_json::json!({
             "ok": status.success(),
             "alias": target_alias,
             "action": "launched",
             "exit_code": exit_code,
-        }));
+        });
+        if let Some(hint) = &revival_hint {
+            payload["hint"] = serde_json::Value::String(super::profile::revival_hint_message(hint));
+        }
+        print_json(&payload);
     } else {
         user_println("codex exited");
     }

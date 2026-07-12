@@ -130,7 +130,10 @@ async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
     let auth_handled = !matches!(auth_check, AuthCheckResult::NoChange);
 
     match cmd {
-        Commands::Use { alias } => commands::use_cmd(alias.as_deref(), json).await?,
+        Commands::Use {
+            alias,
+            consume_card,
+        } => commands::use_cmd(alias.as_deref(), json, consume_card).await?,
         Commands::List { force } => commands::list_cmd(force, json, auth_handled).await?,
         Commands::ResetCard { alias, yes } => commands::reset_card_cmd(&alias, yes, json).await?,
         Commands::Rename { old, new } => commands::rename_cmd(&old, &new, json)?,
@@ -148,9 +151,11 @@ async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
             stable,
         } => commands::self_update_cmd(check, version.as_deref(), dev, stable, json).await?,
         Commands::Warmup { alias } => commands::warmup_cmd(alias.as_deref(), json).await?,
-        Commands::Launch { alias, args } => {
-            commands::launch_cmd(alias.as_deref(), args, json).await?
-        }
+        Commands::Launch {
+            alias,
+            consume_card,
+            args,
+        } => commands::launch_cmd(alias.as_deref(), args, json, consume_card).await?,
         Commands::Tui => tui::run_tui().await?,
         Commands::Open => commands::open_cmd()?,
         Commands::Daemon(sub) => daemon::dispatch(sub, json).await?,

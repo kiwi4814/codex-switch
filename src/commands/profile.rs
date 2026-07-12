@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 
 // ── use ──────────────────────────────────────────────────
 
-pub(crate) async fn use_cmd(alias: Option<&str>, json: bool) -> Result<()> {
+pub(crate) async fn use_cmd(alias: Option<&str>, json: bool, consume_card: bool) -> Result<()> {
     use std::io::IsTerminal;
 
     match alias {
@@ -22,7 +22,7 @@ pub(crate) async fn use_cmd(alias: Option<&str>, json: bool) -> Result<()> {
                 });
             }
         }
-        None => best_cmd(json).await?,
+        None => best_cmd(json, consume_card).await?,
     }
     Ok(())
 }
@@ -330,7 +330,98 @@ fn score_profile_candidates(
     scored
 }
 
-pub(crate) async fn select_best_profile(json: bool) -> Result<(String, usage::UsageInfo, f64)> {
+// ── reset-card-aware revival ──────────────────────────────
+
+/// How aggressively the pool-exhausted fallback may consume a reset card to
+/// revive an otherwise-ineligible account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardPolicy {
+    /// Ask the user interactively before consuming a card.
+    Prompt,
+    /// Consume without asking (user passed --consume-card, or already confirmed).
+    PreApproved,
+    /// Never consume; surface a hint instead (JSON / non-TTY without the flag).
+    Deny,
+}
+
+/// Surfaced to the caller when the pool was exhausted, an account held a
+/// reset card, but nothing was consumed (denied or declined).
+pub(crate) struct RevivalHint {
+    pub(crate) alias: String,
+    pub(crate) card_count: u64,
+}
+
+pub(crate) struct SelectOutcome {
+    pub(crate) alias: String,
+    pub(crate) usage: usage::UsageInfo,
+    pub(crate) score: f64,
+    pub(crate) revival_hint: Option<RevivalHint>,
+}
+
+pub(crate) fn revival_hint_message(hint: &RevivalHint) -> String {
+    format!(
+        "{} holds {} reset card(s); rerun with --consume-card to revive",
+        hint.alias, hint.card_count
+    )
+}
+
+/// Interactive confirmation prompt text for reviving an account by consuming
+/// its earliest-expiring reset card. Pure formatting, no I/O.
+fn revival_prompt_message(alias: &str, card_count: u64, earliest_expiry: &str) -> String {
+    format!(
+        "'{alias}' holds {card_count} reset card(s) (earliest expiry {earliest_expiry}); consume one to revive it? [y/N] "
+    )
+}
+
+/// One scored candidate as seen by `pick_revival_target`. Pure data, no I/O.
+struct RevivalCandidate<'a> {
+    alias: &'a str,
+    eligible: bool,
+    score: f64,
+    reset_credits: &'a [usage::ResetCredit],
+}
+
+/// Sort key for a credit's expiry: missing expiry sorts as "latest" (never
+/// ahead of a dated card), matching `usage::earliest_reset_credit`.
+fn expiry_sort_key(credit: &usage::ResetCredit) -> i64 {
+    credit
+        .expires_at
+        .as_deref()
+        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+        .map(|dt| dt.timestamp())
+        .unwrap_or(i64::MAX)
+}
+
+/// Pick which ineligible, card-holding account should be revived by
+/// consuming its earliest-expiring reset card.
+///
+/// Meaningful only when none of `candidates` are eligible (caller-guaranteed).
+/// Ties break by card count (more cards first), then by existing score.
+fn pick_revival_target(candidates: &[RevivalCandidate]) -> Option<String> {
+    candidates
+        .iter()
+        .filter(|c| !c.eligible && !c.reset_credits.is_empty())
+        .filter_map(|c| {
+            let earliest = usage::earliest_reset_credit(c.reset_credits)?;
+            Some((c, expiry_sort_key(earliest)))
+        })
+        .min_by(|(a, a_key), (b, b_key)| {
+            a_key
+                .cmp(b_key)
+                .then_with(|| b.reset_credits.len().cmp(&a.reset_credits.len()))
+                .then_with(|| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        })
+        .map(|(c, _)| c.alias.to_string())
+}
+
+pub(crate) async fn select_best_profile(
+    json: bool,
+    card_policy: CardPolicy,
+) -> Result<SelectOutcome> {
     let profiles = profile::list_profiles()?;
     if profiles.is_empty() {
         anyhow::bail!(
@@ -406,16 +497,138 @@ pub(crate) async fn select_best_profile(json: bool) -> Result<(String, usage::Us
     let team_priority = config::get().use_cfg.team_priority;
     let now = auth::now_unix_secs();
     let scored = score_profile_candidates(fetched, now, safety_7d, team_priority);
-    let (best_candidate, best_usage, best_score) = scored
-        .into_iter()
-        .next()
+    let (top_candidate, top_usage, top_score) = scored
+        .first()
+        .map(|(c, u, s)| (c.clone(), u.clone(), *s))
         .context("failed to select best profile")?;
 
-    Ok((best_candidate.alias, best_usage, best_score))
+    if usage::is_candidate_eligible(&top_candidate, safety_7d) {
+        return Ok(SelectOutcome {
+            alias: top_candidate.alias,
+            usage: top_usage,
+            score: top_score,
+            revival_hint: None,
+        });
+    }
+
+    // Pool exhausted: see if a card-holding account can be revived.
+    let revival_candidates: Vec<RevivalCandidate> = scored
+        .iter()
+        .map(|(c, u, s)| RevivalCandidate {
+            alias: &c.alias,
+            eligible: usage::is_candidate_eligible(c, safety_7d),
+            score: *s,
+            reset_credits: &u.reset_credits,
+        })
+        .collect();
+    let revival_target = pick_revival_target(&revival_candidates);
+
+    let Some(target_alias) = revival_target else {
+        return Ok(SelectOutcome {
+            alias: top_candidate.alias,
+            usage: top_usage,
+            score: top_score,
+            revival_hint: None,
+        });
+    };
+
+    let target_candidate = scored
+        .iter()
+        .find(|(c, _, _)| c.alias == target_alias)
+        .map(|(c, u, _)| (c.clone(), u.clone()))
+        .context("revival target disappeared from scored candidates")?;
+    let (target_candidate, target_usage) = target_candidate;
+    let card_count = target_usage.reset_credits.len() as u64;
+
+    let approved = match card_policy {
+        CardPolicy::Deny => false,
+        CardPolicy::PreApproved => true,
+        CardPolicy::Prompt => {
+            let expires = usage::earliest_reset_credit(&target_usage.reset_credits)
+                .and_then(|c| c.expires_at.as_deref())
+                .map(output::format_local_datetime)
+                .unwrap_or_else(|| "no expiry".to_string());
+            confirm_default_no(&revival_prompt_message(&target_alias, card_count, &expires))
+        }
+    };
+
+    let fallback = |hint: Option<RevivalHint>| SelectOutcome {
+        alias: top_candidate.alias.clone(),
+        usage: top_usage.clone(),
+        score: top_score,
+        revival_hint: hint,
+    };
+
+    if !approved {
+        return Ok(fallback(Some(RevivalHint {
+            alias: target_alias,
+            card_count,
+        })));
+    }
+
+    let target_path = profile::profile_auth_path(&target_alias)?;
+    let current = profile::read_current();
+    match usage::consume_earliest_reset_credit(&target_alias, &target_path).await {
+        Ok(_consumed) => {
+            if let Err(err) = cache::invalidate(&target_alias) {
+                tracing::warn!("Failed to invalidate usage cache for {target_alias}: {err}");
+            }
+            match usage::fetch_usage_retried_force(&target_alias, &target_path, &current).await {
+                Ok(revived_usage) => {
+                    let mut revived_candidate = usage::Candidate::from_usage(
+                        target_alias.clone(),
+                        &revived_usage,
+                        target_candidate.is_team,
+                        target_candidate.is_free,
+                        target_candidate.last_used,
+                        now,
+                    );
+                    revived_candidate.pool_size = target_candidate.pool_size;
+                    revived_candidate.team_priority = target_candidate.team_priority;
+                    revived_candidate.pool_exhausted =
+                        target_candidate.pool_exhausted.saturating_sub(1);
+                    if usage::is_candidate_eligible(&revived_candidate, safety_7d) {
+                        let score = usage::score_unified(&revived_candidate, safety_7d);
+                        return Ok(SelectOutcome {
+                            alias: target_alias,
+                            usage: revived_usage,
+                            score,
+                            revival_hint: None,
+                        });
+                    }
+                    tracing::warn!(
+                        "[{target_alias}] still exhausted after consuming a reset card; not consuming a second card"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    "[{target_alias}] failed to refresh usage after consuming reset card: {e}"
+                ),
+            }
+        }
+        Err(e) => tracing::warn!("[{target_alias}] failed to consume reset card: {e}"),
+    }
+
+    Ok(fallback(None))
 }
 
-async fn best_cmd(json: bool) -> Result<()> {
-    let (best_alias, best_usage, best_score) = select_best_profile(json).await?;
+async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let card_policy = if consume_card {
+        CardPolicy::PreApproved
+    } else if !json && std::io::stdin().is_terminal() {
+        CardPolicy::Prompt
+    } else {
+        CardPolicy::Deny
+    };
+
+    let outcome = select_best_profile(json, card_policy).await?;
+    let SelectOutcome {
+        alias: best_alias,
+        usage: best_usage,
+        score: best_score,
+        revival_hint,
+    } = outcome;
 
     profile::switch_profile(&best_alias)?;
     cache::set_last_used(&best_alias)?;
@@ -430,14 +643,172 @@ async fn best_cmd(json: bool) -> Result<()> {
             usage: usage_to_json(Ok(&best_usage)),
             score: best_score,
             mode: "unified".to_string(),
+            hint: revival_hint.as_ref().map(revival_hint_message),
         });
     } else {
         println!("{}", color::success(&format!("Switched to: {best_alias}")));
         print_usage_line(&best_usage);
+        if let Some(hint) = &revival_hint {
+            println!("  {}", color::dim(&revival_hint_message(hint)));
+        }
     }
 
     // Opportunistically refresh tokens about to expire (background, bounded)
     usage::refresh_expiring_tokens().await;
 
     Ok(())
+}
+
+// ── tests: pick_revival_target ────────────────────────────
+
+#[cfg(test)]
+mod revival_target_tests {
+    use super::*;
+
+    fn credit(id: &str, expires_at: Option<&str>) -> usage::ResetCredit {
+        usage::ResetCredit {
+            id: id.to_string(),
+            granted_at: None,
+            expires_at: expires_at.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_pick_revival_target_returns_none_when_nobody_holds_card() {
+        let no_cards: Vec<usage::ResetCredit> = vec![];
+        let candidates = vec![
+            RevivalCandidate {
+                alias: "a",
+                eligible: false,
+                score: 10.0,
+                reset_credits: &no_cards,
+            },
+            RevivalCandidate {
+                alias: "b",
+                eligible: false,
+                score: 20.0,
+                reset_credits: &no_cards,
+            },
+        ];
+        assert_eq!(pick_revival_target(&candidates), None);
+    }
+
+    #[test]
+    fn test_pick_revival_target_returns_earliest_expiring_card_holder() {
+        let a_cards = vec![credit("a1", Some("2026-07-10T00:00:00Z"))];
+        let b_cards = vec![credit("b1", Some("2026-07-05T00:00:00Z"))];
+        let candidates = vec![
+            RevivalCandidate {
+                alias: "a",
+                eligible: false,
+                score: 10.0,
+                reset_credits: &a_cards,
+            },
+            RevivalCandidate {
+                alias: "b",
+                eligible: false,
+                score: 20.0,
+                reset_credits: &b_cards,
+            },
+        ];
+        assert_eq!(pick_revival_target(&candidates).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn test_pick_revival_target_treats_missing_expiry_as_latest() {
+        let a_cards = vec![credit("a1", None)]; // never expires -> sorts as latest
+        let b_cards = vec![credit("b1", Some("2026-07-05T00:00:00Z"))];
+        let candidates = vec![
+            RevivalCandidate {
+                alias: "a",
+                eligible: false,
+                score: 10.0,
+                reset_credits: &a_cards,
+            },
+            RevivalCandidate {
+                alias: "b",
+                eligible: false,
+                score: 20.0,
+                reset_credits: &b_cards,
+            },
+        ];
+        assert_eq!(pick_revival_target(&candidates).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn test_pick_revival_target_tie_breaks_by_card_count_then_score() {
+        // Same earliest expiry: a has 1 card, b has 2 cards -> b wins (more cards).
+        let a_cards = vec![credit("a1", Some("2026-07-05T00:00:00Z"))];
+        let b_cards = vec![
+            credit("b1", Some("2026-07-05T00:00:00Z")),
+            credit("b2", Some("2026-07-20T00:00:00Z")),
+        ];
+        let candidates = vec![
+            RevivalCandidate {
+                alias: "a",
+                eligible: false,
+                score: 50.0,
+                reset_credits: &a_cards,
+            },
+            RevivalCandidate {
+                alias: "b",
+                eligible: false,
+                score: 10.0,
+                reset_credits: &b_cards,
+            },
+        ];
+        assert_eq!(pick_revival_target(&candidates).as_deref(), Some("b"));
+
+        // Same earliest expiry, same card count -> higher score wins.
+        let c_cards = vec![credit("c1", Some("2026-07-05T00:00:00Z"))];
+        let d_cards = vec![credit("d1", Some("2026-07-05T00:00:00Z"))];
+        let candidates2 = vec![
+            RevivalCandidate {
+                alias: "c",
+                eligible: false,
+                score: 5.0,
+                reset_credits: &c_cards,
+            },
+            RevivalCandidate {
+                alias: "d",
+                eligible: false,
+                score: 15.0,
+                reset_credits: &d_cards,
+            },
+        ];
+        assert_eq!(pick_revival_target(&candidates2).as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn test_revival_prompt_message_includes_alias_count_and_expiry() {
+        let msg = revival_prompt_message("acct-a", 2, "07-08 00:00");
+        assert!(msg.contains("acct-a"));
+        assert!(msg.contains('2'));
+        assert!(msg.contains("07-08 00:00"));
+        assert!(msg.contains("[y/N]"));
+    }
+
+    #[test]
+    fn test_revival_hint_message_includes_alias_and_flag() {
+        let hint = RevivalHint {
+            alias: "acct-b".to_string(),
+            card_count: 3,
+        };
+        let msg = revival_hint_message(&hint);
+        assert!(msg.contains("acct-b"));
+        assert!(msg.contains('3'));
+        assert!(msg.contains("--consume-card"));
+    }
+
+    #[test]
+    fn test_pick_revival_target_ignores_eligible_candidates() {
+        let cards = vec![credit("x1", Some("2026-07-05T00:00:00Z"))];
+        let candidates = vec![RevivalCandidate {
+            alias: "eligible_holder",
+            eligible: true,
+            score: 999.0,
+            reset_credits: &cards,
+        }];
+        assert_eq!(pick_revival_target(&candidates), None);
+    }
 }

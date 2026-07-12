@@ -162,10 +162,10 @@ sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 
 | 命令 | 说明 |
 |------|------|
-| `codex-switch use [别名]` | 切换账号。不带别名则用自适应评分算法自动选择最优账号 |
+| `codex-switch use [别名] [--consume-card]` | 切换账号。不带别名则用自适应评分算法自动选择最优账号；若账号池全部耗尽，`--consume-card`（或交互式 y/N 确认）会消耗最早过期的 reset card 复活一个账号，而不是直接落回耗尽账号（带别名时该选项被忽略） |
 | `codex-switch list [-f]` | 显示所有账号信息、用量和可用状态（`-f` 强制刷新，忽略缓存） |
 | `codex-switch reset-card <别名> [--yes]` | 消耗该账号最早过期的可用 Codex reset card。默认会先确认；JSON 模式需要 `--yes` |
-| `codex-switch launch [别名] [-- 参数...]` | 用指定账号的认证启动 Codex CLI。不带别名则自适应评分自动选择。`--` 后的参数透传给 codex |
+| `codex-switch launch [别名] [--consume-card] [-- 参数...]` | 用指定账号的认证启动 Codex CLI。不带别名则自适应评分自动选择，`--consume-card` 行为与 `use` 相同。`--` 后的参数透传给 codex |
 | `codex-switch warmup [别名]` | 发送最小请求以触发 5h/7d 配额窗口倒计时。不带别名则预热所有账号 |
 | `codex-switch login [--device] [别名]` | OAuth 登录（`--device` 用于无浏览器的服务器）。若别名已存在则重新授权 |
 | `codex-switch rename <旧别名> <新别名>` | 重命名账号 |

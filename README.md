@@ -163,10 +163,10 @@ Use aliases such as `work` or `personal` in place of `<alias>`. Run `codex-switc
 
 | Command | Description |
 |---------|-------------|
-| `codex-switch use [alias]` | Switch to a profile. Omit alias to auto-select with the adaptive scoring algorithm |
+| `codex-switch use [alias] [--consume-card]` | Switch to a profile. Omit alias to auto-select with the adaptive scoring algorithm; when the pool is exhausted, `--consume-card` (or an interactive y/N prompt) consumes the earliest-expiring reset card to revive an account instead of leaving it exhausted (ignored when an alias is given) |
 | `codex-switch list [-f]` | List all profiles with account info, usage, and availability (`-f` force refresh) |
 | `codex-switch reset-card <alias> [--yes]` | Consume the earliest-expiring available Codex reset card for a profile. Prompts for confirmation unless `--yes` is used; JSON mode requires `--yes` |
-| `codex-switch launch [alias] [-- args...]` | Launch Codex CLI with a profile's auth. Omit alias to auto-select with adaptive scoring. All arguments after `--` are forwarded to codex |
+| `codex-switch launch [alias] [--consume-card] [-- args...]` | Launch Codex CLI with a profile's auth. Omit alias to auto-select with adaptive scoring, with the same `--consume-card` reset-card revival behavior as `use`. All arguments after `--` are forwarded to codex |
 | `codex-switch warmup [alias]` | Send a minimal request to start the 5h/7d quota window countdown. Omit alias to warm up all profiles |
 | `codex-switch login [--device] [alias]` | Log in via OAuth (`--device` for headless servers). If alias exists, re-authorizes |
 | `codex-switch rename <old> <new>` | Rename a profile |

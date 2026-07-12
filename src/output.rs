@@ -82,6 +82,8 @@ pub struct JsonBest {
     pub usage: JsonUsage,
     pub score: f64,
     pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Serialize)]

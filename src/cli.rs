@@ -74,6 +74,11 @@ pub enum Commands {
     Use {
         /// Profile alias (omit to auto-select)
         alias: Option<String>,
+        /// When the pool is exhausted, automatically consume the earliest-expiring
+        /// reset card to revive an account (only applies when alias is omitted;
+        /// ignored when an alias is given)
+        #[arg(long)]
+        consume_card: bool,
     },
     /// List all profiles with account info, usage, and availability
     List {
@@ -153,6 +158,11 @@ pub enum Commands {
     Launch {
         /// Profile alias (omit to auto-select best available)
         alias: Option<String>,
+        /// When the pool is exhausted, automatically consume the earliest-expiring
+        /// reset card to revive an account (only applies when alias is omitted;
+        /// ignored when an alias is given)
+        #[arg(long)]
+        consume_card: bool,
         /// All remaining arguments passed through to codex
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
