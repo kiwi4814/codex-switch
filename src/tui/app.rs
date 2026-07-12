@@ -418,10 +418,7 @@ impl App {
                     let expiry = crate::jwt::token_expires_at(&token)
                         .map(format_local_timestamp)
                         .unwrap_or_else(|| "not reported".into());
-                    expiries.push(format!(
-                        "ID token · proves account identity · expires {}",
-                        expiry
-                    ));
+                    expiries.push(format!("ID token · expires {}", expiry));
                 }
                 if let Some(token) = auth
                     .pointer("/tokens/access_token")
@@ -430,10 +427,7 @@ impl App {
                     let expiry = crate::jwt::token_expires_at(token)
                         .map(format_local_timestamp)
                         .unwrap_or_else(|| "not reported".into());
-                    expiries.push(format!(
-                        "Access token · authorizes API requests · expires {}",
-                        expiry
-                    ));
+                    expiries.push(format!("Access token · expires {}", expiry));
                 }
                 expiries
             })

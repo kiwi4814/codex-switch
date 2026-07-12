@@ -2,13 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, warn};
 
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
-const FALLBACK_MODEL: &str = "gpt-5.3-codex";
 
 static CODEX_VERSION: OnceCell<String> = OnceCell::const_new();
 // tokio Mutex held across the await in resolve_model, ensuring only one fetch per process.
@@ -200,23 +199,37 @@ pub(crate) async fn fetch_models(
     account_id: Option<&str>,
     is_fedramp: bool,
 ) -> Result<Vec<ModelEntry>> {
-    let resp = build_models_request(
-        client,
-        access_token,
-        account_id,
-        is_fedramp,
-        detect_codex_version().await,
-    )
-    .send()
-    .await
-    .map_err(|e| crate::auth::format_reqwest_error("models fetch failed", &e))?;
-
-    if !resp.status().is_success() {
-        bail!("models endpoint returned {}", resp.status());
+    let version = detect_codex_version().await;
+    for attempt in 1..=3 {
+        let response = build_models_request(client, access_token, account_id, is_fedramp, version)
+            .send()
+            .await;
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                let body: serde_json::Value = resp.json().await?;
+                return parse_models_body(&body);
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let retryable = status.is_server_error() || status.as_u16() == 429;
+                if !retryable || attempt == 3 {
+                    bail!("models endpoint returned {status}");
+                }
+                warn!("models fetch attempt {attempt}/3 returned {status}; retrying");
+            }
+            Err(error) => {
+                if attempt == 3 {
+                    return Err(crate::auth::format_reqwest_error(
+                        "models fetch failed after 3 attempts",
+                        &error,
+                    ));
+                }
+                warn!("models fetch attempt {attempt}/3 failed: {error}; retrying");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
     }
-
-    let body: serde_json::Value = resp.json().await?;
-    parse_models_body(&body)
+    unreachable!("models fetch loop always returns")
 }
 
 async fn fetch_warmup_model(
@@ -227,11 +240,17 @@ async fn fetch_warmup_model(
     additional_limits: &[crate::usage::AdditionalRateLimit],
 ) -> Result<String> {
     let models = fetch_models(client, access_token, account_id, is_fedramp).await?;
+    let selected = select_warmup_models(&models, additional_limits)?;
+    require_official_model(
+        selected
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("official models endpoint returned no main-pool model")),
+    )
+}
 
-    Ok(select_warmup_models(&models, additional_limits)?
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| FALLBACK_MODEL.to_string()))
+fn require_official_model(result: Result<String>) -> Result<String> {
+    result.map_err(|error| anyhow::anyhow!("could not resolve an official warmup model: {error:#}"))
 }
 
 fn normalized_pool_name(value: &str) -> String {
@@ -352,31 +371,23 @@ async fn resolve_model(
     account_id: Option<&str>,
     is_fedramp: bool,
     additional_limits: &[crate::usage::AdditionalRateLimit],
-) -> String {
+) -> Result<String> {
     let mut guard = MODEL_CACHE.lock().await;
     if let Some(model) = model_cache_get(&guard, cache_key) {
-        return model;
+        return Ok(model);
     }
     // Hold the lock across the fetch so concurrent callers wait here instead of
     // each issuing a redundant request.
-    match fetch_warmup_model(
+    let model = fetch_warmup_model(
         client,
         access_token,
         account_id,
         is_fedramp,
         additional_limits,
     )
-    .await
-    {
-        Ok(model) => {
-            model_cache_set(&mut guard, cache_key, model.clone());
-            model
-        }
-        Err(e) => {
-            warn!("failed to fetch warmup model list, using fallback: {e}");
-            FALLBACK_MODEL.to_string()
-        }
-    }
+    .await?;
+    model_cache_set(&mut guard, cache_key, model.clone());
+    Ok(model)
 }
 
 fn build_body(model: &str) -> serde_json::Value {
@@ -525,7 +536,8 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
         is_fedramp,
         &additional_limits,
     )
-    .await;
+    .await
+    .with_context(|| format!("{alias}: failed to select a supported warmup model"))?;
     let body = build_body(&model);
 
     debug!("[{alias}] warmup POST → {RESPONSES_URL} (model={model})");
@@ -575,7 +587,10 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                     is_fedramp,
                     &additional_limits,
                 )
-                .await;
+                .await
+                .with_context(|| {
+                    format!("{alias}: failed to refresh the supported warmup model")
+                })?;
                 let retry_body = build_body(&new_model);
                 let mut retry_resp = make_request(
                     &client,
@@ -1003,6 +1018,15 @@ mod tests {
 
         let error = select_warmup_models(&models, &limits).unwrap_err();
         assert!(error.to_string().contains("GPT-6-Codex-Burst"));
+    }
+
+    #[test]
+    fn test_model_fetch_failure_is_not_replaced_with_a_hardcoded_model() {
+        let error = require_official_model(Err(anyhow::anyhow!("models endpoint unavailable")))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("models endpoint unavailable"));
+        assert!(!error.to_string().contains("gpt-5.3-codex"));
     }
 
     #[test]

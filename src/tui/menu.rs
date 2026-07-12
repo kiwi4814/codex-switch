@@ -788,8 +788,8 @@ mod tests {
             is_current: true,
             organizations: vec!["Night City · Owner · default workspace".into()],
             auth_expiries: vec![
-                "ID token · proves account identity · expires soon".into(),
-                "Access token · authorizes API requests · expires soon".into(),
+                "ID token · expires soon".into(),
+                "Access token · expires soon".into(),
             ],
             usage: Some(Box::new(usage)),
             usage_meta: vec!["  updated now".into()],
