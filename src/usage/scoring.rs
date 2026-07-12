@@ -25,13 +25,30 @@ pub fn warmup_window_active(w: &WindowUsage, window_secs: i64, now: i64) -> bool
 /// warmup once the 5h window has closed. Free accounts only have the 7d window, so it
 /// is the only signal available.
 pub fn usage_has_active_warmup_window(u: &UsageInfo, now: i64) -> bool {
-    match u.primary.as_ref() {
+    let main_active = match u.primary.as_ref() {
         Some(w) => warmup_window_active(w, WINDOW_5H_SECS, now),
         None => u
             .secondary
             .as_ref()
             .is_some_and(|w| warmup_window_active(w, WINDOW_7D_SECS, now)),
-    }
+    };
+    let additional_active = u
+        .additional_limits
+        .iter()
+        .filter(|limit| limit.metered_feature.as_deref() == Some("codex_bengalfox"))
+        .all(|limit| {
+            if limit.allowed == Some(false) || limit.limit_reached == Some(true) {
+                return true;
+            }
+            match limit.primary.as_ref() {
+                Some(w) => warmup_window_active(w, WINDOW_5H_SECS, now),
+                None => limit
+                    .secondary
+                    .as_ref()
+                    .is_some_and(|w| warmup_window_active(w, WINDOW_7D_SECS, now)),
+            }
+        });
+    main_active && additional_active
 }
 
 /// Calculate pace: the expected used_percent if consumption were even across the window.
@@ -392,6 +409,8 @@ mod tests {
             reset_credits: vec![],
             reset_credits_error: None,
             account_limited: false,
+            rate_limit_reached_type: None,
+            individual_limit: None,
             additional_limits: vec![],
         }
     }
@@ -400,6 +419,7 @@ mod tests {
         WindowUsage {
             used_percent: Some(used_percent),
             resets_at,
+            window_minutes: None,
         }
     }
 
@@ -484,10 +504,12 @@ mod tests {
             primary: Some(WindowUsage {
                 used_percent: Some(used_percent),
                 resets_at: Some(resets_at),
+                window_minutes: None,
             }),
             secondary: Some(WindowUsage {
                 used_percent: Some(10.0),
                 resets_at: Some(resets_at + 5 * 86400),
+                window_minutes: None,
             }),
             plan_type: plan_type.map(|p| p.to_string()),
             ..UsageInfo::default()
@@ -871,6 +893,7 @@ mod tests {
         let w = WindowUsage {
             used_percent: Some(99.6),
             resets_at: Some(auth::now_unix_secs() + 3600),
+            window_minutes: None,
         };
         assert_eq!(visible_pace_percent(&w, WINDOW_5H_SECS), None);
     }
@@ -880,6 +903,7 @@ mod tests {
         let w = WindowUsage {
             used_percent: Some(99.4),
             resets_at: Some(auth::now_unix_secs() + 3600),
+            window_minutes: None,
         };
         assert!(visible_pace_percent(&w, WINDOW_5H_SECS).is_some());
     }
@@ -890,10 +914,12 @@ mod tests {
         let just_started = WindowUsage {
             used_percent: Some(1.0),
             resets_at: Some(now + WINDOW_5H_SECS - 60),
+            window_minutes: None,
         };
         let past_threshold = WindowUsage {
             used_percent: Some(1.0),
             resets_at: Some(now + WINDOW_5H_SECS - MIN_WARMUP_ELAPSED_SECS),
+            window_minutes: None,
         };
 
         assert!(!warmup_window_active(&just_started, WINDOW_5H_SECS, now));
@@ -906,10 +932,12 @@ mod tests {
         let no_usage = WindowUsage {
             used_percent: Some(0.0),
             resets_at: Some(now + WINDOW_5H_SECS - MIN_WARMUP_ELAPSED_SECS),
+            window_minutes: None,
         };
         let no_reset = WindowUsage {
             used_percent: Some(1.0),
             resets_at: None,
+            window_minutes: None,
         };
 
         assert!(!warmup_window_active(&no_usage, WINDOW_5H_SECS, now));
@@ -925,10 +953,12 @@ mod tests {
         let expired_5h = WindowUsage {
             used_percent: Some(99.0),
             resets_at: Some(now - 60), // already reset server-side
+            window_minutes: None,
         };
         let active_7d = WindowUsage {
             used_percent: Some(40.0),
             resets_at: Some(now + WINDOW_7D_SECS - MIN_WARMUP_ELAPSED_SECS),
+            window_minutes: None,
         };
         let u = UsageInfo {
             primary: Some(expired_5h),
@@ -944,6 +974,7 @@ mod tests {
         let active_5h = WindowUsage {
             used_percent: Some(20.0),
             resets_at: Some(now + WINDOW_5H_SECS - MIN_WARMUP_ELAPSED_SECS),
+            window_minutes: None,
         };
         let u = UsageInfo {
             primary: Some(active_5h),
@@ -954,12 +985,62 @@ mod tests {
     }
 
     #[test]
+    fn test_inactive_additional_pool_requires_warmup_even_when_main_pool_is_active() {
+        let now = 1_000_000i64;
+        let active_5h = WindowUsage {
+            used_percent: Some(20.0),
+            resets_at: Some(now + WINDOW_5H_SECS - MIN_WARMUP_ELAPSED_SECS),
+            window_minutes: None,
+        };
+        let inactive_spark = super::super::AdditionalRateLimit {
+            limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+            metered_feature: Some("codex_bengalfox".to_string()),
+            allowed: Some(true),
+            limit_reached: Some(false),
+            primary: None,
+            secondary: None,
+        };
+        let u = UsageInfo {
+            primary: Some(active_5h),
+            additional_limits: vec![inactive_spark],
+            ..Default::default()
+        };
+
+        assert!(!usage_has_active_warmup_window(&u, now));
+    }
+
+    #[test]
+    fn test_code_review_pool_does_not_trigger_model_warmup() {
+        let now = 1_000_000i64;
+        let active_5h = WindowUsage {
+            used_percent: Some(20.0),
+            resets_at: Some(now + WINDOW_5H_SECS - MIN_WARMUP_ELAPSED_SECS),
+            window_minutes: Some(300),
+        };
+        let u = UsageInfo {
+            primary: Some(active_5h),
+            additional_limits: vec![super::super::AdditionalRateLimit {
+                limit_name: Some("Code review".to_string()),
+                metered_feature: Some("code_review".to_string()),
+                allowed: Some(true),
+                limit_reached: Some(false),
+                primary: None,
+                secondary: None,
+            }],
+            ..Default::default()
+        };
+
+        assert!(usage_has_active_warmup_window(&u, now));
+    }
+
+    #[test]
     fn test_free_account_falls_back_to_7d_window() {
         // Free accounts have primary=None (remapped to secondary in parse_usage).
         let now = 1_000_000i64;
         let active_7d = WindowUsage {
             used_percent: Some(10.0),
             resets_at: Some(now + WINDOW_7D_SECS - MIN_WARMUP_ELAPSED_SECS),
+            window_minutes: None,
         };
         let u = UsageInfo {
             primary: None,

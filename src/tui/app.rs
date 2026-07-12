@@ -11,7 +11,7 @@ use crate::auth;
 use crate::cache;
 use crate::jwt::AccountInfo;
 use crate::login;
-use crate::output::{format_local_datetime, reset_credits_count};
+use crate::output::{format_iso8601, format_local_datetime, reset_credits_count};
 use crate::profile::{
     self, cmd_delete, list_profiles, profile_auth_path, read_current, rename_profile,
     switch_profile, sync_current_from_live, validate_alias,
@@ -33,7 +33,7 @@ pub struct AccountEntry {
 pub enum UsageStatus {
     Idle,
     Loading,
-    Loaded(UsageInfo),
+    Loaded(Box<UsageInfo>),
     Error(UsageError),
 }
 
@@ -42,6 +42,38 @@ pub enum ModelStatus {
     Loading,
     Loaded(Vec<ModelEntry>),
     Error(String),
+}
+
+fn wrap_account_detail_line(line: String) -> Vec<String> {
+    const MAX_WIDTH: usize = 68;
+    if line.chars().count() <= MAX_WIDTH {
+        return vec![line];
+    }
+    let indent = "    ";
+    let mut remaining = line.as_str();
+    let mut wrapped = Vec::new();
+    while remaining.chars().count() > MAX_WIDTH {
+        let split = remaining
+            .char_indices()
+            .take(MAX_WIDTH + 1)
+            .filter(|(_, ch)| ch.is_whitespace() || matches!(ch, '·' | ','))
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or_else(|| {
+                remaining
+                    .char_indices()
+                    .nth(MAX_WIDTH)
+                    .map(|(index, _)| index)
+                    .unwrap_or(remaining.len())
+            });
+        let (head, tail) = remaining.split_at(split);
+        wrapped.push(head.trim_end().to_string());
+        remaining = tail.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '·');
+    }
+    if !remaining.is_empty() {
+        wrapped.push(format!("{indent}{remaining}"));
+    }
+    wrapped
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +149,7 @@ pub struct App {
     pub help_popup: Option<super::popup::PopupState>,
     pub menu: Option<super::menu::MenuState>,
     /// Session-level per-alias model list cache (no TTL). Populated lazily
-    /// when the detail panel is open and an account is selected.
+    /// for the selected account or when its account details are opened.
     pub model_cache: HashMap<String, ModelStatus>,
     pub pending_models: tokio::sync::mpsc::Receiver<(String, Result<Vec<ModelEntry>, String>)>,
     pub model_sender: tokio::sync::mpsc::Sender<(String, Result<Vec<ModelEntry>, String>)>,
@@ -214,7 +246,12 @@ impl App {
     }
 
     pub fn poll_model_results(&mut self) {
+        let mut refresh_open_account = false;
         while let Ok((alias, result)) = self.pending_models.try_recv() {
+            refresh_open_account |= matches!(
+                self.menu.as_ref(),
+                Some(super::menu::MenuState::Account { info, .. }) if info.alias == alias
+            );
             self.model_cache.insert(
                 alias,
                 match result {
@@ -222,6 +259,20 @@ impl App {
                     Err(e) => ModelStatus::Error(e),
                 },
             );
+        }
+        if refresh_open_account {
+            self.rebuild_open_account_menu();
+        }
+    }
+
+    fn rebuild_open_account_menu(&mut self) {
+        let scroll = match self.menu.as_ref() {
+            Some(super::menu::MenuState::Account { popup, .. }) => popup.scroll,
+            _ => return,
+        };
+        self.open_account_menu();
+        if let Some(super::menu::MenuState::Account { popup, .. }) = self.menu.as_mut() {
+            popup.scroll = scroll;
         }
     }
 
@@ -234,14 +285,14 @@ impl App {
     }
 
     pub fn open_account_menu(&mut self) {
-        let Some(entry) = self
-            .selected_account_idx()
-            .and_then(|idx| self.accounts.get(idx))
-        else {
+        let Some(account_idx) = self.selected_account_idx() else {
             return;
         };
+        let alias = self.accounts[account_idx].alias.clone();
+        self.ensure_models_loaded(&alias);
+        let entry = &self.accounts[account_idx];
         let loaded_usage = match &entry.usage {
-            UsageStatus::Loaded(u) => Some(u),
+            UsageStatus::Loaded(u) => Some(u.as_ref()),
             _ => None,
         };
         let plan = loaded_usage
@@ -262,11 +313,17 @@ impl App {
                 credits
                     .into_iter()
                     .map(|credit| {
-                        credit
+                        let granted = credit
+                            .granted_at
+                            .as_deref()
+                            .map(format_local_datetime)
+                            .unwrap_or_else(|| "--".to_string());
+                        let expires = credit
                             .expires_at
                             .as_deref()
                             .map(format_local_datetime)
-                            .unwrap_or_else(|| "no expiry".to_string())
+                            .unwrap_or_else(|| "no expiry".to_string());
+                        format!("granted {granted} · expires {expires} · id={}", credit.id)
                     })
                     .collect()
             })
@@ -274,12 +331,297 @@ impl App {
         let can_consume_reset_card = loaded_usage
             .and_then(|u| crate::usage::earliest_reset_credit(&u.reset_credits))
             .is_some();
+        let window_text = |label: &str, window: Option<&crate::usage::WindowUsage>| {
+            window.map(|window| {
+                let label = match window.window_minutes {
+                    Some(minutes) if minutes % 1_440 == 0 => format!("{}d", minutes / 1_440),
+                    Some(minutes) if minutes % 60 == 0 => format!("{}h", minutes / 60),
+                    Some(minutes) => format!("{minutes}m"),
+                    None => label.to_string(),
+                };
+                let remaining = window
+                    .used_percent
+                    .map(|used| format!("{:.0}% left", (100.0 - used).max(0.0)))
+                    .unwrap_or_else(|| "--".to_string());
+                let reset = window
+                    .resets_at
+                    .map(format_iso8601)
+                    .unwrap_or_else(|| "--".to_string());
+                format!("{label} {remaining}, reset {reset}")
+            })
+        };
+        let quota_line = |name: &str,
+                          primary: Option<&crate::usage::WindowUsage>,
+                          secondary: Option<&crate::usage::WindowUsage>| {
+            let mut parts = vec![name.to_string()];
+            if let Some(text) = window_text("5h", primary) {
+                parts.push(text);
+            }
+            if let Some(text) = window_text("7d", secondary) {
+                parts.push(text);
+            }
+            format!("  {}", parts.join(" · "))
+        };
+        let quota_pools: Vec<String> = loaded_usage
+            .map(|usage| {
+                let mut pools = vec![quota_line(
+                    "Main",
+                    usage.primary.as_ref(),
+                    usage.secondary.as_ref(),
+                )];
+                pools.extend(usage.additional_limits.iter().map(|pool| {
+                    let name = pool.limit_name.as_deref().unwrap_or("Additional");
+                    let feature = pool
+                        .metered_feature
+                        .as_deref()
+                        .map(|value| format!(" [{value}]"))
+                        .unwrap_or_default();
+                    let state = if pool.allowed == Some(false) {
+                        " · disallowed"
+                    } else if pool.limit_reached == Some(true) {
+                        " · exhausted"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{}{feature}{state}",
+                        quota_line(name, pool.primary.as_ref(), pool.secondary.as_ref())
+                    )
+                }));
+                pools
+            })
+            .unwrap_or_else(|| vec!["  usage not loaded".to_string()])
+            .into_iter()
+            .flat_map(wrap_account_detail_line)
+            .collect();
+        let usage_meta: Vec<String> = loaded_usage
+            .map(|usage| {
+                let mut items = Vec::new();
+                if let Some(fetched_at) = usage.fetched_at {
+                    items.push(format!("  fetched {}", format_iso8601(fetched_at)));
+                }
+                if usage.account_limited {
+                    items.push("  account limited".to_string());
+                }
+                if let Some(reason) = &usage.rate_limit_reached_type {
+                    items.push(format!("  limit reason: {reason}"));
+                }
+                if usage.unlimited_credits == Some(true) {
+                    items.push("  credits unlimited".to_string());
+                } else if let Some(balance) = usage.credits_balance {
+                    items.push(format!("  credits ${balance:.2}"));
+                }
+                if let Some(error) = &usage.reset_credits_error {
+                    items.push(format!("  reset-card details unavailable: {error}"));
+                }
+                if let Some(limit) = &usage.individual_limit {
+                    let mut parts = vec!["  monthly limit".to_string()];
+                    if let Some(value) = &limit.limit {
+                        parts.push(format!("limit={value}"));
+                    }
+                    if let Some(value) = &limit.used {
+                        parts.push(format!("used={value}"));
+                    }
+                    if let Some(value) = &limit.remaining {
+                        parts.push(format!("remaining={value}"));
+                    }
+                    if let Some(value) = limit.remaining_percent {
+                        parts.push(format!("{value:.0}% left"));
+                    }
+                    if let Some(value) = limit.resets_at {
+                        parts.push(format!("reset={}", format_iso8601(value)));
+                    }
+                    if let Some(value) = &limit.source {
+                        parts.push(format!("source={value}"));
+                    }
+                    items.push(parts.join(" · "));
+                }
+                items
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(wrap_account_detail_line)
+            .collect();
+        let models: Vec<String> = match self.model_cache.get(&entry.alias) {
+            Some(ModelStatus::Loaded(models)) => crate::warmup::sorted_models_for_display(models)
+                .into_iter()
+                .flat_map(|model| {
+                    let label = match &model.display_name {
+                        Some(name) => format!("  {name} ({})", model.slug),
+                        None => format!("  {}", model.slug),
+                    };
+                    let visibility = model.visibility.as_deref().unwrap_or("unknown");
+                    let api = match model.supported_in_api {
+                        Some(true) => "yes",
+                        Some(false) => "no",
+                        None => "unknown",
+                    };
+                    let context = model
+                        .context_window
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "--".to_string());
+                    let priority = model
+                        .priority
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "--".to_string());
+                    let max_context = model
+                        .max_context_window
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "--".to_string());
+                    let mut lines = vec![
+                        label,
+                        format!(
+                            "    visibility={visibility} · api={api} · priority={priority} · context={context} · max={max_context}"
+                        ),
+                    ];
+                    if let Some(description) = &model.description {
+                        lines.push(format!("    {description}"));
+                    }
+                    if model.default_reasoning_effort.is_some()
+                        || !model.supported_reasoning_efforts.is_empty()
+                    {
+                        lines.push(format!(
+                            "    reasoning default={} · supported={}",
+                            model.default_reasoning_effort.as_deref().unwrap_or("--"),
+                            if model.supported_reasoning_efforts.is_empty() {
+                                "--".to_string()
+                            } else {
+                                model.supported_reasoning_efforts.join(", ")
+                            }
+                        ));
+                    }
+                    if !model.input_modalities.is_empty()
+                        || !model.additional_speed_tiers.is_empty()
+                        || !model.service_tiers.is_empty()
+                    {
+                        lines.push(format!(
+                            "    modalities={} · speed={} · tiers={} · default tier={}",
+                            if model.input_modalities.is_empty() {
+                                "--".to_string()
+                            } else {
+                                model.input_modalities.join(", ")
+                            },
+                            if model.additional_speed_tiers.is_empty() {
+                                "--".to_string()
+                            } else {
+                                model.additional_speed_tiers.join(", ")
+                            },
+                            if model.service_tiers.is_empty() {
+                                "--".to_string()
+                            } else {
+                                model.service_tiers.join(", ")
+                            },
+                            model.default_service_tier.as_deref().unwrap_or("--")
+                        ));
+                    }
+                    if model.auto_compact_token_limit.is_some()
+                        || model.effective_context_window_percent.is_some()
+                    {
+                        lines.push(format!(
+                            "    auto compact={} · effective context={}{}",
+                            model
+                                .auto_compact_token_limit
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "--".to_string()),
+                            model
+                                .effective_context_window_percent
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "--".to_string()),
+                            if model.effective_context_window_percent.is_some() {
+                                "%"
+                            } else {
+                                ""
+                            }
+                        ));
+                    }
+                    if model.supports_parallel_tool_calls.is_some()
+                        || model.supports_image_detail_original.is_some()
+                        || model.supports_search_tool.is_some()
+                        || model.use_responses_lite.is_some()
+                        || !model.experimental_supported_tools.is_empty()
+                    {
+                        let flag = |value: Option<bool>| match value {
+                            Some(true) => "yes",
+                            Some(false) => "no",
+                            None => "--",
+                        };
+                        lines.push(format!(
+                            "    parallel={} · image-original={} · search={} · lite={} · tools={}",
+                            flag(model.supports_parallel_tool_calls),
+                            flag(model.supports_image_detail_original),
+                            flag(model.supports_search_tool),
+                            flag(model.use_responses_lite),
+                            if model.experimental_supported_tools.is_empty() {
+                                "--".to_string()
+                            } else {
+                                model.experimental_supported_tools.join(", ")
+                            }
+                        ));
+                    }
+                    lines
+                })
+                .collect(),
+            Some(ModelStatus::Error(error)) => vec![format!("  error: {error}")],
+            _ => vec!["  loading...".to_string()],
+        }
+        .into_iter()
+        .flat_map(wrap_account_detail_line)
+        .collect();
+        let auth_expiries = profile_auth_path(&entry.alias)
+            .ok()
+            .and_then(|path| auth::read_auth(&path).ok())
+            .map(|auth| {
+                let mut expiries = Vec::new();
+                if let Some(token) = auth::extract_id_token(&auth)
+                    && let Some(expires_at) = crate::jwt::token_expires_at(&token)
+                {
+                    expiries.push(format!("ID token {}", format_iso8601(expires_at)));
+                }
+                if let Some(token) = auth
+                    .pointer("/tokens/access_token")
+                    .and_then(serde_json::Value::as_str)
+                    && let Some(expires_at) = crate::jwt::token_expires_at(token)
+                {
+                    expiries.push(format!("access token {}", format_iso8601(expires_at)));
+                }
+                expiries
+            })
+            .unwrap_or_default();
         self.menu = Some(super::menu::MenuState::account(
             super::menu::AccountMenuInfo {
                 alias: entry.alias.clone(),
                 email: entry.info.email.clone(),
+                account_id: entry.info.account_id.clone(),
+                user_id: entry.info.user_id.clone(),
+                workspace_name: entry.info.workspace_name.clone(),
+                is_fedramp: entry.info.is_fedramp,
                 plan_label: entry.info.plan_label_with(plan),
+                plan_type: plan.map(str::to_string),
                 is_current: entry.is_current,
+                organizations: entry
+                    .info
+                    .organizations
+                    .iter()
+                    .filter(|organization| !organization.title.is_empty())
+                    .map(|organization| {
+                        format!(
+                            "{} · role={} · id={}{}",
+                            organization.title,
+                            organization.role,
+                            organization.id,
+                            if organization.is_default {
+                                " · default"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .flat_map(wrap_account_detail_line)
+                    .collect(),
+                auth_expiries,
+                usage_meta,
+                quota_pools,
+                models,
                 reset_cards,
                 reset_card_expiries,
                 can_consume_reset_card,
@@ -599,6 +941,21 @@ impl App {
         count
     }
 
+    pub fn refresh_one(&mut self, alias: &str) {
+        let Some(idx) = self
+            .accounts
+            .iter()
+            .position(|account| account.alias == alias)
+        else {
+            return;
+        };
+        self.accounts[idx].usage = UsageStatus::Idle;
+        self.model_cache.remove(alias);
+        self.fetch_usage_for(idx, true);
+        self.ensure_models_loaded(alias);
+        self.set_status(format!("Refreshing {alias}"), 3);
+    }
+
     fn spawn_warmup(&mut self, alias: String) {
         // Skip if this alias already has an in-flight warmup task.
         if self.is_warmup_in_flight(&alias) {
@@ -820,7 +1177,7 @@ impl App {
                 _ => {}
             }
             if !force && let Some(cached) = crate::cache::get(&entry.alias) {
-                entry.usage = UsageStatus::Loaded(cached);
+                entry.usage = UsageStatus::Loaded(Box::new(cached));
             }
         }
         for &i in target_indices {
@@ -845,25 +1202,35 @@ impl App {
 
     pub fn poll_results(&mut self) {
         let mut changed = false;
+        let open_account_alias = match self.menu.as_ref() {
+            Some(super::menu::MenuState::Account { info, .. }) => Some(info.alias.clone()),
+            _ => None,
+        };
+        let mut refresh_open_account = false;
         while let Ok((alias, result)) = self.pending_results.try_recv() {
             let Some(idx) = self.accounts.iter().position(|entry| entry.alias == alias) else {
                 continue;
             };
             self.accounts[idx].usage = match result {
-                Ok(u) => UsageStatus::Loaded(u),
+                Ok(u) => UsageStatus::Loaded(Box::new(u)),
                 Err(e) => UsageStatus::Error(e),
             };
             crate::cache::apply_workspace_name(&mut self.accounts[idx].info);
+            refresh_open_account |= open_account_alias.as_deref() == Some(alias.as_str());
             changed = true;
         }
         while let Ok(alias) = self.pending_workspace.try_recv() {
             if let Some(entry) = self.accounts.iter_mut().find(|entry| entry.alias == alias) {
                 crate::cache::apply_workspace_name(&mut entry.info);
+                refresh_open_account |= open_account_alias.as_deref() == Some(alias.as_str());
                 changed = true;
             }
         }
         if changed {
             self.update_view();
+        }
+        if refresh_open_account {
+            self.rebuild_open_account_menu();
         }
     }
 
@@ -1439,7 +1806,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
 }
 
 async fn handle_menu_key(app: &mut App, terminal: &mut DefaultTerminal, code: KeyCode) {
-    let Some(menu) = app.menu.as_ref() else {
+    let Some(menu) = app.menu.as_mut() else {
         return;
     };
     let action = menu.handle_key(code);
@@ -1467,6 +1834,10 @@ async fn handle_menu_key(app: &mut App, terminal: &mut DefaultTerminal, code: Ke
         MenuAction::Add { device } => {
             app.close_menu();
             perform_oauth(terminal, app, OAuthMode::Add, device).await;
+        }
+        MenuAction::RefreshOne(alias) => {
+            app.close_menu();
+            app.refresh_one(&alias);
         }
         MenuAction::Rename(alias) => {
             app.close_menu();
@@ -1718,4 +2089,76 @@ fn char_to_byte(s: &str, char_pos: usize) -> usize {
         .nth(char_pos)
         .map(|(byte_idx, _)| byte_idx)
         .unwrap_or(s.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AccountEntry, App, ModelStatus, UsageStatus};
+    use crate::{jwt::AccountInfo, usage::UsageInfo, warmup::ModelEntry};
+
+    #[test]
+    fn model_result_rebuilds_an_open_account_detail() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+        app.model_cache
+            .insert("account".into(), ModelStatus::Loading);
+        app.open_account_menu();
+
+        app.model_sender
+            .try_send((
+                "account".into(),
+                Ok(vec![ModelEntry {
+                    slug: "official-slug".into(),
+                    display_name: Some("Official Name".into()),
+                    ..ModelEntry::default()
+                }]),
+            ))
+            .unwrap();
+        app.poll_model_results();
+
+        let Some(super::super::menu::MenuState::Account { info, .. }) = app.menu else {
+            panic!("account detail should remain open");
+        };
+        assert!(
+            info.models
+                .iter()
+                .any(|line| line.contains("Official Name (official-slug)"))
+        );
+    }
+
+    #[test]
+    fn usage_result_rebuilds_an_open_account_detail() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loading,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+        app.model_cache
+            .insert("account".into(), ModelStatus::Loaded(Vec::new()));
+        app.open_account_menu();
+
+        app.result_sender
+            .try_send(("account".into(), Ok(UsageInfo::default())))
+            .unwrap();
+        app.poll_results();
+
+        let Some(super::super::menu::MenuState::Account { info, .. }) = app.menu else {
+            panic!("account detail should remain open");
+        };
+        assert!(
+            !info
+                .quota_pools
+                .iter()
+                .any(|line| line == "  usage not loaded")
+        );
+    }
 }

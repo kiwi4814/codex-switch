@@ -19,8 +19,12 @@ struct CacheEntry {
     ts: u64,
     primary_used: Option<f64>,
     primary_reset: Option<i64>,
+    #[serde(default)]
+    primary_window_minutes: Option<i64>,
     secondary_used: Option<f64>,
     secondary_reset: Option<i64>,
+    #[serde(default)]
+    secondary_window_minutes: Option<i64>,
     #[serde(default)]
     credits_balance: Option<f64>,
     #[serde(default)]
@@ -35,6 +39,12 @@ struct CacheEntry {
     reset_credits_error: Option<String>,
     #[serde(default)]
     account_limited: bool,
+    #[serde(default)]
+    rate_limit_reached_type: Option<String>,
+    #[serde(default)]
+    individual_limit: Option<Box<crate::usage::SpendControlLimit>>,
+    #[serde(default)]
+    additional_limits: Vec<crate::usage::AdditionalRateLimit>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -150,8 +160,10 @@ fn to_entry(u: &UsageInfo) -> CacheEntry {
         ts: now_secs(),
         primary_used: u.primary.as_ref().and_then(|w| w.used_percent),
         primary_reset: u.primary.as_ref().and_then(|w| w.resets_at),
+        primary_window_minutes: u.primary.as_ref().and_then(|w| w.window_minutes),
         secondary_used: u.secondary.as_ref().and_then(|w| w.used_percent),
         secondary_reset: u.secondary.as_ref().and_then(|w| w.resets_at),
+        secondary_window_minutes: u.secondary.as_ref().and_then(|w| w.window_minutes),
         credits_balance: u.credits_balance,
         unlimited_credits: u.unlimited_credits,
         plan_type: u.plan_type.clone(),
@@ -159,6 +171,9 @@ fn to_entry(u: &UsageInfo) -> CacheEntry {
         reset_credits: u.reset_credits.clone(),
         reset_credits_error: u.reset_credits_error.clone(),
         account_limited: u.account_limited,
+        rate_limit_reached_type: u.rate_limit_reached_type.clone(),
+        individual_limit: u.individual_limit.clone(),
+        additional_limits: u.additional_limits.clone(),
     }
 }
 
@@ -168,6 +183,7 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         Some(WindowUsage {
             used_percent: e.primary_used,
             resets_at: e.primary_reset,
+            window_minutes: e.primary_window_minutes,
         })
     } else {
         None
@@ -176,6 +192,7 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         Some(WindowUsage {
             used_percent: e.secondary_used,
             resets_at: e.secondary_reset,
+            window_minutes: e.secondary_window_minutes,
         })
     } else {
         None
@@ -191,7 +208,9 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         reset_credits: e.reset_credits.clone(),
         reset_credits_error: e.reset_credits_error.clone(),
         account_limited: e.account_limited,
-        additional_limits: vec![],
+        rate_limit_reached_type: e.rate_limit_reached_type.clone(),
+        individual_limit: e.individual_limit.clone(),
+        additional_limits: e.additional_limits.clone(),
     }
 }
 
@@ -380,15 +399,34 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_round_trip_preserves_account_limited() {
+    fn test_cache_round_trip_preserves_limit_details() {
         let usage = UsageInfo {
             account_limited: true,
+            rate_limit_reached_type: Some("rate_limit_reached".to_string()),
+            additional_limits: vec![crate::usage::AdditionalRateLimit {
+                limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+                metered_feature: Some("codex_bengalfox".to_string()),
+                allowed: Some(true),
+                limit_reached: Some(false),
+                primary: None,
+                secondary: None,
+            }],
             ..Default::default()
         };
 
         let entry = to_entry(&usage);
         assert!(entry.account_limited);
-        assert!(from_entry(&entry).account_limited);
+        let restored = from_entry(&entry);
+        assert!(restored.account_limited);
+        assert_eq!(
+            restored.rate_limit_reached_type.as_deref(),
+            Some("rate_limit_reached")
+        );
+        assert_eq!(restored.additional_limits.len(), 1);
+        assert_eq!(
+            restored.additional_limits[0].metered_feature.as_deref(),
+            Some("codex_bengalfox")
+        );
     }
 
     #[test]

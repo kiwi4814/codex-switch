@@ -22,70 +22,83 @@ fn parse_window(val: &Value) -> Option<WindowUsage> {
     let used_percent = val.get("used_percent").and_then(|v| v.as_f64());
     used_percent?;
     let resets_at = val.get("reset_at").and_then(|v| v.as_i64());
+    let window_minutes = val
+        .get("limit_window_seconds")
+        .and_then(|v| v.as_i64())
+        .map(|seconds| seconds / 60);
 
     Some(WindowUsage {
         used_percent,
         resets_at,
+        window_minutes,
     })
 }
 
 /// Parse `additional_rate_limits[]`. Malformed entries (missing/non-object
 /// `rate_limit`) are skipped rather than failing the whole parse.
 fn parse_additional_rate_limits(body: &Value) -> Vec<AdditionalRateLimit> {
-    let Some(items) = body.get("additional_rate_limits").and_then(Value::as_array) else {
-        return vec![];
+    let parse_item = |item: &Value, direct: bool| {
+        let rate_limit = if direct {
+            item.get("rate_limit").unwrap_or(item)
+        } else {
+            item.get("rate_limit")?
+        };
+        if !rate_limit.is_object() {
+            return None;
+        }
+        let primary = rate_limit
+            .get("primary_window")
+            .filter(|v| !v.is_null())
+            .and_then(parse_window);
+        let secondary = rate_limit
+            .get("secondary_window")
+            .filter(|v| !v.is_null())
+            .and_then(parse_window);
+        Some(AdditionalRateLimit {
+            limit_name: item
+                .get("limit_name")
+                .and_then(Value::as_str)
+                .map(String::from),
+            metered_feature: item
+                .get("metered_feature")
+                .and_then(Value::as_str)
+                .map(String::from),
+            allowed: rate_limit.get("allowed").and_then(Value::as_bool),
+            limit_reached: rate_limit.get("limit_reached").and_then(Value::as_bool),
+            primary,
+            secondary,
+        })
     };
 
-    items
-        .iter()
-        .filter_map(|item| {
-            let rate_limit = item.get("rate_limit")?;
-            if !rate_limit.is_object() {
-                return None;
-            }
-            let primary = rate_limit
-                .get("primary_window")
-                .filter(|v| !v.is_null())
-                .and_then(parse_window);
-            let secondary = rate_limit
-                .get("secondary_window")
-                .filter(|v| !v.is_null())
-                .and_then(parse_window);
-            Some(AdditionalRateLimit {
-                limit_name: item
-                    .get("limit_name")
-                    .and_then(Value::as_str)
-                    .map(String::from),
-                metered_feature: item
-                    .get("metered_feature")
-                    .and_then(Value::as_str)
-                    .map(String::from),
-                allowed: rate_limit.get("allowed").and_then(Value::as_bool),
-                limit_reached: rate_limit.get("limit_reached").and_then(Value::as_bool),
-                primary,
-                secondary,
-            })
-        })
-        .collect()
+    let mut limits: Vec<AdditionalRateLimit> = body
+        .get("additional_rate_limits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| parse_item(item, false))
+        .collect();
+
+    if let Some(review) = body
+        .get("code_review_rate_limit")
+        .filter(|value| !value.is_null())
+        && let Some(mut limit) = parse_item(review, true)
+    {
+        limit.limit_name = Some("Code review".to_string());
+        limit.metered_feature = Some("code_review".to_string());
+        limits.push(limit);
+    }
+    limits
 }
 
-fn known_rate_limit_reached_type(body: &Value) -> bool {
-    let kind = body.get("rate_limit_reached_type").and_then(|value| {
-        value
-            .get("type")
-            .and_then(Value::as_str)
-            .or_else(|| value.as_str())
-    });
-    matches!(
-        kind,
-        Some(
-            "rate_limit_reached"
-                | "workspace_owner_credits_depleted"
-                | "workspace_member_credits_depleted"
-                | "workspace_owner_usage_limit_reached"
-                | "workspace_member_usage_limit_reached"
-        )
-    )
+fn rate_limit_reached_type(body: &Value) -> Option<String> {
+    body.get("rate_limit_reached_type")
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .or_else(|| value.as_str())
+        })
+        .map(String::from)
 }
 
 pub(super) fn parse_usage_checked(body: &Value) -> Result<UsageInfo> {
@@ -181,11 +194,20 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
         .get("plan_type")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let account_limited = known_rate_limit_reached_type(body)
-        || body
-            .pointer("/spend_control/reached")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+    let rate_limit_reached_type = rate_limit_reached_type(body);
+    let account_limited = matches!(
+        rate_limit_reached_type.as_deref(),
+        Some(
+            "rate_limit_reached"
+                | "workspace_owner_credits_depleted"
+                | "workspace_member_credits_depleted"
+                | "workspace_owner_usage_limit_reached"
+                | "workspace_member_usage_limit_reached"
+        )
+    ) || body
+        .pointer("/spend_control/reached")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
         || body
             .pointer("/rate_limit/limit_reached")
             .and_then(Value::as_bool)
@@ -198,6 +220,26 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
         .unwrap_or((None, vec![], false));
 
     let additional_limits = parse_additional_rate_limits(body);
+    let individual_limit = body
+        .pointer("/spend_control/individual_limit")
+        .map(|limit| {
+            let string_value = |key: &str| {
+                limit.get(key).and_then(|value| {
+                    value
+                        .as_str()
+                        .map(String::from)
+                        .or_else(|| value.as_f64().map(|number| number.to_string()))
+                })
+            };
+            Box::new(super::SpendControlLimit {
+                source: string_value("source"),
+                limit: string_value("limit"),
+                used: string_value("used"),
+                remaining: string_value("remaining"),
+                remaining_percent: limit.get("remaining_percent").and_then(Value::as_f64),
+                resets_at: limit.get("reset_at").and_then(Value::as_i64),
+            })
+        });
 
     UsageInfo {
         fetched_at: Some(auth::now_unix_secs()),
@@ -210,6 +252,8 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
         reset_credits,
         reset_credits_error: None,
         account_limited,
+        rate_limit_reached_type,
+        individual_limit,
         additional_limits,
     }
 }
@@ -556,12 +600,70 @@ mod tests {
             Some(1783843614i64)
         );
         assert_eq!(
+            extra.primary.as_ref().and_then(|w| w.window_minutes),
+            Some(300)
+        );
+        assert_eq!(
             extra.secondary.as_ref().and_then(|w| w.used_percent),
             Some(0.0)
         );
         assert_eq!(
             extra.secondary.as_ref().and_then(|w| w.resets_at),
             Some(1784430414i64)
+        );
+    }
+
+    #[test]
+    fn test_parse_usage_preserves_code_review_and_individual_limit_details() {
+        let usage = parse_usage(&json!({
+            "rate_limit": {"primary_window": {"used_percent": 10.0}},
+            "rate_limit_reached_type": {"type": "workspace_member_usage_limit_reached"},
+            "spend_control": {
+                "individual_limit": {
+                    "source": "workspace_spend_controls",
+                    "limit": "25000",
+                    "used": "8000",
+                    "remaining": "17000",
+                    "remaining_percent": 68,
+                    "reset_at": 1784430414i64
+                }
+            },
+            "code_review_rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 25,
+                    "limit_window_seconds": 86400,
+                    "reset_at": 1784430414i64
+                }
+            }
+        }));
+
+        assert_eq!(
+            usage.rate_limit_reached_type.as_deref(),
+            Some("workspace_member_usage_limit_reached")
+        );
+        let limit = usage.individual_limit.expect("individual limit");
+        assert_eq!(limit.limit.as_deref(), Some("25000"));
+        assert_eq!(limit.used.as_deref(), Some("8000"));
+        assert_eq!(limit.remaining.as_deref(), Some("17000"));
+        assert_eq!(limit.remaining_percent, Some(68.0));
+        assert_eq!(limit.resets_at, Some(1784430414i64));
+        assert_eq!(usage.additional_limits.len(), 1);
+        assert_eq!(
+            usage.additional_limits[0].limit_name.as_deref(),
+            Some("Code review")
+        );
+        assert_eq!(
+            usage.additional_limits[0].metered_feature.as_deref(),
+            Some("code_review")
+        );
+        assert_eq!(
+            usage.additional_limits[0]
+                .primary
+                .as_ref()
+                .and_then(|window| window.window_minutes),
+            Some(1_440)
         );
     }
 

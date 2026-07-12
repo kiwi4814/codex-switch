@@ -26,15 +26,26 @@ pub use scoring::{
 #[allow(unused_imports)]
 pub use scoring::{score_unified, warmup_window_active};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WindowUsage {
     pub used_percent: Option<f64>,
+    pub resets_at: Option<i64>,
+    pub window_minutes: Option<i64>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct SpendControlLimit {
+    pub source: Option<String>,
+    pub limit: Option<String>,
+    pub used: Option<String>,
+    pub remaining: Option<String>,
+    pub remaining_percent: Option<f64>,
     pub resets_at: Option<i64>,
 }
 
 /// One entry from the `additional_rate_limits` array in the usage API response.
 /// Represents a metered feature (e.g. `codex_other`) with its own independent windows.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AdditionalRateLimit {
     pub limit_name: Option<String>,
     pub metered_feature: Option<String>,
@@ -73,6 +84,10 @@ pub struct UsageInfo {
     pub reset_credits_error: Option<String>,
     /// Explicit account/workspace-level restriction reported by the API.
     pub account_limited: bool,
+    /// Backend-classified limit reason, preserved for detailed diagnostics.
+    pub rate_limit_reached_type: Option<String>,
+    /// Effective workspace/user spend-control limit, when supplied by the backend.
+    pub individual_limit: Option<Box<SpendControlLimit>>,
     /// Per-feature rate limits from `additional_rate_limits[]` (e.g. codex_other).
     pub additional_limits: Vec<AdditionalRateLimit>,
 }
@@ -249,10 +264,12 @@ mod pool_row_tests {
             primary: Some(WindowUsage {
                 used_percent: Some(42.0),
                 resets_at: Some(1000),
+                window_minutes: Some(300),
             }),
             secondary: Some(WindowUsage {
                 used_percent: Some(10.0),
                 resets_at: Some(2000),
+                window_minutes: Some(10_080),
             }),
         }];
 

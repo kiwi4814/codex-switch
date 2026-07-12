@@ -69,6 +69,12 @@ pub const KEYMAP: &[Binding] = &[
     },
     // Account actions (via Enter menu)
     Binding {
+        keys: "r",
+        section: Section::Account,
+        label: "refresh account details",
+        in_status_bar: false,
+    },
+    Binding {
         keys: "u",
         section: Section::Account,
         label: "use (switch to)",
@@ -164,7 +170,7 @@ pub const KEYMAP: &[Binding] = &[
         keys: "i",
         section: Section::Global,
         label: "show / hide account detail panel",
-        in_status_bar: false,
+        in_status_bar: true,
     },
     Binding {
         keys: "h",
@@ -211,6 +217,15 @@ mod tests {
             super::status_bar_items()
                 .iter()
                 .any(|(keys, label)| *keys == "a" && label.contains("add"))
+        );
+    }
+
+    #[test]
+    fn status_bar_surfaces_account_detail_action() {
+        assert!(
+            super::status_bar_items()
+                .iter()
+                .any(|(keys, label)| *keys == "i" && label.contains("detail"))
         );
     }
 }

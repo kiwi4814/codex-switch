@@ -20,7 +20,7 @@ const C_CYAN: Color = Color::Rgb(100, 210, 255);
 pub enum MenuState {
     /// Account-scoped action menu (Enter on a single account).
     Account {
-        info: AccountMenuInfo,
+        info: Box<AccountMenuInfo>,
         popup: PopupState,
     },
     /// Add new account: choose OAuth flow.
@@ -41,8 +41,18 @@ pub enum MenuState {
 pub struct AccountMenuInfo {
     pub alias: String,
     pub email: Option<String>,
+    pub account_id: Option<String>,
+    pub user_id: Option<String>,
+    pub workspace_name: Option<String>,
+    pub is_fedramp: bool,
     pub plan_label: String,
+    pub plan_type: Option<String>,
     pub is_current: bool,
+    pub organizations: Vec<String>,
+    pub auth_expiries: Vec<String>,
+    pub usage_meta: Vec<String>,
+    pub quota_pools: Vec<String>,
+    pub models: Vec<String>,
     pub reset_cards: Option<u64>,
     pub reset_card_expiries: Vec<String>,
     pub can_consume_reset_card: bool,
@@ -62,6 +72,8 @@ pub enum MenuAction {
     Relogin { alias: String, device: bool },
     /// Trigger add-new-account with chosen flow.
     Add { device: bool },
+    /// Refresh usage and model metadata for one account.
+    RefreshOne(String),
     /// Open rename input for alias.
     Rename(String),
     /// Warmup just this alias.
@@ -87,7 +99,7 @@ pub enum MenuAction {
 impl MenuState {
     pub fn account(info: AccountMenuInfo) -> Self {
         MenuState::Account {
-            info,
+            info: Box::new(info),
             popup: PopupState::new(),
         }
     }
@@ -121,16 +133,37 @@ impl MenuState {
     }
 
     /// Translate a key press into an action. Returns `Close` to dismiss menu only.
-    pub fn handle_key(&self, code: ratatui::crossterm::event::KeyCode) -> MenuAction {
+    pub fn handle_key(&mut self, code: ratatui::crossterm::event::KeyCode) -> MenuAction {
         use ratatui::crossterm::event::KeyCode;
         match self {
-            MenuState::Account { info, .. } => match code {
+            MenuState::Account { info, popup } => match code {
                 KeyCode::Esc | KeyCode::Char('q') => MenuAction::Close,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    popup.scroll_down(u16::MAX);
+                    MenuAction::Noop
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    popup.scroll_up();
+                    MenuAction::Noop
+                }
+                KeyCode::PageDown => {
+                    popup.page_down(5, u16::MAX);
+                    MenuAction::Noop
+                }
+                KeyCode::PageUp => {
+                    popup.page_up(5);
+                    MenuAction::Noop
+                }
+                KeyCode::Home => {
+                    popup.reset();
+                    MenuAction::Noop
+                }
                 KeyCode::Char('u') => MenuAction::Use(info.alias.clone()),
                 KeyCode::Char('l') => {
                     MenuAction::ReloginRequest(info.alias.clone(), info.email.clone())
                 }
                 KeyCode::Char('n') => MenuAction::Rename(info.alias.clone()),
+                KeyCode::Char('r') => MenuAction::RefreshOne(info.alias.clone()),
                 KeyCode::Char('w') => MenuAction::WarmupOne(info.alias.clone()),
                 KeyCode::Char('c') => MenuAction::ConsumeResetCard(info.alias.clone()),
                 KeyCode::Char('d') => MenuAction::DeleteRequest(info.alias.clone()),
@@ -179,7 +212,7 @@ impl MenuState {
 
         match self {
             MenuState::Account { info, popup } => {
-                let title = "Account";
+                let title = "Account details";
                 let mut lines: Vec<Line<'static>> = Vec::new();
                 let active = if info.is_current { "  active" } else { "" };
                 lines.push(Line::from(Span::styled(
@@ -196,6 +229,56 @@ impl MenuState {
                     Span::styled("plan   ", dim),
                     Span::styled(info.plan_label.clone(), label_style),
                 ]));
+                if let Some(account_id) = &info.account_id {
+                    lines.push(Line::from(vec![
+                        Span::styled("id     ", dim),
+                        Span::styled(account_id.clone(), label_style),
+                    ]));
+                }
+                if let Some(user_id) = &info.user_id {
+                    lines.push(Line::from(vec![
+                        Span::styled("user   ", dim),
+                        Span::styled(user_id.clone(), label_style),
+                    ]));
+                }
+                if let Some(workspace) = &info.workspace_name {
+                    lines.push(Line::from(vec![
+                        Span::styled("space  ", dim),
+                        Span::styled(workspace.clone(), label_style),
+                    ]));
+                }
+                if let Some(plan_type) = &info.plan_type {
+                    lines.push(Line::from(vec![
+                        Span::styled("type   ", dim),
+                        Span::styled(plan_type.clone(), label_style),
+                    ]));
+                }
+                if info.is_fedramp {
+                    lines.push(Line::from(vec![
+                        Span::styled("route  ", dim),
+                        Span::styled("FedRAMP", label_style),
+                    ]));
+                }
+                for organization in &info.organizations {
+                    lines.push(Line::from(vec![
+                        Span::styled("org    ", dim),
+                        Span::styled(organization.clone(), label_style),
+                    ]));
+                }
+                for expiry in &info.auth_expiries {
+                    lines.push(Line::from(vec![
+                        Span::styled("expiry ", dim),
+                        Span::styled(expiry.clone(), label_style),
+                    ]));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("Quota", header_style)));
+                for item in &info.usage_meta {
+                    lines.push(Line::from(Span::styled(item.clone(), dim)));
+                }
+                for pool in &info.quota_pools {
+                    lines.push(Line::from(Span::styled(pool.clone(), label_style)));
+                }
                 let cards = info
                     .reset_cards
                     .map(|count| count.to_string())
@@ -213,6 +296,11 @@ impl MenuState {
                     ]));
                 }
                 lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("Models", header_style)));
+                for model in &info.models {
+                    lines.push(Line::from(Span::styled(model.clone(), label_style)));
+                }
+                lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled("Primary", header_style)));
                 lines.extend(menu_items(
                     &[("u", "Use (switch to)")],
@@ -220,9 +308,10 @@ impl MenuState {
                     label_style,
                 ));
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("Quota", header_style)));
+                lines.push(Line::from(Span::styled("Quota actions", header_style)));
                 lines.extend(menu_items_stateful(
                     &[
+                        ("r", "Refresh account details", true),
                         (
                             "c",
                             "Confirm earliest reset card",
@@ -245,7 +334,10 @@ impl MenuState {
                     label_style,
                 ));
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("esc / q to cancel", dim)));
+                lines.push(Line::from(Span::styled(
+                    "j k / arrows / PgUp PgDn to scroll · esc / q to cancel",
+                    dim,
+                )));
                 render_popup(f, title, &lines, popup, area);
             }
             MenuState::Add { popup } => {
@@ -395,14 +487,43 @@ fn menu_items_stateful(
 mod tests {
     use ratatui::crossterm::event::KeyCode;
 
-    use super::{MenuAction, MenuState};
+    use super::{AccountMenuInfo, MenuAction, MenuState};
 
     #[test]
     fn unknown_key_keeps_menu_open() {
-        let menu = MenuState::add();
+        let mut menu = MenuState::add();
         assert!(matches!(
             menu.handle_key(KeyCode::Char('x')),
             MenuAction::Noop
         ));
+    }
+
+    #[test]
+    fn account_details_navigation_scrolls_popup() {
+        let mut menu = MenuState::account(AccountMenuInfo {
+            alias: "account".into(),
+            email: None,
+            account_id: None,
+            user_id: None,
+            workspace_name: None,
+            is_fedramp: false,
+            plan_label: "Unknown".into(),
+            plan_type: None,
+            is_current: false,
+            organizations: Vec::new(),
+            auth_expiries: Vec::new(),
+            usage_meta: Vec::new(),
+            quota_pools: Vec::new(),
+            models: Vec::new(),
+            reset_cards: None,
+            reset_card_expiries: Vec::new(),
+            can_consume_reset_card: false,
+        });
+
+        assert!(matches!(menu.handle_key(KeyCode::Down), MenuAction::Noop));
+        let MenuState::Account { popup, .. } = menu else {
+            unreachable!();
+        };
+        assert_eq!(popup.scroll, 1);
     }
 }

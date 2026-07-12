@@ -6,20 +6,14 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
 
-use super::app::{App, ModelStatus, UsageStatus};
+use super::app::{App, UsageStatus};
 use super::keymap;
 use super::popup;
 use crate::jwt::PlanKind;
 use crate::output::{
-    format_local_datetime, format_local_time, format_reset_short, format_reset_time,
-    reset_credits_count,
+    format_local_time, format_reset_short, format_reset_time, reset_credits_count,
 };
-use crate::usage::{
-    PoolRow, UsageInfo, WindowUsage, additional_pool_rows, earliest_reset_credit, is_available,
-};
-use crate::warmup::{is_hidden_model, sorted_models_for_display};
-
-use super::app::AccountEntry;
+use crate::usage::{UsageInfo, is_available};
 
 // ── RGB-only color palette ───────────────────────────────
 // All colors are explicit RGB to avoid mixing ANSI-16 + 24-bit,
@@ -129,7 +123,52 @@ fn render_help_popup(f: &mut Frame, state: &mut popup::PopupState, area: ratatui
 }
 
 fn display_width(s: &str) -> usize {
-    s.chars().count()
+    Line::from(s).width()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TableTextWidths {
+    alias: u16,
+    email: u16,
+    plan: u16,
+}
+
+fn table_text_widths(
+    total_width: u16,
+    aliases: &[&str],
+    emails: &[&str],
+    plans: &[&str],
+) -> TableTextWidths {
+    let desired = |header: &str, values: &[&str]| {
+        values
+            .iter()
+            .map(|value| u16::try_from(display_width(value)).unwrap_or(u16::MAX))
+            .chain(std::iter::once(
+                u16::try_from(display_width(header)).unwrap_or(u16::MAX),
+            ))
+            .max()
+            .unwrap_or(0)
+    };
+    let mut widths = TableTextWidths {
+        alias: desired("Alias", aliases).max(5),
+        email: desired("Email", emails).max(5),
+        plan: desired("Plan", plans).max(4),
+    };
+
+    // Borders, column spacing, marker and fixed quota columns consume 64 cells.
+    let budget = total_width.saturating_sub(64).max(14);
+    let total = u32::from(widths.alias) + u32::from(widths.email) + u32::from(widths.plan);
+    let mut excess = total.saturating_sub(u32::from(budget));
+    for (width, minimum) in [
+        (&mut widths.email, 5_u16),
+        (&mut widths.plan, 4_u16),
+        (&mut widths.alias, 5_u16),
+    ] {
+        let shrink = excess.min(u32::from(width.saturating_sub(minimum)));
+        *width -= shrink as u16;
+        excess -= shrink;
+    }
+    widths
 }
 
 fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
@@ -368,12 +407,6 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
             render_selected = rows.len();
         }
         rows.push(main_row);
-
-        if let UsageStatus::Loaded(u) = &entry.usage {
-            for pool in additional_pool_rows(&u.additional_limits) {
-                rows.push(pool_row(&pool));
-            }
-        }
     }
 
     let loading_count = app.loading_count();
@@ -403,19 +436,46 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
 
     let mut table_state = TableState::default().with_selected(render_selected);
 
+    let aliases: Vec<&str> = app
+        .view_indices
+        .iter()
+        .map(|&idx| app.accounts[idx].alias.as_str())
+        .collect();
+    let emails: Vec<&str> = app
+        .view_indices
+        .iter()
+        .map(|&idx| app.accounts[idx].info.email.as_deref().unwrap_or("--"))
+        .collect();
+    let plan_labels: Vec<String> = app
+        .view_indices
+        .iter()
+        .map(|&idx| {
+            let entry = &app.accounts[idx];
+            let api_plan = match &entry.usage {
+                UsageStatus::Loaded(u) => u.plan_type.as_deref(),
+                _ => None,
+            };
+            entry
+                .info
+                .plan_label_with(api_plan.or(entry.info.plan_type.as_deref()))
+        })
+        .collect();
+    let plans: Vec<&str> = plan_labels.iter().map(String::as_str).collect();
+    let text_widths = table_text_widths(area.width, &aliases, &emails, &plans);
+
     let table = Table::new(
         rows,
         [
-            Constraint::Length(2),  // marker
-            Constraint::Length(14), // alias
-            Constraint::Min(18),    // email
-            Constraint::Length(16), // plan
-            Constraint::Length(8),  // status
-            Constraint::Length(6),  // 5h %
-            Constraint::Length(6),  // 7d %
-            Constraint::Length(12), // 5h reset
-            Constraint::Length(12), // 7d reset
-            Constraint::Length(7),  // reset cards
+            Constraint::Length(2),                 // marker
+            Constraint::Length(text_widths.alias), // alias
+            Constraint::Length(text_widths.email), // email
+            Constraint::Length(text_widths.plan),  // plan
+            Constraint::Length(8),                 // status
+            Constraint::Length(6),                 // 5h %
+            Constraint::Length(6),                 // 7d %
+            Constraint::Length(12),                // 5h reset
+            Constraint::Length(12),                // 7d reset
+            Constraint::Length(7),                 // reset cards
         ],
     )
     .header(header)
@@ -436,79 +496,14 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(table, area, &mut table_state);
 }
 
-/// Render one additional-limit pool as an indented, unselectable sub-row
-/// under its account's main row. Reuses the same cell-coloring helpers
-/// (`remaining_color`, `reset_color`, `format_reset_short`) as the main row.
-fn pool_row(pool: &PoolRow) -> Row<'static> {
-    let now = crate::auth::now_unix_secs();
-
-    let pct_cell = |w: &Option<crate::usage::WindowUsage>| -> (String, Color) {
-        match w.as_ref().and_then(|w| w.used_percent) {
-            Some(pct) => {
-                let remaining = (100.0 - pct).max(0.0);
-                (format!("{remaining:.0}%"), remaining_color(remaining))
-            }
-            None => ("--".to_string(), DIM),
-        }
-    };
-    let reset_cell = |w: &Option<crate::usage::WindowUsage>| -> (String, Color) {
-        match w.as_ref().and_then(|w| w.resets_at) {
-            Some(ts) => (format_reset_short(ts), reset_color(ts - now)),
-            None => ("--".to_string(), DIM),
-        }
-    };
-
-    let (p5, p5c) = pct_cell(&pool.primary);
-    let (p7, p7c) = pct_cell(&pool.secondary);
-    let (r5, r5c) = reset_cell(&pool.primary);
-    let (r7, r7c) = reset_cell(&pool.secondary);
-    let (status_text, status_color) = if pool.unavailable {
-        ("exhausted".to_string(), C_RED)
-    } else {
-        (String::new(), DIM)
-    };
-
-    Row::new(vec![
-        Cell::from(""),
-        Cell::from(format!("  \u{2514} {}", pool.limit_name)).style(base().fg(DIM)),
-        Cell::from(""),
-        Cell::from(""),
-        Cell::from(status_text).style(base().fg(status_color)),
-        Cell::from(p5).style(base().fg(p5c)),
-        Cell::from(p7).style(base().fg(p7c)),
-        Cell::from(r5).style(base().fg(r5c)),
-        Cell::from(r7).style(base().fg(r7c)),
-        Cell::from(""),
-    ])
-    .height(1)
-}
-
-/// Number of additional-limit pools for the currently-selected account
-/// (0 when nothing is selected, usage isn't loaded, or there are none).
-/// Capped so a pathological pool count can't blow out the panel layout.
-fn quota_pool_count(app: &App) -> usize {
-    app.selected_account_idx()
-        .and_then(|idx| app.accounts.get(idx))
-        .map(|e| match &e.usage {
-            UsageStatus::Loaded(u) => additional_pool_rows(&u.additional_limits).len(),
-            _ => 0,
-        })
-        .unwrap_or(0)
-        .min(4)
-}
-
-const MODELS_BLOCK_HEIGHT: u16 = 6;
-const GAUGES_BLOCK_HEIGHT: u16 = 6;
+const GAUGES_BLOCK_HEIGHT: u16 = 4;
 
 /// Total height needed for the detail panel: info row + gauges + the new
 /// "Quota pools" and "Models" sections + borders. Grows with the selected
 /// account's additional-pool count (capped) so Pro 20x-style accounts with
 /// a per-model pool get enough room without wasting space on plain accounts.
-fn detail_panel_height(app: &App) -> u16 {
-    let qpc = quota_pool_count(app) as u16;
-    let quota_block = qpc + 3; // header + main-pool line + additional pools + reset-card line
-    1 /* info */ + 1 /* spacer */ + GAUGES_BLOCK_HEIGHT + 1 /* spacer */
-        + quota_block + 1 /* spacer */ + MODELS_BLOCK_HEIGHT + 2 /* borders */
+fn detail_panel_height(_app: &App) -> u16 {
+    8
 }
 
 fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
@@ -535,221 +530,40 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let qpc = quota_pool_count(app) as u16;
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),                   // account info row
-            Constraint::Length(1),                   // spacer
-            Constraint::Length(GAUGES_BLOCK_HEIGHT), // usage gauges
-            Constraint::Length(1),                   // spacer
-            Constraint::Length(qpc + 3),             // quota pools section
-            Constraint::Length(1),                   // spacer
-            Constraint::Min(MODELS_BLOCK_HEIGHT),    // models section
-        ])
+        .constraints([Constraint::Length(GAUGES_BLOCK_HEIGHT)])
         .margin(1)
         .split(inner);
-
-    // Compact info line
-    let api_plan_popup = if let UsageStatus::Loaded(u) = &entry.usage {
-        u.plan_type.as_deref()
-    } else {
-        None
-    };
-    let effective_plan_popup = api_plan_popup.or(entry.info.plan_type.as_deref());
-    let plan_label = entry.info.plan_label_with(effective_plan_popup);
-    let acct_id = entry.info.account_id.as_deref().unwrap_or("--");
-    let email = entry.info.email.as_deref().unwrap_or("--");
-
-    let info_line = Line::from(vec![
-        Span::styled("Email ", base().fg(DIM)),
-        Span::styled(email, base().fg(C_WHITE)),
-        Span::styled("  ", base()),
-        Span::styled("Plan ", base().fg(DIM)),
-        Span::styled(&plan_label, plan_color(effective_plan_popup, true)),
-        Span::styled("  ", base()),
-        Span::styled("ID ", base().fg(DIM)),
-        Span::styled(
-            if acct_id.len() > 20 {
-                &acct_id[..20]
-            } else {
-                acct_id
-            },
-            base().fg(DIM),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(info_line).style(base()), layout[0]);
 
     // Usage area
     match &entry.usage {
         UsageStatus::Idle => {
             let p = Paragraph::new("Press r to refresh usage").style(base().fg(DIM));
-            f.render_widget(p, layout[2]);
+            f.render_widget(p, layout[0]);
         }
         UsageStatus::Loading => {
             let p = Paragraph::new("Fetching usage...").style(base().fg(C_YELLOW));
-            f.render_widget(p, layout[2]);
+            f.render_widget(p, layout[0]);
         }
         UsageStatus::Error(e) => {
             let p = Paragraph::new(format!("Error: {}", e.detail)).style(base().fg(C_RED));
-            f.render_widget(p, layout[2]);
+            f.render_widget(p, layout[0]);
         }
         UsageStatus::Loaded(u) => {
-            render_usage_gauges(f, u, layout[2]);
+            render_usage_gauges(f, u, layout[0]);
         }
     }
-
-    render_quota_pools_block(f, entry, layout[4]);
-    render_models_block(f, app, entry, layout[6]);
-}
-
-/// "Quota pools" section: one line for the main pool, one per
-/// additional-limit pool, then a reset-card summary line.
-fn render_quota_pools_block(f: &mut Frame, entry: &AccountEntry, area: Rect) {
-    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
-        "Quota pools",
-        base().fg(C_CYAN).add_modifier(Modifier::BOLD),
-    ))];
-
-    match &entry.usage {
-        UsageStatus::Loaded(u) => {
-            lines.push(quota_summary_line(
-                "Main",
-                u.primary.as_ref(),
-                u.secondary.as_ref(),
-                false,
-            ));
-            for pool in additional_pool_rows(&u.additional_limits) {
-                lines.push(quota_summary_line(
-                    &pool.limit_name,
-                    pool.primary.as_ref(),
-                    pool.secondary.as_ref(),
-                    pool.unavailable,
-                ));
-            }
-            if let Some(summary) = crate::output::reset_credits_compact(u) {
-                lines.push(Line::from(Span::styled(
-                    format!("  {summary}"),
-                    base().fg(DIM),
-                )));
-            }
-        }
-        UsageStatus::Loading => {
-            lines.push(Line::from(Span::styled(
-                "  fetching usage...",
-                base().fg(C_YELLOW),
-            )));
-        }
-        UsageStatus::Error(_) | UsageStatus::Idle => {
-            lines.push(Line::from(Span::styled("  --", base().fg(DIM))));
-        }
-    }
-
-    f.render_widget(Paragraph::new(lines).style(base()), area);
-}
-
-fn quota_summary_line(
-    name: &str,
-    primary: Option<&WindowUsage>,
-    secondary: Option<&WindowUsage>,
-    unavailable: bool,
-) -> Line<'static> {
-    let mut spans = vec![Span::styled(format!("  {name}  "), base().fg(C_WHITE))];
-    if let Some(w) = primary {
-        let pct = w.used_percent.unwrap_or(0.0);
-        let remaining = (100.0 - pct).max(0.0);
-        spans.push(Span::styled(
-            format!("5h {remaining:.0}% left  "),
-            base().fg(remaining_color(remaining)),
-        ));
-    }
-    if let Some(w) = secondary {
-        let pct = w.used_percent.unwrap_or(0.0);
-        let remaining = (100.0 - pct).max(0.0);
-        spans.push(Span::styled(
-            format!("7d {remaining:.0}% left  "),
-            base().fg(remaining_color(remaining)),
-        ));
-    }
-    if unavailable {
-        spans.push(Span::styled(
-            "[exhausted]",
-            base().fg(C_RED).add_modifier(Modifier::BOLD),
-        ));
-    }
-    Line::from(spans)
-}
-
-/// "Models" section: the account's available model list (from the
-/// `/models` endpoint), sorted by priority ascending; hidden models are
-/// dimmed rather than dropped so their existence stays visible.
-fn render_models_block(f: &mut Frame, app: &App, entry: &AccountEntry, area: Rect) {
-    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
-        "Models",
-        base().fg(C_CYAN).add_modifier(Modifier::BOLD),
-    ))];
-
-    match app.model_cache.get(&entry.alias) {
-        None | Some(ModelStatus::Loading) => {
-            lines.push(Line::from(Span::styled(
-                "  loading models...",
-                base().fg(DIM),
-            )));
-        }
-        Some(ModelStatus::Error(e)) => {
-            lines.push(Line::from(Span::styled(
-                format!("  error: {e}"),
-                base().fg(C_RED),
-            )));
-        }
-        Some(ModelStatus::Loaded(models)) => {
-            if models.is_empty() {
-                lines.push(Line::from(Span::styled("  (no models)", base().fg(DIM))));
-            } else {
-                let sorted = sorted_models_for_display(models);
-                let max_rows = (area.height.saturating_sub(1) as usize).max(1);
-                for m in sorted.iter().take(max_rows) {
-                    let label = match &m.display_name {
-                        Some(name) => format!("{name} ({})", m.slug),
-                        None => m.slug.clone(),
-                    };
-                    let style = if is_hidden_model(m) {
-                        base().fg(DIM)
-                    } else {
-                        base().fg(C_GRAY)
-                    };
-                    lines.push(Line::from(Span::styled(format!("  {label}"), style)));
-                }
-                if sorted.len() > max_rows {
-                    lines.push(Line::from(Span::styled(
-                        format!("  ... {} more", sorted.len() - max_rows),
-                        base().fg(DIM),
-                    )));
-                }
-            }
-        }
-    }
-
-    f.render_widget(Paragraph::new(lines).style(base()), area);
 }
 
 fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
     let now = crate::auth::now_unix_secs();
-    let has_credits = u.credits_balance.is_some();
-    let reset_lines = reset_credits_lines(u);
-    let reset_height = u16::from(has_reset_credits(u));
     let mut constraints = vec![];
     if u.primary.is_some() {
         constraints.push(Constraint::Length(2));
     }
     if u.secondary.is_some() {
         constraints.push(Constraint::Length(2));
-    }
-    if has_credits {
-        constraints.push(Constraint::Length(1));
-    }
-    if reset_height > 0 {
-        constraints.push(Constraint::Length(reset_height));
     }
     if constraints.is_empty() {
         constraints.push(Constraint::Min(1));
@@ -769,36 +583,12 @@ fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
 
     if let Some(w) = &u.secondary {
         render_usage_gauge(f, w, "7d", crate::usage::WINDOW_7D_SECS, now, layout[idx]);
-        idx += 1;
     }
 
-    if let Some(balance) = u.credits_balance {
-        let unlimited = u.unlimited_credits == Some(true);
-        let text = if unlimited {
-            "Credits: unlimited".to_string()
-        } else {
-            format!("Credits: ${balance:.2}")
-        };
-        let p = Paragraph::new(text).style(base().fg(credits_color(balance, unlimited)));
-        f.render_widget(p, layout[idx]);
-        idx += 1;
-    }
-
-    if has_reset_credits(u) {
-        let p = Paragraph::new(reset_lines).style(base());
-        f.render_widget(p, layout[idx]);
-    }
-
-    if u.primary.is_none() && u.secondary.is_none() && !has_credits && !has_reset_credits(u) {
+    if u.primary.is_none() && u.secondary.is_none() {
         let p = Paragraph::new("No usage data").style(base().fg(DIM));
         f.render_widget(p, layout[0]);
     }
-}
-
-fn has_reset_credits(u: &UsageInfo) -> bool {
-    u.reset_credits_available_count.is_some()
-        || !u.reset_credits.is_empty()
-        || u.reset_credits_error.is_some()
 }
 
 fn reset_cards_table_text(u: &UsageInfo) -> String {
@@ -815,44 +605,6 @@ fn reset_cards_color(u: &UsageInfo) -> Color {
         None if u.reset_credits_error.is_some() => C_YELLOW,
         None => DIM,
     }
-}
-
-fn reset_credits_lines(u: &UsageInfo) -> Vec<Line<'static>> {
-    let count = reset_credits_count(u)
-        .map(|count| count.to_string())
-        .unwrap_or_else(|| "--".to_string());
-    let mut spans = vec![
-        Span::styled("Reset cards  ", base().fg(DIM)),
-        Span::styled(
-            count,
-            base().fg(reset_cards_color(u)).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" available", base().fg(DIM)),
-    ];
-
-    if let Some(err) = &u.reset_credits_error {
-        spans.extend([
-            Span::styled("  |  expiry unavailable: ", base().fg(DIM)),
-            Span::styled(err.clone(), base().fg(C_YELLOW)),
-        ]);
-        return vec![Line::from(spans)];
-    }
-
-    if let Some(credit) = earliest_reset_credit(&u.reset_credits) {
-        spans.extend([
-            Span::styled("  |  earliest expiry ", base().fg(DIM)),
-            Span::styled(
-                credit
-                    .expires_at
-                    .as_deref()
-                    .map(format_local_datetime)
-                    .unwrap_or_else(|| "no expiry".to_string()),
-                base().fg(C_CYAN).add_modifier(Modifier::BOLD),
-            ),
-        ]);
-    }
-
-    vec![Line::from(spans)]
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
@@ -1172,17 +924,6 @@ fn reset_color(remaining_secs: i64) -> Color {
     }
 }
 
-/// Color for credits balance: green >= $10, yellow >= $2, red < $2
-fn credits_color(balance: f64, unlimited: bool) -> Color {
-    if unlimited || balance >= 10.0 {
-        C_GREEN
-    } else if balance >= 2.0 {
-        C_YELLOW
-    } else {
-        C_RED
-    }
-}
-
 fn usage_pct_style(remaining_pct_str: &str, is_selected: bool) -> Style {
     let over_pace = remaining_pct_str.ends_with('!');
     let clean = remaining_pct_str.trim_end_matches('!');
@@ -1253,6 +994,7 @@ fn short_label(label: &str) -> &str {
         "search" => "search",
         "open menu (account or batch)" => "menu",
         "refresh visible accounts" => "refresh",
+        "show / hide account detail panel" => "quota",
         "show this help" => "help",
         "quit" => "quit",
         other => other,
@@ -1291,6 +1033,7 @@ fn status_bar_height(app: &App, width: u16) -> usize {
 mod tests {
     use super::{
         C_BLUE, C_CYAN, C_GRAY, C_MAGENTA, C_RED, C_YELLOW, plan_color, status_message_color,
+        table_text_widths,
     };
     use ratatui::style::Modifier;
 
@@ -1311,5 +1054,42 @@ mod tests {
         assert_eq!(plan_color(Some("team"), false).fg, Some(C_MAGENTA));
         assert_eq!(plan_color(Some("business"), false).fg, Some(C_MAGENTA));
         assert_eq!(plan_color(Some("future_plan"), false).fg, Some(C_GRAY));
+    }
+
+    #[test]
+    fn account_table_columns_expand_to_fit_names_when_space_is_available() {
+        let widths = table_text_widths(
+            180,
+            &["oai001_20x", "a-very-long-account-alias"],
+            &["oai001@ozi.xyz"],
+            &["Pro 20×", "Team - NightCity Workspace"],
+        );
+
+        assert!(widths.alias >= "a-very-long-account-alias".chars().count() as u16);
+        assert!(widths.plan >= "Team - NightCity Workspace".chars().count() as u16);
+    }
+
+    #[test]
+    fn account_table_columns_fit_an_eighty_column_terminal() {
+        let widths = table_text_widths(
+            80,
+            &["a-very-long-account-alias"],
+            &["a-very-long-address@example.com"],
+            &["Team - NightCity Workspace"],
+        );
+
+        assert!(widths.alias + widths.email + widths.plan <= 16);
+    }
+
+    #[test]
+    fn account_table_columns_use_extra_space_beyond_the_old_caps() {
+        let alias = "a".repeat(45);
+        let email = format!("{}@example.com", "e".repeat(40));
+        let plan = format!("Team - {}", "Workspace".repeat(5));
+        let widths = table_text_widths(260, &[&alias], &[&email], &[&plan]);
+
+        assert_eq!(widths.alias, alias.len() as u16);
+        assert_eq!(widths.email, email.len() as u16);
+        assert_eq!(widths.plan, plan.len() as u16);
     }
 }

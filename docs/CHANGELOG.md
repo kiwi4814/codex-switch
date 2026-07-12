@@ -14,7 +14,7 @@
 - **Plan-aware labels and colors** — CLI and TUI now recognize Go, distinguish `Pro 5×` (`prolite`) from `Pro 20×` (`pro`), normalize workspace plan names, preserve unknown backend values, and use a shared semantic color family without relying on color alone.
 - **Authoritative workspace names** — Login and explicit account refreshes now mirror Codex's authenticated `accounts/check` request, match the selected account ID, cache the returned workspace name outside `auth.json`, and expose it in human and JSON output without guessing from an unrelated default organization.
 - **Reset-card aware auto-switching** — `codex-switch use`/`launch` (no alias) now consider reset cards when the whole pool is exhausted: `--consume-card` (or an interactive y/N prompt) consumes the earliest-expiring card to revive an account instead of settling for an exhausted one; non-interactive/JSON runs without the flag surface a `hint` instead of consuming anything.
-- **Per-model quota pools** — `list`/`use`/`best` (human and JSON output) and the TUI now surface `additional_rate_limits[]` pools (e.g. Pro 20×'s per-model `GPT-5.3-Codex-Spark` pool) as indented sub-rows under the owning account, with exhausted pools flagged; the TUI detail panel (`i`) adds a Quota pools summary and a lazily-fetched, priority-sorted Models list per account.
+- **Per-model quota pools** — `list`/`use`/`best` (human and JSON output) surface `additional_rate_limits[]` pools (e.g. Pro 20×'s per-model `GPT-5.3-Codex-Spark` pool), and warmup can activate both the main and eligible per-model quota windows.
 
 ### Changed
 
@@ -24,6 +24,7 @@
 - **Cross-platform daemon lifecycle** — launchd, systemd user services, and Windows Task Scheduler preserve `CODEX_HOME`; PID files include executable identity and an active OS lock; stale or legacy PID data is never trusted for signaling; zero daemon intervals normalize to 60/300/300 seconds.
 - **Fail-fast configuration** — An existing unreadable, malformed, or dangling-symlink `config.toml` now reports the real error instead of silently starting with defaults; defaults remain limited to a genuinely missing file.
 - **Internal module layout** — The oversized `usage.rs` (2,645 lines) and `main.rs` (1,740 lines) were split into focused submodules (`usage/{scoring,api,reset_credits,parse}` and `commands/`) as a pure mechanical move; public paths, behavior, and tests are unchanged.
+- **TUI account information hierarchy** — The home screen keeps only the essential 5h/7d quota gauges, while Enter opens a scrollable account page with identity, organization, token expiry, quota/spend-control/reset-card details, and the complete model catalog returned by Codex's live models endpoint.
 
 ### Fixed
 
@@ -41,6 +42,7 @@
 - **Case-insensitive checksum verification** — `self-update` compares release SHA-256 digests case-insensitively, so an uppercase checksum file no longer rejects a valid archive; the comparison and the malformed-usage-response rejection are now locked by unit tests.
 - **Nested debug-log redaction** — Sensitive token fields in `--debug` HTTP body logs are masked at any nesting depth (objects and arrays), not only at the top level.
 - **Per-account warmup model cache** — The warmup model cache is keyed by account, so one account's resolved model is never reused for another plan tier (avoiding wasteful 400 retries) and cache invalidation only affects the failing account; the `codex --version` probe now runs on the blocking thread pool instead of stalling an async worker.
+- **Official model metadata and additional-quota warmup** — TUI model names, descriptions, and capabilities now come from the authenticated Codex models response instead of UI constants; cached additional quota pools retain their warmup eligibility, and the account page refreshes when a first-time model fetch completes.
 - **Self-update trust model documented** — README clarifies that the release `.sha256` guards download integrity only; the trust anchor is the GitHub Release over TLS, and there is no independent code signature yet.
 
 ## v0.0.21 — 2026-07-10

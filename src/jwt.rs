@@ -78,36 +78,10 @@ impl AccountInfo {
     /// Same as `plan_label` but with an overridden plan type (e.g. from API response).
     pub fn plan_label_with(&self, plan_type: Option<&str>) -> String {
         let base = PlanKind::from_wire(plan_type).display_name(plan_type);
-        let titled_organization_count = self
-            .organizations
-            .iter()
-            .filter(|organization| !organization.title.is_empty())
-            .count();
-        let active_workspace_is_organization = self.workspace_name.as_ref().is_some_and(|name| {
-            self.organizations
-                .iter()
-                .any(|organization| organization.title == *name)
-        });
-        let displayed_organization_count = if active_workspace_is_organization
-            || self.workspace_name.is_none()
-                && self
-                    .organizations
-                    .iter()
-                    .any(|organization| organization.is_default && !organization.title.is_empty())
-        {
-            titled_organization_count.saturating_sub(1)
-        } else {
-            titled_organization_count
-        };
-        let organization_suffix = match displayed_organization_count {
-            0 => String::new(),
-            1 => " (+1 org)".to_string(),
-            count => format!(" (+{count} orgs)"),
-        };
         if let Some(name) = &self.workspace_name
             && !name.is_empty()
         {
-            return format!("{base} - {name}{organization_suffix}");
+            return format!("{base} - {name}");
         }
         base
     }
@@ -419,7 +393,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(info.plan_label(), "Team - Platform Team (+1 org)");
+        assert_eq!(info.plan_label(), "Team - Platform Team");
     }
 
     #[test]
@@ -444,7 +418,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(info.plan_label(), "Team - Personal (+2 orgs)");
+        assert_eq!(info.plan_label(), "Team - Personal");
     }
 
     #[test]

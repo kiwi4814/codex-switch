@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 const FALLBACK_MODEL: &str = "gpt-5.3-codex";
+const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
 
 static CODEX_VERSION: OnceCell<String> = OnceCell::const_new();
 // tokio Mutex held across the await in resolve_model, ensuring only one fetch per process.
@@ -76,14 +77,29 @@ fn build_models_request(
 }
 
 /// One entry from the `/models` endpoint's `models[]` array.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ModelEntry {
     pub slug: String,
     pub display_name: Option<String>,
+    pub description: Option<String>,
     pub visibility: Option<String>,
     pub priority: Option<i64>,
     pub supported_in_api: Option<bool>,
     pub context_window: Option<u64>,
+    pub default_reasoning_effort: Option<String>,
+    pub supported_reasoning_efforts: Vec<String>,
+    pub input_modalities: Vec<String>,
+    pub additional_speed_tiers: Vec<String>,
+    pub service_tiers: Vec<String>,
+    pub default_service_tier: Option<String>,
+    pub max_context_window: Option<u64>,
+    pub auto_compact_token_limit: Option<u64>,
+    pub effective_context_window_percent: Option<i64>,
+    pub supports_parallel_tool_calls: Option<bool>,
+    pub supports_image_detail_original: Option<bool>,
+    pub experimental_supported_tools: Vec<String>,
+    pub supports_search_tool: Option<bool>,
+    pub use_responses_lite: Option<bool>,
 }
 
 /// Parse the `/models` endpoint's JSON body into a `Vec<ModelEntry>`. Entries
@@ -98,13 +114,72 @@ fn parse_models_body(body: &serde_json::Value) -> Result<Vec<ModelEntry>> {
         .iter()
         .filter_map(|m| {
             let slug = m["slug"].as_str()?.to_string();
+            let string_list = |key: &str| {
+                m.get(key)
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
             Some(ModelEntry {
                 slug,
                 display_name: m["display_name"].as_str().map(String::from),
+                description: m["description"].as_str().map(String::from),
                 visibility: m["visibility"].as_str().map(String::from),
                 priority: m["priority"].as_i64(),
                 supported_in_api: m["supported_in_api"].as_bool(),
                 context_window: m["context_window"].as_u64(),
+                default_reasoning_effort: m["default_reasoning_level"]
+                    .as_str()
+                    .or_else(|| m["default_reasoning_effort"].as_str())
+                    .map(String::from),
+                supported_reasoning_efforts: m
+                    .get("supported_reasoning_levels")
+                    .or_else(|| m.get("supported_reasoning_efforts"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| {
+                                item.as_str()
+                                    .or_else(|| item.get("effort").and_then(|v| v.as_str()))
+                                    .or_else(|| {
+                                        item.get("reasoning_effort").and_then(|v| v.as_str())
+                                    })
+                                    .map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                input_modalities: string_list("input_modalities"),
+                additional_speed_tiers: string_list("additional_speed_tiers"),
+                service_tiers: m
+                    .get("service_tiers")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| {
+                                item.as_str()
+                                    .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                                    .map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                default_service_tier: m["default_service_tier"].as_str().map(String::from),
+                max_context_window: m["max_context_window"].as_u64(),
+                auto_compact_token_limit: m["auto_compact_token_limit"].as_u64(),
+                effective_context_window_percent: m["effective_context_window_percent"].as_i64(),
+                supports_parallel_tool_calls: m["supports_parallel_tool_calls"].as_bool(),
+                supports_image_detail_original: m["supports_image_detail_original"].as_bool(),
+                experimental_supported_tools: string_list("experimental_supported_tools"),
+                supports_search_tool: m["supports_search_tool"].as_bool(),
+                use_responses_lite: m["use_responses_lite"].as_bool(),
             })
         })
         .collect())
@@ -117,11 +192,6 @@ pub(crate) fn sorted_models_for_display(models: &[ModelEntry]) -> Vec<&ModelEntr
     let mut sorted: Vec<&ModelEntry> = models.iter().collect();
     sorted.sort_by_key(|m| m.priority.unwrap_or(i64::MAX));
     sorted
-}
-
-/// True when the model's `visibility` marks it hidden from normal listings.
-pub(crate) fn is_hidden_model(m: &ModelEntry) -> bool {
-    m.visibility.as_deref() == Some("hide")
 }
 
 /// Fetch and parse the full model list from the `/models` endpoint.
@@ -158,29 +228,47 @@ async fn fetch_warmup_model(
 ) -> Result<String> {
     let models = fetch_models(client, access_token, account_id, is_fedramp).await?;
 
+    Ok(select_warmup_models(&models)?
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| FALLBACK_MODEL.to_string()))
+}
+
+fn select_warmup_models(models: &[ModelEntry]) -> Result<Vec<String>> {
     let visible: Vec<&ModelEntry> = models
         .iter()
-        .filter(|m| m.visibility.as_deref() != Some("hide"))
+        .filter(|m| m.visibility.as_deref() != Some("hide") && m.supported_in_api != Some(false))
         .collect();
 
     if visible.is_empty() {
         bail!("no visible models available");
     }
 
-    // Prefer mini (lightest), fall back to highest priority (lowest number)
-    let selected = visible
+    let main_candidates: Vec<&ModelEntry> = visible
+        .iter()
+        .copied()
+        .filter(|model| model.slug != SPARK_MODEL)
+        .collect();
+
+    // Prefer mini (lightest), fall back to highest priority (lowest number).
+    // Spark owns an additional pool and must not replace the main-pool request.
+    let main = main_candidates
         .iter()
         .find(|m| m.slug.contains("mini"))
         .or_else(|| {
-            visible
+            main_candidates
                 .iter()
                 .min_by_key(|m| m.priority.unwrap_or(i64::MAX))
         })
-        .map(|m| m.slug.as_str())
-        .unwrap_or(FALLBACK_MODEL);
+        .map(|m| m.slug.clone());
 
-    debug!("warmup: model selected from API: {selected}");
-    Ok(selected.to_string())
+    let mut selected: Vec<String> = main.into_iter().collect();
+    if visible.iter().any(|m| m.slug == SPARK_MODEL) {
+        selected.push(SPARK_MODEL.to_string());
+    }
+
+    debug!("warmup: models selected from API: {selected:?}");
+    Ok(selected)
 }
 
 async fn resolve_model(
@@ -242,6 +330,31 @@ fn make_request(
         is_fedramp,
     )
     .json(body)
+}
+
+async fn warmup_additional_models(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+) -> Result<()> {
+    let models = fetch_models(client, access_token, account_id, is_fedramp).await?;
+    for model in select_warmup_models(&models)?.into_iter().skip(1) {
+        let body = build_body(&model);
+        debug!("warmup additional pool POST → {RESPONSES_URL} (model={model})");
+        let mut resp = make_request(client, access_token, account_id, is_fedramp, &body)
+            .send()
+            .await
+            .map_err(|e| crate::auth::format_reqwest_error("additional warmup failed", &e))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            let snippet: String = text.chars().take(160).collect();
+            bail!("additional model {model}: HTTP {status} — {snippet}");
+        }
+        let _ = resp.chunk().await;
+    }
+    Ok(())
 }
 
 /// Send a minimal completion request to trigger the quota window countdown for a profile.
@@ -328,7 +441,8 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
             // Quota window is triggered server-side on request receipt.
             // Read one chunk to confirm streaming started, then drop.
             let _ = resp.chunk().await;
-            Ok(())
+            warmup_additional_models(&client, &access_token, account_id.as_deref(), is_fedramp)
+                .await
         }
         400 => {
             let text = resp.text().await.unwrap_or_default();
@@ -360,7 +474,13 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                 let retry_status = retry_resp.status();
                 if retry_status.is_success() {
                     let _ = retry_resp.chunk().await;
-                    return Ok(());
+                    return warmup_additional_models(
+                        &client,
+                        &access_token,
+                        account_id.as_deref(),
+                        is_fedramp,
+                    )
+                    .await;
                 }
                 let retry_text = retry_resp.text().await.unwrap_or_default();
                 let snippet: String = retry_text.chars().take(160).collect();
@@ -406,7 +526,13 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                         let retry_status = retry_resp.status();
                         if retry_status.is_success() {
                             let _ = retry_resp.chunk().await;
-                            return Ok(());
+                            return warmup_additional_models(
+                                &client,
+                                &refreshed.access_token,
+                                account_id.as_deref(),
+                                is_fedramp,
+                            )
+                            .await;
                         }
                         bail!("{alias}: HTTP {retry_status} after token refresh retry")
                     }
@@ -511,10 +637,28 @@ mod tests {
             "models": [{
                 "slug": "gpt-5.3-codex",
                 "display_name": "GPT-5.3 Codex",
+                "description": "Best for coding",
                 "visibility": "List",
                 "priority": 1,
                 "supported_in_api": true,
-                "context_window": 128000
+                "context_window": 128000,
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [
+                    {"effort": "low"},
+                    {"reasoning_effort": "high"}
+                ],
+                "input_modalities": ["text", "image"],
+                "additional_speed_tiers": ["fast"],
+                "service_tiers": [{"id": "fast"}],
+                "default_service_tier": "fast",
+                "max_context_window": 256000,
+                "auto_compact_token_limit": 110000,
+                "effective_context_window_percent": 95,
+                "supports_parallel_tool_calls": true,
+                "supports_image_detail_original": true,
+                "experimental_supported_tools": ["computer"],
+                "supports_search_tool": true,
+                "use_responses_lite": false
             }]
         });
 
@@ -525,10 +669,25 @@ mod tests {
             ModelEntry {
                 slug: "gpt-5.3-codex".to_string(),
                 display_name: Some("GPT-5.3 Codex".to_string()),
+                description: Some("Best for coding".to_string()),
                 visibility: Some("List".to_string()),
                 priority: Some(1),
                 supported_in_api: Some(true),
                 context_window: Some(128000),
+                default_reasoning_effort: Some("medium".to_string()),
+                supported_reasoning_efforts: vec!["low".to_string(), "high".to_string()],
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+                additional_speed_tiers: vec!["fast".to_string()],
+                service_tiers: vec!["fast".to_string()],
+                default_service_tier: Some("fast".to_string()),
+                max_context_window: Some(256000),
+                auto_compact_token_limit: Some(110000),
+                effective_context_window_percent: Some(95),
+                supports_parallel_tool_calls: Some(true),
+                supports_image_detail_original: Some(true),
+                experimental_supported_tools: vec!["computer".to_string()],
+                supports_search_tool: Some(true),
+                use_responses_lite: Some(false),
             }
         );
     }
@@ -570,24 +729,21 @@ mod tests {
                 display_name: None,
                 visibility: None,
                 priority: Some(3),
-                supported_in_api: None,
-                context_window: None,
+                ..Default::default()
             },
             ModelEntry {
                 slug: "a".to_string(),
                 display_name: None,
                 visibility: None,
                 priority: Some(1),
-                supported_in_api: None,
-                context_window: None,
+                ..Default::default()
             },
             ModelEntry {
                 slug: "c-no-priority".to_string(),
                 display_name: None,
                 visibility: None,
                 priority: None,
-                supported_in_api: None,
-                context_window: None,
+                ..Default::default()
             },
         ];
 
@@ -602,25 +758,55 @@ mod tests {
     }
 
     #[test]
-    fn test_is_hidden_model_detects_hide_visibility() {
-        let hidden = ModelEntry {
-            slug: "hidden".to_string(),
-            display_name: None,
-            visibility: Some("hide".to_string()),
-            priority: None,
-            supported_in_api: None,
-            context_window: None,
-        };
-        let visible = ModelEntry {
-            slug: "visible".to_string(),
-            display_name: None,
-            visibility: Some("List".to_string()),
-            priority: None,
-            supported_in_api: None,
-            context_window: None,
-        };
-        assert!(is_hidden_model(&hidden));
-        assert!(!is_hidden_model(&visible));
+    fn test_warmup_models_include_main_pool_and_spark_pool() {
+        let models = vec![
+            ModelEntry {
+                slug: "gpt-5.4-mini".to_string(),
+                display_name: None,
+                visibility: Some("List".to_string()),
+                priority: Some(10),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+            ModelEntry {
+                slug: "gpt-5.3-codex-spark".to_string(),
+                display_name: None,
+                visibility: Some("List".to_string()),
+                priority: Some(26),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            select_warmup_models(&models).unwrap(),
+            vec!["gpt-5.4-mini", "gpt-5.3-codex-spark"]
+        );
+    }
+
+    #[test]
+    fn test_warmup_models_do_not_use_spark_as_the_main_pool_fallback() {
+        let models = vec![
+            ModelEntry {
+                slug: "gpt-5.6-codex".to_string(),
+                visibility: Some("List".to_string()),
+                priority: Some(10),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+            ModelEntry {
+                slug: SPARK_MODEL.to_string(),
+                visibility: Some("List".to_string()),
+                priority: Some(1),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            select_warmup_models(&models).unwrap(),
+            vec!["gpt-5.6-codex", SPARK_MODEL]
+        );
     }
 
     #[test]
