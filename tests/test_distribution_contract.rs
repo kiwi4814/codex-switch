@@ -134,6 +134,25 @@ fn unix_installer_preserves_migration_and_path_lifecycle() {
 }
 
 #[test]
+fn unix_installer_records_and_cleans_explicit_system_install_intent() {
+    let script = repo_file("scripts/install.sh");
+
+    for required in [
+        "SYSTEM_INSTALL_MARKER",
+        ".codex-switch-system-install-v1",
+        "install -m 0644 /dev/null \"$SYSTEM_INSTALL_MARKER\"",
+        "sudo install -m 0644 /dev/null \"$SYSTEM_INSTALL_MARKER\"",
+        "rm -f \"$LEGACY_BIN\" \"$SYSTEM_INSTALL_MARKER\"",
+        "sudo rm -f \"$LEGACY_BIN\" \"$SYSTEM_INSTALL_MARKER\"",
+    ] {
+        assert!(
+            script.contains(required),
+            "Unix installer must preserve system-install marker lifecycle: `{required}`"
+        );
+    }
+}
+
+#[test]
 fn windows_installer_verifies_checksum_before_extracting() {
     let script = repo_file("scripts/install.ps1");
 
@@ -160,6 +179,17 @@ fn self_update_checks_replace_permission_before_archive_download() {
     );
     assert!(!update.contains("permission denied? try: sudo codex-switch self-update"));
     assert!(!update.contains("retry from PowerShell as Administrator"));
+}
+
+#[test]
+fn self_update_gates_markerless_system_installs_before_network_checks() {
+    let command = repo_file("src/commands/update.rs");
+
+    assert_before(
+        &command,
+        "ensure_legacy_system_install_migrated(use_dev, version)?",
+        "if check",
+    );
 }
 
 #[test]
@@ -203,6 +233,33 @@ fn release_verifies_archives_before_creating_a_release() {
         "Verify release checksums",
         "Create GitHub Release (stable)",
     );
+}
+
+#[test]
+fn release_retests_v0019_upgrade_on_all_supported_hosts() {
+    let workflow = repo_file(".github/workflows/release.yml");
+
+    for required in [
+        "legacy-upgrade:",
+        "needs: [meta, release]",
+        "ubuntu-latest",
+        "macos-latest",
+        "windows-latest",
+        "releases/download/v0.0.19",
+        "self-update --dev",
+        "self-update --stable",
+        "@(& $bin --version)[0]",
+        "3589fdac3d480aea83ab61dd4fb0a7592c018a44415842083df2d5f1d0bb0d2f",
+        "5db981cc5f1380f3bf9ac2d66484c0cc67d06712e617c2cd0457e3058dcb12b0",
+        "cbc4229285c5e8ea02c9463b7868cd03f2021f5125f5b187ff99e3bebe16e278",
+        "2e365dc8273c04ee634d593eeada338a46ba7c7db2a1ca8f5c2aff30aec57a98",
+        "9ff8a3f8794517771ef6959632417fdf1dfbc85b7fdf4c344998223985582e63",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "Release workflow must test legacy upgrade contract: `{required}`"
+        );
+    }
 }
 
 #[test]

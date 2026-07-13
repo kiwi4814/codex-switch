@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 const REPO_OWNER: &str = "xjoker";
 const REPO_NAME: &str = "codex-switch";
 const BIN_NAME: &str = "codex-switch";
+const SYSTEM_INSTALL_DIR: &str = "/usr/local/bin";
+const SYSTEM_INSTALL_MARKER_NAME: &str = ".codex-switch-system-install-v1";
 const UPDATE_TTL_SECS: i64 = 12 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +47,93 @@ fn unix_migration_command(release_tag: &str) -> String {
     }
 }
 
+fn legacy_system_install_migration_hint(
+    executable: &Path,
+    platform: UpdatePlatform,
+    marker_present: bool,
+    use_dev: bool,
+    requested_version: Option<&str>,
+) -> Option<String> {
+    if platform != UpdatePlatform::Unix
+        || executable.parent() != Some(Path::new(SYSTEM_INSTALL_DIR))
+        || marker_present
+    {
+        return None;
+    }
+
+    let exact_version = requested_version.map(normalize_version);
+    if exact_version
+        .as_deref()
+        .is_some_and(|version| Version::parse(version).is_err())
+    {
+        return Some(format!(
+            "legacy direct install detected at '{}'; the requested version is not valid, so no migration command was generated. Use a semantic version such as `20260712.2.0`",
+            executable.display()
+        ));
+    }
+
+    let (user_command, system_command) = if let Some(version) = exact_version {
+        let url = format!(
+            "https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/v{version}/install.sh"
+        );
+        (
+            format!("curl -fsSL {url} | CS_VERSION={version} bash"),
+            format!("curl -fsSL {url} | CS_VERSION={version} bash -s -- --system"),
+        )
+    } else if use_dev {
+        (
+            format!(
+                "curl -fsSL https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/dev/install.sh | bash -s -- --dev"
+            ),
+            format!(
+                "curl -fsSL https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/dev/install.sh | bash -s -- --dev --system"
+            ),
+        )
+    } else {
+        (
+            format!(
+                "curl -fsSL https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/install.sh | bash"
+            ),
+            format!(
+                "curl -fsSL https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/install.sh | bash -s -- --system"
+            ),
+        )
+    };
+
+    Some(format!(
+        "legacy direct install detected at '{}'; direct self-update is paused so future updates no longer require sudo. Run the user-level installer once: `{user_command}`. Profiles and configuration in ~/.codex-switch are preserved. If this was an intentional system install, record that choice with `{system_command}` instead",
+        executable.display()
+    ))
+}
+
+fn canonical_executable_path(executable: PathBuf) -> PathBuf {
+    fs::canonicalize(&executable).unwrap_or(executable)
+}
+
+pub fn ensure_legacy_system_install_migrated(
+    use_dev: bool,
+    requested_version: Option<&str>,
+) -> Result<()> {
+    let executable =
+        canonical_executable_path(std::env::current_exe().context("locating current executable")?);
+    let platform = current_update_platform();
+    let marker_present = executable
+        .parent()
+        .map(|parent| parent.join(SYSTEM_INSTALL_MARKER_NAME).is_file())
+        .unwrap_or(false);
+
+    if let Some(hint) = legacy_system_install_migration_hint(
+        &executable,
+        platform,
+        marker_present,
+        use_dev,
+        requested_version,
+    ) {
+        anyhow::bail!(hint);
+    }
+    Ok(())
+}
+
 fn replacement_permission_hint(
     executable: &Path,
     platform: UpdatePlatform,
@@ -52,7 +141,7 @@ fn replacement_permission_hint(
 ) -> String {
     let parent = executable.parent().unwrap_or(executable);
     match platform {
-        UpdatePlatform::Unix if parent == Path::new("/usr/local/bin") => format!(
+        UpdatePlatform::Unix if parent == Path::new(SYSTEM_INSTALL_DIR) => format!(
             "install directory '{}' is not writable; for a legacy direct install, rerun the user-level installer once with {}. If codex-switch was intentionally installed with `--system`, run `sudo codex-switch self-update` instead",
             parent.display(),
             unix_migration_command(release_tag)
@@ -928,6 +1017,116 @@ mod tests {
 
         assert!(hint.contains("releases/latest/download/install.sh"));
         assert!(!hint.contains("echo-pwned"));
+    }
+
+    #[test]
+    fn markerless_unix_system_install_requires_the_dev_installer() {
+        let hint = legacy_system_install_migration_hint(
+            Path::new("/usr/local/bin/codex-switch"),
+            UpdatePlatform::Unix,
+            false,
+            true,
+            None,
+        )
+        .expect("markerless /usr/local install must migrate");
+
+        assert!(hint.contains("legacy direct install"));
+        assert!(hint.contains("releases/download/dev/install.sh"));
+        assert!(hint.contains("bash -s -- --dev"));
+        assert!(hint.contains("--dev --system"));
+    }
+
+    #[test]
+    fn markerless_unix_system_install_requires_the_stable_installer() {
+        let hint = legacy_system_install_migration_hint(
+            Path::new("/usr/local/bin/codex-switch"),
+            UpdatePlatform::Unix,
+            false,
+            false,
+            None,
+        )
+        .expect("markerless /usr/local install must migrate");
+
+        assert!(hint.contains("releases/latest/download/install.sh"));
+        assert!(!hint.contains("--dev"));
+        assert!(hint.contains("--system"));
+    }
+
+    #[test]
+    fn marked_system_and_user_installs_do_not_enter_legacy_migration() {
+        assert!(
+            legacy_system_install_migration_hint(
+                Path::new("/usr/local/bin/codex-switch"),
+                UpdatePlatform::Unix,
+                true,
+                false,
+                None,
+            )
+            .is_none()
+        );
+        assert!(
+            legacy_system_install_migration_hint(
+                Path::new("/home/alice/.local/bin/codex-switch"),
+                UpdatePlatform::Unix,
+                false,
+                false,
+                None,
+            )
+            .is_none()
+        );
+        assert!(
+            legacy_system_install_migration_hint(
+                Path::new(r"C:\Users\Alice\AppData\Local\Programs\codex-switch\codex-switch.exe"),
+                UpdatePlatform::Windows,
+                false,
+                false,
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn homebrew_symlink_is_resolved_before_legacy_migration_check() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let cellar_dir = temp.path().join("Cellar/codex-switch/20260713.4.0/bin");
+        fs::create_dir_all(&cellar_dir).expect("create fake Cellar path");
+        let cellar_binary = cellar_dir.join("codex-switch");
+        fs::write(&cellar_binary, b"fixture").expect("write fake Homebrew binary");
+        let symlink_path = temp.path().join("codex-switch");
+        symlink(&cellar_binary, &symlink_path).expect("create Homebrew symlink");
+
+        let resolved = canonical_executable_path(symlink_path);
+        assert!(resolved.to_string_lossy().contains("/Cellar/codex-switch/"));
+        assert!(
+            legacy_system_install_migration_hint(
+                &resolved,
+                UpdatePlatform::Unix,
+                false,
+                false,
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn markerless_system_install_preserves_an_exact_requested_version() {
+        let hint = legacy_system_install_migration_hint(
+            Path::new("/usr/local/bin/codex-switch"),
+            UpdatePlatform::Unix,
+            false,
+            false,
+            Some("v20260712.2.0"),
+        )
+        .expect("markerless /usr/local install must migrate");
+
+        assert!(hint.contains("releases/download/v20260712.2.0/install.sh"));
+        assert!(hint.contains("| CS_VERSION=20260712.2.0 bash"));
+        assert!(!hint.contains("releases/latest/download"));
     }
 
     #[test]

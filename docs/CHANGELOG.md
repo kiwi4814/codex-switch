@@ -1,5 +1,11 @@
 # Changelog
 
+## v20260713.4.0 — 2026-07-13
+
+- **Legacy install provenance** — Explicit Unix `--system` installs now carry a marker; markerless `/usr/local/bin` binaries are treated as legacy and `self-update` prints the matching stable/dev user-level installer command before any network request.
+- **v0.0.19 upgrade gate** — Release runs now execute the official `v0.0.19` updater on macOS, Linux, and Windows and verify that it installs the newly published version.
+- **One-time Unix migration** — The verified installer moves only the executable to `~/.local/bin`, removes the old `/usr/local/bin` copy and marker with one sudo authorization, and preserves all data under `~/.codex-switch`.
+
 ## v20260713.3.0 — 2026-07-13
 
 - **Dev update compatibility** — Bumped the rolling dev base to `20260713.3.0` so clients on `20260713.2.0-dev` can receive the corrected updater guidance.

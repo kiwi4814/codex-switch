@@ -21,6 +21,8 @@ pub(crate) async fn self_update_cmd(
         update::is_dev_version(update::current_version())
     };
 
+    update::ensure_legacy_system_install_migrated(use_dev, version)?;
+
     if check {
         let current_version = update::current_version().to_string();
         let result = if use_dev {

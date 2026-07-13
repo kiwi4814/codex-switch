@@ -97,9 +97,12 @@ GitHub Actions Release builds are the only distribution source of truth; do not 
 - `install.sh` / `install.ps1`
 - User update path: `codex-switch self-update --dev`
 
+After creating the GitHub Release, the `legacy-upgrade` job downloads the official `v0.0.19` binary on macOS, Linux, and Windows, runs its original self-update command against the new channel release, and verifies the resulting binary version. This is the compatibility floor for direct self-update; `v0.0.1` and `v0.0.2` remain installer-only.
+
 Post-release verification must confirm at least:
 
 - The GitHub Actions Release run succeeds, including all six builds and the release job.
+- The macOS, Linux, and Windows `legacy-upgrade` jobs prove `v0.0.19` can replace itself with the published version.
 - A platform archive downloaded from GitHub Releases matches its `.sha256`.
 - The unpacked release binary reports the CI-injected version with `codex-switch --version`.
 - The original release path works, for example `codex-switch self-update --check --dev`.

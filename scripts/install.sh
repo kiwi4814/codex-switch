@@ -15,6 +15,7 @@ SYSTEM_INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="codex-switch"
 DATA_DIR="${HOME}/.codex-switch"
 LEGACY_BIN="${SYSTEM_INSTALL_DIR}/${BINARY_NAME}"
+SYSTEM_INSTALL_MARKER="${SYSTEM_INSTALL_DIR}/.codex-switch-system-install-v1"
 PATH_BLOCK_BEGIN="# >>> codex-switch PATH >>>"
 PATH_BLOCK_END="# <<< codex-switch PATH <<<"
 
@@ -161,7 +162,12 @@ if [ "$UNINSTALL" = true ]; then
           ;;
       esac
       BIN_DIR="${BIN_PATH%/*}"
-      if [ -w "$BIN_DIR" ]; then
+      if [ "$BIN_PATH" = "$LEGACY_BIN" ] && [ -w "$BIN_DIR" ]; then
+        rm -f "$BIN_PATH" "$SYSTEM_INSTALL_MARKER"
+      elif [ "$BIN_PATH" = "$LEGACY_BIN" ]; then
+        info "Removing ${BIN_PATH} (requires sudo)"
+        sudo rm -f "$BIN_PATH" "$SYSTEM_INSTALL_MARKER"
+      elif [ -w "$BIN_DIR" ]; then
         rm -f "$BIN_PATH"
       else
         info "Removing ${BIN_PATH} (requires sudo)"
@@ -303,9 +309,11 @@ fi
 if [ "$SYSTEM_INSTALL" = true ]; then
   if [ -w "$INSTALL_DIR" ]; then
     install -m 0755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+    install -m 0644 /dev/null "$SYSTEM_INSTALL_MARKER"
   else
     info "Installing system-wide to ${INSTALL_DIR} (requires sudo)"
     sudo install -m 0755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+    sudo install -m 0644 /dev/null "$SYSTEM_INSTALL_MARKER"
   fi
 else
   mkdir -p "$INSTALL_DIR"
@@ -314,9 +322,9 @@ fi
 
 if [ "$MIGRATE_LEGACY" = true ]; then
   if [ "$LEGACY_NEEDS_SUDO" = true ]; then
-    sudo rm -f "$LEGACY_BIN"
+    sudo rm -f "$LEGACY_BIN" "$SYSTEM_INSTALL_MARKER"
   else
-    rm -f "$LEGACY_BIN"
+    rm -f "$LEGACY_BIN" "$SYSTEM_INSTALL_MARKER"
   fi
   info "Removed legacy install: ${LEGACY_BIN}"
 fi
