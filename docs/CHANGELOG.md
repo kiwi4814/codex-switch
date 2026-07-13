@@ -1,5 +1,11 @@
 # Changelog
 
+## v20260713.3.0 — 2026-07-13
+
+- **Dev update compatibility** — Bumped the rolling dev base to `20260713.3.0` so clients on `20260713.2.0-dev` can receive the corrected updater guidance.
+- **Path-aware self-update recovery** — Unix user installs no longer recommend `sudo`; legacy or explicit `/usr/local/bin` installs distinguish one-time installer migration from intentional `--system` updates; Windows user installs recommend closing running processes instead of Administrator PowerShell.
+- **Release migration prompt** — Dev and stable GitHub Release bodies now show the matching one-time installer command for older macOS/Linux direct installs. The installer remains the sole migration owner and preserves profiles and configuration.
+
 ## v20260713.2.0 — 2026-07-13
 
 - **Dev update compatibility** — Bumped the rolling dev base to `20260713.2.0` so clients on `20260713.1.0-dev` and earlier development builds can receive the corrected release candidate.

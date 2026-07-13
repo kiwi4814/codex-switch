@@ -12,6 +12,62 @@ const REPO_NAME: &str = "codex-switch";
 const BIN_NAME: &str = "codex-switch";
 const UPDATE_TTL_SECS: i64 = 12 * 60 * 60;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdatePlatform {
+    Unix,
+    Windows,
+}
+
+fn current_update_platform() -> UpdatePlatform {
+    if cfg!(windows) {
+        UpdatePlatform::Windows
+    } else {
+        UpdatePlatform::Unix
+    }
+}
+
+fn unix_migration_command(release_tag: &str) -> String {
+    let safe_tag = !release_tag.is_empty()
+        && release_tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
+    let url = if safe_tag {
+        format!(
+            "https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/{release_tag}/install.sh"
+        )
+    } else {
+        format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/install.sh")
+    };
+    if release_tag == "dev" && safe_tag {
+        format!("`curl -fsSL {url} | bash -s -- --dev`")
+    } else {
+        format!("`curl -fsSL {url} | bash`")
+    }
+}
+
+fn replacement_permission_hint(
+    executable: &Path,
+    platform: UpdatePlatform,
+    release_tag: &str,
+) -> String {
+    let parent = executable.parent().unwrap_or(executable);
+    match platform {
+        UpdatePlatform::Unix if parent == Path::new("/usr/local/bin") => format!(
+            "install directory '{}' is not writable; for a legacy direct install, rerun the user-level installer once with {}. If codex-switch was intentionally installed with `--system`, run `sudo codex-switch self-update` instead",
+            parent.display(),
+            unix_migration_command(release_tag)
+        ),
+        UpdatePlatform::Unix => format!(
+            "user-owned install directory '{}' is not writable; fix its ownership or reinstall with the user-level installer. Do not run self-update with elevated privileges",
+            parent.display()
+        ),
+        UpdatePlatform::Windows => format!(
+            "install directory '{}' is not writable; close running codex-switch processes and retry, or reinstall with the user-level installer",
+            parent.display()
+        ),
+    }
+}
+
 fn homebrew_dev_install_hint() -> &'static str {
     "run `brew uninstall codex-switch`, then follow the Dev Build instructions at https://github.com/xjoker/codex-switch#dev-build-latest-development-version"
 }
@@ -23,22 +79,17 @@ fn homebrew_dev_install_error() -> String {
     )
 }
 
-fn ensure_replace_parent_writable(executable: &Path) -> Result<()> {
+fn ensure_replace_parent_writable(
+    executable: &Path,
+    platform: UpdatePlatform,
+    release_tag: &str,
+) -> Result<()> {
     let parent = executable
         .parent()
         .with_context(|| format!("current executable has no parent: {}", executable.display()))?;
-    tempfile::NamedTempFile::new_in(parent).with_context(|| {
-        format!(
-            "install directory '{}' is not writable; reinstall with the user-level installer, or use elevated privileges for an explicit system install",
-            parent.display()
-        )
-    })?;
+    tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| replacement_permission_hint(executable, platform, release_tag))?;
     Ok(())
-}
-
-fn ensure_current_executable_replaceable() -> Result<()> {
-    let executable = std::env::current_exe().context("locating current executable")?;
-    ensure_replace_parent_writable(&executable)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,7 +301,9 @@ async fn download_and_replace(
     show_progress: bool,
     label_suffix: &str,
 ) -> Result<()> {
-    ensure_current_executable_replaceable()?;
+    let executable = std::env::current_exe().context("locating current executable")?;
+    let platform = current_update_platform();
+    ensure_replace_parent_writable(&executable, platform, &release.tag_name)?;
     let client =
         crate::auth::build_http_client().context("building HTTP client for self-update")?;
     let archive_name = asset_name();
@@ -285,12 +338,12 @@ async fn download_and_replace(
     if show_progress {
         eprintln!("Replacing current executable...");
     }
-    #[cfg(windows)]
-    let replace_context = "replacing current executable (close any running codex-switch processes and retry from PowerShell as Administrator)";
-    #[cfg(not(windows))]
-    let replace_context =
-        "replacing current executable (permission denied? try: sudo codex-switch self-update)";
-    self_replace::self_replace(&extracted_path).context(replace_context)?;
+    self_replace::self_replace(&extracted_path).with_context(|| {
+        format!(
+            "replacing current executable: {}",
+            replacement_permission_hint(&executable, platform, &release.tag_name)
+        )
+    })?;
     Ok(())
 }
 
@@ -815,11 +868,66 @@ mod tests {
         fs::write(&executable, b"old binary").unwrap();
         fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o555)).unwrap();
 
-        let error = ensure_replace_parent_writable(&executable).unwrap_err();
+        let error = ensure_replace_parent_writable(&executable, UpdatePlatform::Unix, "v1.2.3")
+            .unwrap_err();
 
         fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(error.to_string().contains("not writable"));
         assert!(error.to_string().contains("user-level installer"));
+    }
+
+    #[test]
+    fn unix_system_install_hint_separates_legacy_migration_from_explicit_system_updates() {
+        let hint = replacement_permission_hint(
+            Path::new("/usr/local/bin/codex-switch"),
+            UpdatePlatform::Unix,
+            "dev",
+        );
+
+        assert!(hint.contains("legacy direct install"));
+        assert!(hint.contains("releases/download/dev/install.sh"));
+        assert!(hint.contains("--dev"));
+        assert!(hint.contains("intentionally installed with `--system`"));
+        assert!(hint.contains("sudo codex-switch self-update"));
+    }
+
+    #[test]
+    fn unix_user_install_hint_never_recommends_sudo() {
+        let hint = replacement_permission_hint(
+            Path::new("/home/alice/.local/bin/codex-switch"),
+            UpdatePlatform::Unix,
+            "v20260713.3.0",
+        );
+
+        assert!(hint.contains("user-owned install directory"));
+        assert!(hint.contains("reinstall"));
+        assert!(!hint.contains("sudo"));
+    }
+
+    #[test]
+    fn windows_user_install_hint_never_recommends_administrator() {
+        let hint = replacement_permission_hint(
+            Path::new(r"C:\Users\Alice\AppData\Local\Programs\codex-switch\codex-switch.exe"),
+            UpdatePlatform::Windows,
+            "v20260713.3.0",
+        );
+
+        assert!(hint.contains("close running codex-switch processes"));
+        assert!(hint.contains("user-level installer"));
+        assert!(!hint.contains("Administrator"));
+        assert!(!hint.contains("sudo"));
+    }
+
+    #[test]
+    fn migration_hint_does_not_embed_an_untrusted_release_tag() {
+        let hint = replacement_permission_hint(
+            Path::new("/usr/local/bin/codex-switch"),
+            UpdatePlatform::Unix,
+            "v1.2.3;echo-pwned",
+        );
+
+        assert!(hint.contains("releases/latest/download/install.sh"));
+        assert!(!hint.contains("echo-pwned"));
     }
 
     #[test]

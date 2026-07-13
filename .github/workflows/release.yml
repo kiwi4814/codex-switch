@@ -221,6 +221,10 @@ jobs:
 
           **This is a pre-release build for testing.** Use \`codex-switch self-update --dev\` to install, or \`codex-switch self-update --stable\` to return to the latest stable release.
 
+          **Older macOS/Linux direct install in \`/usr/local/bin\`:** migrate once with the matching user-level installer. It installs to \`~/.local/bin\`, preserves profiles and configuration, and requests \`sudo\` only to remove the old binary.
+
+          \`curl -fsSL https://github.com/xjoker/codex-switch/releases/download/dev/install.sh | bash -s -- --dev\`
+
           Version: \`${{ needs.meta.outputs.version }}\`
           EOF
 
@@ -245,6 +249,10 @@ jobs:
           name: v${{ needs.meta.outputs.version }}
           prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
           generate_release_notes: true
+          body: |
+            **Older macOS/Linux direct install in `/usr/local/bin`:** migrate once with the matching user-level installer. It installs to `~/.local/bin`, preserves profiles and configuration, and requests `sudo` only to remove the old binary.
+
+            `curl -fsSL https://github.com/xjoker/codex-switch/releases/download/v${{ needs.meta.outputs.version }}/install.sh | bash`
           files: |
             artifacts/*
         env:

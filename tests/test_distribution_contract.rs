@@ -155,8 +155,21 @@ fn self_update_checks_replace_permission_before_archive_download() {
 
     assert_before(
         &update,
-        "ensure_current_executable_replaceable()?",
+        "ensure_replace_parent_writable(&executable, platform, &release.tag_name)?",
         "download_file(&client, &archive_asset.browser_download_url",
+    );
+    assert!(!update.contains("permission denied? try: sudo codex-switch self-update"));
+    assert!(!update.contains("retry from PowerShell as Administrator"));
+}
+
+#[test]
+fn release_notes_prompt_legacy_users_to_run_the_matching_installer() {
+    let workflow = repo_file(".github/workflows/release.yml");
+
+    assert!(workflow.contains("Older macOS/Linux direct install"));
+    assert!(workflow.contains("releases/download/dev/install.sh | bash -s -- --dev"));
+    assert!(
+        workflow.contains("releases/download/v${{ needs.meta.outputs.version }}/install.sh | bash")
     );
 }
 

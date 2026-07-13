@@ -88,6 +88,10 @@ Versions `0.0.1` and `0.0.2` should rerun the installer because their updater pr
 
 Older macOS/Linux direct installs in `/usr/local/bin` should rerun the current installer once. It installs the user-owned binary first, then asks for `sudo` once to remove the legacy binary so PATH cannot keep selecting the old copy. Profiles and configuration under `~/.codex-switch` are preserved.
 
+```bash
+curl -fsSL https://github.com/xjoker/codex-switch/releases/latest/download/install.sh | bash
+```
+
 ## Documentation
 
 For users:
