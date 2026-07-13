@@ -263,6 +263,24 @@ fn release_retests_v0019_upgrade_on_all_supported_hosts() {
 }
 
 #[test]
+fn legacy_upgrade_retries_during_github_release_propagation() {
+    let workflow = repo_file(".github/workflows/release.yml");
+
+    for required in [
+        "for attempt in 1 2 3 4 5; do",
+        "foreach ($attempt in 1..5)",
+        "Retrying legacy self-update after GitHub Release propagation delay",
+        "sleep 5",
+        "Start-Sleep -Seconds 5",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "legacy upgrade must tolerate GitHub Release propagation: `{required}`"
+        );
+    }
+}
+
+#[test]
 fn dev_release_uses_the_short_calendar_prerelease_version() {
     let workflow = repo_file(".github/workflows/release.yml");
 

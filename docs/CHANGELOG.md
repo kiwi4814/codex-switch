@@ -1,5 +1,9 @@
 # Changelog
 
+## v20260713.5.0 — 2026-07-13
+
+- **Reliable legacy upgrade gate** — Release runs retry the v0.0.19 self-update check during the short GitHub Release propagation window, while still failing after a bounded timeout.
+
 ## v20260713.4.0 — 2026-07-13
 
 - **Legacy install provenance** — Explicit Unix `--system` installs now carry a marker; markerless `/usr/local/bin` binaries are treated as legacy and `self-update` prints the matching stable/dev user-level installer command before any network request.

@@ -305,11 +305,19 @@ jobs:
           )
           bin="${work}/codex-switch"
           test "$("$bin" --version | head -n 1)" = "codex-switch 0.0.19"
-          if [[ "$IS_DEV" == "true" ]]; then
-            HOME="${work}/home" "$bin" self-update --dev
-          else
-            HOME="${work}/home" "$bin" self-update --stable
-          fi
+          updated=false
+          for attempt in 1 2 3 4 5; do
+            if [[ "$IS_DEV" == "true" ]]; then
+              HOME="${work}/home" "$bin" self-update --dev && updated=true && break
+            else
+              HOME="${work}/home" "$bin" self-update --stable && updated=true && break
+            fi
+            if [[ "$attempt" -lt 5 ]]; then
+              echo "Retrying legacy self-update after GitHub Release propagation delay"
+              sleep 5
+            fi
+          done
+          test "$updated" = true
           test "$("$bin" --version | head -n 1)" = "codex-switch ${EXPECTED_VERSION}"
 
       - name: Upgrade v0.0.19 on Windows
@@ -334,12 +342,23 @@ jobs:
           if (@(& $bin --version)[0] -ne "codex-switch 0.0.19") {
             throw "unexpected legacy version"
           }
-          if ($env:IS_DEV -eq "true") {
-            & $bin self-update --dev
-          } else {
-            & $bin self-update --stable
+          $updated = $false
+          foreach ($attempt in 1..5) {
+            if ($env:IS_DEV -eq "true") {
+              & $bin self-update --dev
+            } else {
+              & $bin self-update --stable
+            }
+            if ($LASTEXITCODE -eq 0) {
+              $updated = $true
+              break
+            }
+            if ($attempt -lt 5) {
+              Write-Host "Retrying legacy self-update after GitHub Release propagation delay"
+              Start-Sleep -Seconds 5
+            }
           }
-          if ($LASTEXITCODE -ne 0) { throw "v0.0.19 self-update failed" }
+          if (-not $updated) { throw "v0.0.19 self-update failed" }
           if (@(& $bin --version)[0] -ne "codex-switch $env:EXPECTED_VERSION") {
             throw "legacy upgrade installed an unexpected version"
           }
