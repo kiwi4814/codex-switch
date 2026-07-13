@@ -111,6 +111,14 @@ codex-switch self-update --dev
 
 Downloaded archives are checked against the `.sha256` file in the same GitHub Release. This detects corruption, but it is not an independent signature: GitHub Releases over TLS remains the trust anchor. Homebrew installations must be updated with Homebrew.
 
+Homebrew distributes stable releases only:
+
+```bash
+brew upgrade xjoker/tap/codex-switch
+```
+
+The rolling dev channel is a direct-install workflow. A Homebrew user who intentionally opts into dev must first run `brew uninstall codex-switch`, then use the Unix installer with `--dev`. `self-update --stable` returns that direct installation to the stable channel but does not restore Homebrew ownership. To return to Homebrew, run the direct uninstaller, keep the data directory when prompted, and reinstall `xjoker/tap/codex-switch`.
+
 Direct-install ownership is platform-specific:
 
 - macOS and Linux default to `$HOME/.local/bin`; the installer manages a removable PATH block for zsh, bash, and fish, and prints manual guidance for other shells. `--system` explicitly selects `/usr/local/bin` and may require `sudo` for future updates.

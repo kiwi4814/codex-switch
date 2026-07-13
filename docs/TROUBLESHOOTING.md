@@ -10,6 +10,8 @@ Start with the complete error message. Configuration, login, update, and permiss
 | Windows daemon installation is denied | Open PowerShell as Administrator and retry. |
 | TUI layout is broken in Git Bash | Use Windows Terminal or PowerShell. |
 | Direct update does not replace a Homebrew binary | Run `brew upgrade xjoker/tap/codex-switch`. |
+| A Homebrew installation cannot switch to dev | Run `brew uninstall codex-switch`, then follow [Testing development releases](wiki/Development-Releases.md#install-the-rolling-dev-build). |
+| A direct dev installation should return to Homebrew | Run the direct uninstaller, keep the data directory when prompted, then run `brew install xjoker/tap/codex-switch`. |
 | macOS/Linux self-update reports that the install directory is not writable | Rerun the current installer once to migrate a legacy `/usr/local/bin` direct install to `$HOME/.local/bin`. Use `sudo codex-switch self-update` only for an intentional `--system` install. |
 | A dev build should return to stable | Run `codex-switch self-update --stable`. |
 

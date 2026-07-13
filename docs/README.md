@@ -27,7 +27,7 @@ This directory is the canonical documentation for `codex-switch`. Documentation 
 
 ## Documentation contract
 
-- Write documentation in English.
+- Keep English as the canonical documentation language. Chinese companion pages may summarize tasks and link back to the English source, but they must not become a second specification.
 - Keep warnings and prerequisites near the top.
 - Describe observed behavior, not planned behavior.
 - Link to source files for implementation details that may change.

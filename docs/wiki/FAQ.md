@@ -20,6 +20,10 @@ No. Inactive profiles are archived under `deleted-profiles/`. The active profile
 
 No. It is an optional Beta feature. `codex-switch use`, `list`, `launch`, and the TUI work without it.
 
+## How do I test the next release?
+
+Use the rolling dev channel only when you are prepared to test prerelease behavior. Follow [Testing development releases](Development-Releases) for installation, verification, rollback, and issue-reporting steps.
+
 ## Are release binaries independently signed?
 
 Not currently. Archives are checked against SHA256 files from the same GitHub Release, which detects corruption but shares the Release trust domain.

@@ -28,6 +28,8 @@ Official references, checked 2026-07-13:
 
 Wiki source pages live in `docs/wiki/`. Keep them concise and link to canonical documents for details. Each page should answer one navigation question and identify the canonical source.
 
+English is the primary Wiki language. A Chinese companion page may provide a quick path for Chinese readers, but detailed behavior remains in the English repository documents. When behavior changes, update the canonical English document first, then adjust the companion summary if its navigation or examples are affected.
+
 Do not edit the published Wiki directly except to recover from a publishing failure. A direct fix must be copied back to `docs/wiki/` immediately.
 
 ## Initialize the Wiki

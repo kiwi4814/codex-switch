@@ -157,8 +157,8 @@ fn replacement_permission_hint(
     }
 }
 
-fn homebrew_dev_install_hint() -> &'static str {
-    "run `brew uninstall codex-switch`, then follow the Dev Build instructions at https://github.com/xjoker/codex-switch#dev-build-latest-development-version"
+pub(crate) fn homebrew_dev_install_hint() -> &'static str {
+    "run `brew uninstall codex-switch`, then follow the development-release instructions at https://github.com/xjoker/codex-switch/blob/master/docs/wiki/Development-Releases.md#install-the-rolling-dev-build"
 }
 
 fn homebrew_dev_install_error() -> String {
@@ -933,7 +933,9 @@ mod tests {
     fn homebrew_dev_hint_avoids_removed_binary_and_unreviewed_pipe_command() {
         let hint = super::homebrew_dev_install_hint();
         assert!(hint.contains("brew uninstall codex-switch"));
-        assert!(hint.contains("github.com/xjoker/codex-switch"));
+        assert!(hint.contains(
+            "github.com/xjoker/codex-switch/blob/master/docs/wiki/Development-Releases.md#install-the-rolling-dev-build"
+        ));
         assert!(!hint.contains("| bash"));
         assert!(!hint.contains("self-update"));
     }

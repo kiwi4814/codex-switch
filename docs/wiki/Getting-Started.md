@@ -24,4 +24,4 @@ Codex must use `cli_auth_credentials_store = "file"` in `$CODEX_HOME/config.toml
 
 Existing stable versions `0.0.3` and newer can upgrade with `codex-switch self-update`. Development builds can return to stable with `codex-switch self-update --stable`; versions `0.0.1` and `0.0.2` should rerun the installer. Windows direct installs remain user-owned under `%LOCALAPPDATA%`; Homebrew installations must use Homebrew updates.
 
-Next: read the [Feature guide](Feature-Guide), or use the full [command reference](https://github.com/xjoker/codex-switch/blob/master/docs/COMMANDS.md).
+To opt into the rolling build before the next stable release, follow [Testing development releases](Development-Releases). Otherwise, continue with the [Feature guide](Feature-Guide) or the full [command reference](https://github.com/xjoker/codex-switch/blob/master/docs/COMMANDS.md).

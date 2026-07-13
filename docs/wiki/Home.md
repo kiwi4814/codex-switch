@@ -7,9 +7,12 @@
 ## Using codex-switch
 
 - [Getting started](Getting-Started) — install, add an account, and open the dashboard.
+- [Testing development releases](Development-Releases) — install the rolling dev build, verify it, and return to stable.
 - [Feature guide](Feature-Guide) — understand the supported workflows and safety boundaries.
 - [Troubleshooting](Troubleshooting) — diagnose common failures and recover a profile.
 - [FAQ](FAQ) — concise answers to user and project questions.
+
+中文读者可以从[中文指南](Chinese-Guide)开始；详细行为仍以英文主文档为准。
 
 ## Developing codex-switch
 

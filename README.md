@@ -84,6 +84,15 @@ codex-switch self-update --version <VERSION>
 brew upgrade xjoker/tap/codex-switch
 ```
 
+Homebrew distributes stable releases only and must retain ownership of its Cellar binary. To test the rolling dev build, remove the Homebrew package first, then use the direct dev installer:
+
+```bash
+brew uninstall codex-switch
+curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash -s -- --dev
+```
+
+Use `codex-switch self-update --stable` to keep a direct installation but return to the stable channel. To return to Homebrew ownership, run the direct uninstaller, keep the data directory when prompted, then reinstall with `brew install xjoker/tap/codex-switch`.
+
 Versions `0.0.1` and `0.0.2` should rerun the installer because their updater predates the supported migration path. The release workflow continuously verifies direct self-update from `v0.0.19` on macOS, Linux, and Windows. Calendar-version releases are a normal upgrade from `0.0.x`; configuration and profiles remain in place.
 
 Older macOS/Linux direct installs in `/usr/local/bin` should rerun the current installer once. The script verifies the download, validates one-time `sudo` access, installs the user-owned binary, and removes the legacy copy so PATH cannot keep selecting it. Profiles and configuration under `~/.codex-switch` are preserved. If an old updater first upgrades in place with `sudo`, the new updater detects the unmarked legacy location and prints this installer command before any later network check. Explicit `--system` installs carry a marker and continue to use system-level updates.

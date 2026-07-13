@@ -1,5 +1,11 @@
 # Changelog
 
+## v20260713.6.0 — 2026-07-13
+
+- **Repository-backed GitHub Wiki** — Added task-oriented Wiki sources with English as the canonical language, a Chinese companion entry point, and a development-release testing guide.
+- **Homebrew channel guidance** — Documented stable updates, opting into direct dev builds, returning to the stable channel, and restoring Homebrew ownership without deleting profiles.
+- **Correct Homebrew dev prompt** — Replaced the stale README anchor and the unusable uninstall-then-self-update command with the reviewed development-release instructions.
+
 ## v20260713.5.0 — 2026-07-13
 
 - **Reliable legacy upgrade gate** — Release runs retry the v0.0.19 self-update check during the short GitHub Release propagation window, while still failing after a bounded timeout.

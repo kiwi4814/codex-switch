@@ -80,6 +80,21 @@ codex-switch tui
 brew install xjoker/tap/codex-switch
 ```
 
+Homebrew 只发布正式版，并持续管理其 Cellar 中的二进制。更新正式版使用：
+
+```bash
+brew upgrade xjoker/tap/codex-switch
+```
+
+若要参与滚动开发版测试，必须先卸载 Homebrew 包，再改用直装开发版：
+
+```bash
+brew uninstall codex-switch
+curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash -s -- --dev
+```
+
+测试结束后，`codex-switch self-update --stable` 可以保留直装方式并回到正式通道。若要恢复由 Homebrew 管理，请运行下方直装卸载命令，在询问是否删除数据目录时选择 `N`，然后重新运行 `brew install xjoker/tap/codex-switch`。
+
 ### 安装开发版（最新开发构建）
 
 开发版可能不稳定，仅建议用于在下一个正式版发布前参与测试。

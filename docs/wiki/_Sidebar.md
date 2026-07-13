@@ -2,9 +2,11 @@
 
 - [Home](Home)
 - [Getting started](Getting-Started)
+- [Testing development releases](Development-Releases)
 - [Feature guide](Feature-Guide)
 - [Troubleshooting](Troubleshooting)
 - [FAQ](FAQ)
+- [中文指南](Chinese-Guide)
 
 ## Developing codex-switch
 

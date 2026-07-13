@@ -59,28 +59,30 @@ pub(crate) async fn self_update_cmd(
         let channel_label = if use_dev { " (dev)" } else { "" };
         match result {
             Some(info) => {
-                let hint = if use_dev {
-                    if info.install_source == update::InstallSource::Homebrew
-                        && !update::is_dev_version(&info.current_version)
-                    {
-                        "brew uninstall codex-switch && codex-switch self-update --dev"
-                    } else if dev {
+                let homebrew_to_dev = use_dev
+                    && info.install_source == update::InstallSource::Homebrew
+                    && !update::is_dev_version(&info.current_version);
+                let instruction = if homebrew_to_dev {
+                    format!("To switch to dev, {}.", update::homebrew_dev_install_hint())
+                } else {
+                    let hint = if use_dev && dev {
                         // Explicit --dev flag: include it in the hint.
                         "codex-switch self-update --dev"
-                    } else {
+                    } else if use_dev {
                         // Already on dev (auto-detected): plain self-update stays in dev.
                         "codex-switch self-update"
-                    }
-                } else if stable {
-                    "codex-switch self-update --stable"
-                } else {
-                    info.install_source.upgrade_hint()
+                    } else if stable {
+                        "codex-switch self-update --stable"
+                    } else {
+                        info.install_source.upgrade_hint()
+                    };
+                    format!("Run `{hint}`.")
                 };
                 println!(
                     "{}",
                     color::warn(&format!(
-                        "New version available{channel_label}: v{} (current v{}). Run `{hint}`.",
-                        info.latest_version, info.current_version,
+                        "New version available{channel_label}: v{} (current v{}). {instruction}",
+                        info.latest_version, info.current_version
                     ))
                 );
             }
