@@ -266,6 +266,8 @@ fn is_model_quota_limit(limit: &crate::usage::AdditionalRateLimit) -> bool {
         .metered_feature
         .as_deref()
         .is_some_and(|feature| feature.starts_with("codex_"))
+        && limit.allowed != Some(false)
+        && limit.limit_reached != Some(true)
 }
 
 fn select_warmup_models(
@@ -923,6 +925,66 @@ mod tests {
         assert_eq!(
             select_warmup_models(&models, &limits).unwrap(),
             vec!["gpt-5.4-mini", "gpt-5.3-codex-spark"]
+        );
+    }
+
+    #[test]
+    fn test_warmup_models_exclude_disallowed_additional_pool() {
+        let models = vec![
+            ModelEntry {
+                slug: "gpt-5.4-mini".to_string(),
+                visibility: Some("List".to_string()),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+            ModelEntry {
+                slug: "gpt-5.3-codex-spark".to_string(),
+                visibility: Some("List".to_string()),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+        ];
+        let limits = vec![crate::usage::AdditionalRateLimit {
+            limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+            metered_feature: Some("codex_bengalfox".to_string()),
+            allowed: Some(false),
+            limit_reached: Some(false),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            select_warmup_models(&models, &limits).unwrap(),
+            vec!["gpt-5.4-mini"]
+        );
+    }
+
+    #[test]
+    fn test_warmup_models_exclude_exhausted_additional_pool() {
+        let models = vec![
+            ModelEntry {
+                slug: "gpt-5.4-mini".to_string(),
+                visibility: Some("List".to_string()),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+            ModelEntry {
+                slug: "gpt-5.3-codex-spark".to_string(),
+                visibility: Some("List".to_string()),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+        ];
+        let limits = vec![crate::usage::AdditionalRateLimit {
+            limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+            metered_feature: Some("codex_bengalfox".to_string()),
+            allowed: Some(true),
+            limit_reached: Some(true),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            select_warmup_models(&models, &limits).unwrap(),
+            vec!["gpt-5.4-mini"]
         );
     }
 

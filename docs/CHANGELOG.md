@@ -1,11 +1,12 @@
 # Changelog
 
-## v20260712.2.0 — Unreleased
+## v20260713.1.0 — 2026-07-13
 
-- **Dev update compatibility** — Bumped the rolling dev base to `20260712.2.0` so clients already on the legacy timestamped `20260712.1.0-dev.*` build can upgrade to the short `20260712.2.0-dev` version.
+- **Dev update compatibility** — Bumped the rolling dev base to `20260713.1.0` so clients already on legacy timestamped or short `20260712.*-dev` builds can upgrade to `20260713.1.0-dev`.
 
 ### Added
 
+- **Contributor and maintainer documentation** — Added canonical English feature, architecture, development, contribution, and Wiki-maintenance guides, plus curated Wiki source pages for user and coding-agent onboarding.
 - **Three-host CI quality gate** — A dedicated CI workflow now runs tests, Clippy, and debug builds on Linux, macOS, and Windows for `dev` pushes and pull requests. Linux additionally checks formatting, dependency advisories, and shell syntax; Windows parses the PowerShell installer.
 - **Verified installers** — Unix and PowerShell installers now download the matching `.sha256` asset and reject malformed or mismatched checksums before extracting release content.
 - **TUI home-panel toggle** — The `i` key shows or hides the compact quota panel on the home screen, keeping the account list focused while preserving a fast quota glance.

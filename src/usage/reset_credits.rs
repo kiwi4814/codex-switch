@@ -15,6 +15,59 @@ const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit
 const RESET_CREDITS_CONSUME_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumeFailureKind {
+    DefinitelyNotConsumed,
+    OutcomeUnknownAfterRequest,
+}
+
+#[derive(Debug)]
+pub struct ConsumeResetCreditError {
+    kind: ConsumeFailureKind,
+    source: anyhow::Error,
+}
+
+impl ConsumeResetCreditError {
+    fn not_consumed(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: ConsumeFailureKind::DefinitelyNotConsumed,
+            source: source.into(),
+        }
+    }
+
+    fn outcome_unknown(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: ConsumeFailureKind::OutcomeUnknownAfterRequest,
+            source: source.into(),
+        }
+    }
+
+    pub fn definitely_not_consumed(&self) -> bool {
+        self.kind == ConsumeFailureKind::DefinitelyNotConsumed
+    }
+
+    pub fn outcome_unknown_after_request(&self) -> bool {
+        self.kind == ConsumeFailureKind::OutcomeUnknownAfterRequest
+    }
+
+    pub fn user_facing_unknown_message(&self, alias: &str) -> String {
+        debug_assert!(self.outcome_unknown_after_request());
+        format!("{alias}: reset-card consumption may have occurred; verify before retry")
+    }
+}
+
+impl std::fmt::Display for ConsumeResetCreditError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ConsumeResetCreditError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
 fn reset_credits_url() -> String {
     if let Ok(url) = std::env::var("CS_RESET_CREDITS_URL") {
         return url;
@@ -112,19 +165,23 @@ pub fn earliest_reset_credit(credits: &[ResetCredit]) -> Option<&ResetCredit> {
 pub async fn consume_earliest_reset_credit(
     alias: &str,
     profile_path: &Path,
-) -> Result<ConsumedResetCredit> {
-    let val = auth::read_auth(profile_path)?;
+) -> std::result::Result<ConsumedResetCredit, ConsumeResetCreditError> {
+    let val = auth::read_auth(profile_path).map_err(ConsumeResetCreditError::not_consumed)?;
     let (access_token, _) = auth::extract_tokens(&val);
     let access_token = access_token
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{alias}: auth.json missing access_token"))?;
+        .ok_or_else(|| anyhow::anyhow!("{alias}: auth.json missing access_token"))
+        .map_err(ConsumeResetCreditError::not_consumed)?;
     let account_id = crate::jwt::parse_account_info(&val).account_id;
-    let client = auth::build_http_client()?;
+    let client = auth::build_http_client().map_err(ConsumeResetCreditError::not_consumed)?;
 
-    let (_, credits) = fetch_reset_credits(&client, &access_token, account_id.as_deref()).await?;
+    let (_, credits) = fetch_reset_credits(&client, &access_token, account_id.as_deref())
+        .await
+        .map_err(ConsumeResetCreditError::not_consumed)?;
     let credit = earliest_reset_credit(&credits)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("{alias}: no available reset cards"))?;
+        .ok_or_else(|| anyhow::anyhow!("{alias}: no available reset cards"))
+        .map_err(ConsumeResetCreditError::not_consumed)?;
 
     consume_reset_credit(&client, &access_token, account_id.as_deref(), credit).await
 }
@@ -134,7 +191,7 @@ async fn consume_reset_credit(
     access_token: &str,
     account_id: Option<&str>,
     credit: ResetCredit,
-) -> Result<ConsumedResetCredit> {
+) -> std::result::Result<ConsumedResetCredit, ConsumeResetCreditError> {
     consume_reset_credit_at_url(
         client,
         access_token,
@@ -151,10 +208,11 @@ async fn consume_reset_credit_at_url(
     account_id: Option<&str>,
     credit: ResetCredit,
     url: &str,
-) -> Result<ConsumedResetCredit> {
+) -> std::result::Result<ConsumedResetCredit, ConsumeResetCreditError> {
     // Generate once per user action. Any retry after an ambiguous transport/server
     // failure must identify the same logical redemption to the backend.
     let request_id = redeem_request_id();
+    let mut outcome_may_have_changed = false;
     for attempt in 0..MAX_RETRIES {
         let mut req = client
             .post(url)
@@ -174,6 +232,7 @@ async fn consume_reset_credit_at_url(
         let resp = match req.send().await {
             Ok(resp) => resp,
             Err(error) if attempt + 1 < MAX_RETRIES => {
+                outcome_may_have_changed = true;
                 debug!(
                     "reset credit consume attempt {}/{} failed before response: {}",
                     attempt + 1,
@@ -184,15 +243,15 @@ async fn consume_reset_credit_at_url(
                 continue;
             }
             Err(error) => {
-                return Err(format_reqwest_error(
-                    "reset credit consume request failed",
-                    &error,
+                return Err(ConsumeResetCreditError::outcome_unknown(
+                    format_reqwest_error("reset credit consume request failed", &error),
                 ));
             }
         };
         let status = resp.status();
         if !status.is_success() {
             if (status.is_server_error() || status.as_u16() == 429) && attempt + 1 < MAX_RETRIES {
+                outcome_may_have_changed = true;
                 debug!(
                     "reset credit consume attempt {}/{} returned HTTP {status}",
                     attempt + 1,
@@ -201,12 +260,20 @@ async fn consume_reset_credit_at_url(
                 tokio::time::sleep(RETRY_DELAY).await;
                 continue;
             }
-            anyhow::bail!("reset credit consume request failed (HTTP {status})");
+            let error = anyhow::anyhow!("reset credit consume request failed (HTTP {status})");
+            if status.is_client_error() && status.as_u16() != 429 && !outcome_may_have_changed {
+                return Err(ConsumeResetCreditError::not_consumed(error));
+            }
+            return Err(ConsumeResetCreditError::outcome_unknown(error));
         }
 
         match resp.json::<Value>().await {
-            Ok(body) => return parse_consumed_reset_credit(&body, credit),
+            Ok(body) => {
+                return parse_consumed_reset_credit(&body, credit)
+                    .map_err(ConsumeResetCreditError::outcome_unknown);
+            }
             Err(error) if attempt + 1 < MAX_RETRIES => {
+                outcome_may_have_changed = true;
                 debug!(
                     "reset credit consume attempt {}/{} returned invalid JSON: {error}",
                     attempt + 1,
@@ -215,9 +282,9 @@ async fn consume_reset_credit_at_url(
                 tokio::time::sleep(RETRY_DELAY).await;
             }
             Err(error) => {
-                return Err(anyhow::anyhow!(
+                return Err(ConsumeResetCreditError::outcome_unknown(anyhow::anyhow!(
                     "failed to parse reset credit consume response: {error}"
-                ));
+                )));
             }
         }
     }
@@ -346,6 +413,7 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::post;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -441,5 +509,168 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(!ids[0].is_empty());
         assert_eq!(ids[0], ids[1]);
+    }
+
+    #[tokio::test]
+    async fn success_with_invalid_json_is_classified_as_outcome_unknown() {
+        let app =
+            axum::Router::new().route("/consume", post(|| async { (StatusCode::OK, "not-json") }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = consume_reset_credit_at_url(
+            &reqwest::Client::new(),
+            "access-token",
+            None,
+            ResetCredit {
+                id: "credit-1".to_string(),
+                granted_at: None,
+                expires_at: None,
+            },
+            &format!("http://{address}/consume"),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert!(error.outcome_unknown_after_request());
+    }
+
+    #[tokio::test]
+    async fn explicit_client_error_is_classified_as_not_consumed() {
+        let app = axum::Router::new().route("/consume", post(|| async { StatusCode::BAD_REQUEST }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = consume_reset_credit_at_url(
+            &reqwest::Client::new(),
+            "access-token",
+            None,
+            ResetCredit {
+                id: "credit-1".to_string(),
+                granted_at: None,
+                expires_at: None,
+            },
+            &format!("http://{address}/consume"),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert!(error.definitely_not_consumed());
+    }
+
+    #[tokio::test]
+    async fn first_success_with_non_reset_code_is_outcome_unknown() {
+        let app = axum::Router::new().route(
+            "/consume",
+            post(|| async { Json(json!({"code": "already_redeemed"})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = consume_reset_credit_at_url(
+            &reqwest::Client::new(),
+            "access-token",
+            None,
+            ResetCredit {
+                id: "credit-1".to_string(),
+                granted_at: None,
+                expires_at: None,
+            },
+            &format!("http://{address}/consume"),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert!(error.outcome_unknown_after_request());
+        let message = error.user_facing_unknown_message("account");
+        assert_eq!(
+            message,
+            "account: reset-card consumption may have occurred; verify before retry"
+        );
+        assert!(!message.contains("already_redeemed"));
+    }
+
+    #[tokio::test]
+    async fn invalid_response_followed_by_conflict_remains_outcome_unknown() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&attempts);
+        let app = axum::Router::new().route(
+            "/consume",
+            post(move || {
+                let captured = Arc::clone(&captured);
+                async move {
+                    if captured.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (StatusCode::OK, "not-json").into_response()
+                    } else {
+                        StatusCode::CONFLICT.into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = consume_reset_credit_at_url(
+            &reqwest::Client::new(),
+            "access-token",
+            None,
+            ResetCredit {
+                id: "credit-1".to_string(),
+                granted_at: None,
+                expires_at: None,
+            },
+            &format!("http://{address}/consume"),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert!(error.outcome_unknown_after_request());
+    }
+
+    #[tokio::test]
+    async fn invalid_response_followed_by_already_redeemed_remains_outcome_unknown() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&attempts);
+        let app = axum::Router::new().route(
+            "/consume",
+            post(move || {
+                let captured = Arc::clone(&captured);
+                async move {
+                    if captured.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (StatusCode::OK, "not-json").into_response()
+                    } else {
+                        Json(json!({"code": "already_redeemed"})).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = consume_reset_credit_at_url(
+            &reqwest::Client::new(),
+            "access-token",
+            None,
+            ResetCredit {
+                id: "credit-1".to_string(),
+                granted_at: None,
+                expires_at: None,
+            },
+            &format!("http://{address}/consume"),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert!(error.outcome_unknown_after_request());
     }
 }

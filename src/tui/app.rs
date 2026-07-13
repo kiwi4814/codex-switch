@@ -37,6 +37,19 @@ pub enum UsageStatus {
     Error(UsageError),
 }
 
+#[derive(Debug)]
+pub struct ResetCardFailure {
+    message: String,
+    invalidate_cache: bool,
+}
+
+fn map_reset_card_failure(message: String, invalidate_cache: bool) -> ResetCardFailure {
+    ResetCardFailure {
+        message,
+        invalidate_cache,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ModelStatus {
     Loading,
@@ -129,8 +142,9 @@ pub struct App {
     pub pending_warmup: tokio::sync::mpsc::Receiver<(u64, String, Result<(), String>)>,
     pub warmup_sender: tokio::sync::mpsc::Sender<(u64, String, Result<(), String>)>,
     pub pending_reset_cards:
-        tokio::sync::mpsc::Receiver<(String, Result<ConsumedResetCredit, String>)>,
-    pub reset_card_sender: tokio::sync::mpsc::Sender<(String, Result<ConsumedResetCredit, String>)>,
+        tokio::sync::mpsc::Receiver<(String, Result<ConsumedResetCredit, ResetCardFailure>)>,
+    pub reset_card_sender:
+        tokio::sync::mpsc::Sender<(String, Result<ConsumedResetCredit, ResetCardFailure>)>,
     /// Tracks in-flight warmup tasks: task_id → (alias, start_time).
     /// Each spawn gets a unique `warmup_next_id`; results are matched by ID
     /// so a late-arriving result from a timed-out task cannot clear a newer task.
@@ -926,7 +940,12 @@ impl App {
                     to_refresh.insert(alias);
                 }
                 Err(e) => {
-                    self.set_status_error(format!("Reset card failed ({alias}): {e}"), 7);
+                    if e.invalidate_cache
+                        && let Err(err) = cache::invalidate(&alias)
+                    {
+                        tracing::warn!("Failed to invalidate usage cache for {alias}: {err}");
+                    }
+                    self.set_status_error(e.message, 7);
                 }
             }
         }
@@ -1169,7 +1188,15 @@ impl App {
         tokio::spawn(async move {
             let result = crate::usage::consume_earliest_reset_credit(&alias_owned, &path)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|error| {
+                    let unknown = error.outcome_unknown_after_request();
+                    let message = if unknown {
+                        error.user_facing_unknown_message(&alias_owned)
+                    } else {
+                        format!("Reset card failed ({alias_owned}): {error}")
+                    };
+                    map_reset_card_failure(message, unknown)
+                });
             let _ = tx.send((alias_owned, result)).await;
         });
     }
@@ -1946,7 +1973,7 @@ fn char_to_byte(s: &str, char_pos: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountEntry, App, ModelStatus, UsageStatus};
+    use super::{AccountEntry, App, ModelStatus, UsageStatus, map_reset_card_failure};
     use crate::{
         jwt::{AccountInfo, OrgInfo},
         usage::{ResetCredit, UsageInfo},
@@ -2064,5 +2091,26 @@ mod tests {
         assert!(info.reset_card_expiries[0].contains("expires 2026-07-20"));
         assert!(!info.reset_card_expiries[0].contains("credit-secret-looking-id"));
         assert!(!info.organizations[0].contains("org-secret-looking-id"));
+    }
+
+    #[test]
+    fn unknown_reset_card_failure_uses_safe_message_and_invalidates_cache() {
+        let failure = map_reset_card_failure(
+            "account: reset-card consumption may have occurred; verify before retry".to_string(),
+            true,
+        );
+
+        assert!(failure.invalidate_cache);
+        assert!(failure.message.contains("account"));
+        assert!(failure.message.contains("consumption may have occurred"));
+        assert!(failure.message.contains("verify before retry"));
+    }
+
+    #[test]
+    fn definite_reset_card_failure_keeps_accurate_error_without_invalidation() {
+        let failure = map_reset_card_failure("HTTP 400".to_string(), false);
+
+        assert!(!failure.invalidate_cache);
+        assert_eq!(failure.message, "HTTP 400");
     }
 }

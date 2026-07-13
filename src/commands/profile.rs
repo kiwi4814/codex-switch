@@ -349,6 +349,8 @@ pub(crate) enum CardPolicy {
 pub(crate) struct RevivalHint {
     pub(crate) alias: String,
     pub(crate) card_count: u64,
+    pub(crate) consumed_unconfirmed: Option<&'static str>,
+    pub(crate) consumption_unknown_message: Option<String>,
 }
 
 pub(crate) struct SelectOutcome {
@@ -359,6 +361,15 @@ pub(crate) struct SelectOutcome {
 }
 
 pub(crate) fn revival_hint_message(hint: &RevivalHint) -> String {
+    if let Some(message) = &hint.consumption_unknown_message {
+        return message.clone();
+    }
+    if let Some(summary) = hint.consumed_unconfirmed {
+        return format!(
+            "{}: card was consumed, but account could not be confirmed revived ({summary})",
+            hint.alias
+        );
+    }
     format!(
         "{} holds {} reset card(s); rerun with --consume-card to revive",
         hint.alias, hint.card_count
@@ -563,6 +574,8 @@ pub(crate) async fn select_best_profile(
         return Ok(fallback(Some(RevivalHint {
             alias: target_alias,
             card_count,
+            consumed_unconfirmed: None,
+            consumption_unknown_message: None,
         })));
     }
 
@@ -573,7 +586,13 @@ pub(crate) async fn select_best_profile(
             if let Err(err) = cache::invalidate(&target_alias) {
                 tracing::warn!("Failed to invalidate usage cache for {target_alias}: {err}");
             }
-            match usage::fetch_usage_retried_force(&target_alias, &target_path, &current).await {
+            let failure_summary = match usage::fetch_usage_retried_force(
+                &target_alias,
+                &target_path,
+                &current,
+            )
+            .await
+            {
                 Ok(revived_usage) => {
                     let mut revived_candidate = usage::Candidate::from_usage(
                         target_alias.clone(),
@@ -599,13 +618,39 @@ pub(crate) async fn select_best_profile(
                     tracing::warn!(
                         "[{target_alias}] still exhausted after consuming a reset card; not consuming a second card"
                     );
+                    "quota remained exhausted after refresh"
                 }
-                Err(e) => tracing::warn!(
-                    "[{target_alias}] failed to refresh usage after consuming reset card: {e}"
-                ),
+                Err(e) => {
+                    tracing::warn!(
+                        "[{target_alias}] failed to refresh usage after consuming reset card: {e}"
+                    );
+                    "usage refresh failed"
+                }
+            };
+            return Ok(fallback(Some(RevivalHint {
+                alias: target_alias,
+                card_count,
+                consumed_unconfirmed: Some(failure_summary),
+                consumption_unknown_message: None,
+            })));
+        }
+        Err(e) => {
+            tracing::warn!("[{target_alias}] failed to consume reset card: {e}");
+            if e.outcome_unknown_after_request() {
+                if let Err(err) = cache::invalidate(&target_alias) {
+                    tracing::warn!("Failed to invalidate usage cache for {target_alias}: {err}");
+                }
+                let message = e.user_facing_unknown_message(&target_alias);
+                return Ok(fallback(Some(RevivalHint {
+                    alias: target_alias,
+                    card_count,
+                    consumed_unconfirmed: None,
+                    consumption_unknown_message: Some(message),
+                })));
+            } else {
+                debug_assert!(e.definitely_not_consumed());
             }
         }
-        Err(e) => tracing::warn!("[{target_alias}] failed to consume reset card: {e}"),
     }
 
     Ok(fallback(None))
@@ -793,6 +838,8 @@ mod revival_target_tests {
         let hint = RevivalHint {
             alias: "acct-b".to_string(),
             card_count: 3,
+            consumed_unconfirmed: None,
+            consumption_unknown_message: None,
         };
         let msg = revival_hint_message(&hint);
         assert!(msg.contains("acct-b"));

@@ -1,123 +1,145 @@
-# Release 流程
+# Release process
 
-日常质量门由 `.github/workflows/ci.yml` 驱动：`dev` 分支 push，以及目标为 `dev` / `master` 的 pull request，都会在 Linux、macOS、Windows 上执行测试、Clippy 和构建；Linux 质量 job 另外执行 fmt、`cargo audit` 与安装脚本语法检查。发布构建由 `.github/workflows/release.yml` 驱动，只监听 tag 事件 `v*` 与 `dev`。
+The daily quality gate is defined by `.github/workflows/ci.yml`. Pushes to `dev` and pull requests targeting `dev` or `master` run tests, Clippy, and a build on Linux, macOS, and Windows. The Linux quality job also runs formatting, `cargo audit`, and installer syntax checks. Release builds are defined by `.github/workflows/release.yml` and run only for `v*` and `dev` tag events.
 
-本文面向项目维护者。普通用户请使用 README 中的安装与更新命令，不需要操作 Git tag。
+This document is for maintainers. Users should follow the installation and update instructions in the README and do not need to manage Git tags.
 
-## 发布资格
+## Release eligibility
 
-开始推送前必须同时满足：
+All of the following must be true before any release push:
 
-- 当前分支为本地 `dev`，工作树干净，且本次变更已提交
-- `Cargo.toml` 是目标基础版本，`docs/CHANGELOG.md` 顶部存在对应的 Unreleased 条目
-- 独立代码审查无 CRITICAL/HIGH，认证、更新或用户数据变更还需通过安全审查
-- 本地质量门和真实 CLI 冒烟通过
-- 已明确获得 `git push` 授权，并记录待推送 commit
+- The local branch is `dev`, the worktree is clean, and all intended changes are committed.
+- `Cargo.toml` contains the target base version and the top of `docs/CHANGELOG.md` contains the matching release section. Ordinary dev builds may keep it Unreleased; the final dev candidate must carry the intended stable date so promotion requires no edit.
+- Independent code review has no CRITICAL or HIGH findings. Authentication, update, or user-data changes also require security review.
+- The local quality gate and a real CLI smoke test pass.
+- `git push` has explicit authorization and the commit to publish is recorded.
 
-`dev` 发布分两道门：先推分支并等待三平台 CI 全绿，再移动 `dev` tag 触发 Release。分支 CI 未通过时禁止移动 tag。
+A development release has two gates: push the branch and wait for all three CI hosts to pass, then move the `dev` tag to trigger the Release workflow. Never move the tag while branch CI is failing.
 
-## 版本号策略
+The final development release before a stable release has an additional acceptance gate:
 
-基础版本采用兼容 SemVer 的 `YYYYMMDD.V.0`：
+- Finish code, tests, changelog, README, and repository-backed Wiki sources before publishing the final `dev` build.
+- Record the exact commit SHA and ask the maintainer to test that build.
+- After acceptance, make no code, documentation, formatting, lockfile, or metadata changes.
+- Fast-forward `master` to that exact commit and create the stable tag on the same commit.
+- If any change is needed, publish and test a new `dev` build; the previous acceptance no longer qualifies.
 
-- `YYYYMMDD` 是发布日期，例如 2026-07-12 为 `20260712`
-- `V` 是当天发布序号，从 `1` 开始；同日第二版为 `20260712.2.0`
-- 最后一段固定为 `0`，因为 Cargo/SemVer 要求 `major.minor.patch` 三段；不要使用无效的两段式 `20260712.1`
-- 日期必须按 `YYYYMMDD` 排列，不能使用会破坏时间排序的 `YYYYDDMM`
-- 从旧的 `0.0.x` 迁移是正常升级；迁移后不要再发布更小的 `0.x` 版本，否则 self-update 会将其视为降级
+Publishing the separate GitHub Wiki repository after the stable release does not change the accepted source commit. Its reviewed source must already match `docs/wiki/` in that commit.
 
-| 推送的 tag | CI 输出版本号 | GitHub Release 名 | self-update 通道 | 触发 homebrew |
+## Version policy
+
+Base versions use the SemVer-compatible `YYYYMMDD.V.0` format:
+
+- `YYYYMMDD` is the release date; 2026-07-12 becomes `20260712`.
+- `V` is the release sequence for that date, starting at `1`; the second release that day is `20260712.2.0`.
+- The final component is always `0` because Cargo and SemVer require `major.minor.patch`. Do not use the invalid two-component form `20260712.1`.
+- Keep the date in `YYYYMMDD` order; `YYYYDDMM` breaks chronological sorting.
+- Migrating from `0.0.x` to the calendar version is an upgrade. Never publish a smaller `0.x` version afterward because self-update will treat it as a downgrade.
+
+| Pushed tag | Version produced by CI | GitHub Release name | Self-update channel | Homebrew |
 |---|---|---|---|---|
-| `dev`（rolling，每次覆盖） | `YYYYMMDD.V.0-dev` | `dev` | `--dev` | 否 |
-| `vYYYYMMDD.V.0-<suffix>`（永久 prerelease） | `YYYYMMDD.V.0-<suffix>` | 同 tag | 拿不到（客户端硬编码 tag=`dev`） | 否 |
-| `vYYYYMMDD.V.0`（stable） | `YYYYMMDD.V.0` | 同 tag | 默认通道 | 是 |
+| `dev` (rolling, overwritten) | `YYYYMMDD.V.0-dev` | `dev` | `--dev` | No |
+| `vYYYYMMDD.V.0-<suffix>` (permanent prerelease) | `YYYYMMDD.V.0-<suffix>` | Same as tag | Unavailable to the hardcoded `dev` channel | No |
+| `vYYYYMMDD.V.0` (stable) | `YYYYMMDD.V.0` | Same as tag | Default channel | Yes |
 
-> Cargo.toml `version` 字段不带 `-dev` 后缀，由 CI 在 inject 步骤统一加。
+> The `version` field in `Cargo.toml` never includes `-dev`; CI adds it during version injection.
+> The final dev and stable builds come from the same commit. The Release workflow adds `-dev` for the rolling `dev` tag and leaves the manifest base unchanged for the stable tag; this version display difference does not require a source edit.
 >
-> 客户端 `src/update.rs` 的 `--dev` 通道 `fetch_release(Some("dev"))` 是写死的 tag=`dev`，所以"独立 prerelease tag"对 self-update 不可见。
+> The `--dev` path in `src/update.rs` calls `fetch_release(Some("dev"))`, so self-update cannot discover an independently named prerelease tag.
 
-## ⚠ `dev` 是分支也是 tag（refname 歧义）
+## ⚠ `dev` is both a branch and a tag
 
-本仓库 `dev` 同时是开发分支与 rolling tag。**所有 push/delete/lookup 必须使用完整 refspec**，否则报：
+This repository uses `dev` as both the development branch and the rolling release tag. **Use full refspecs for every push, delete, and lookup** or Git can report:
 
 ```
 error: src refspec dev matches more than one
 ```
 
-或意外推到错误的目标。
+or operate on the wrong ref.
 
-## 发布 dev 测试版（标准流程）
+## Publish a development release
 
-前置：`dev` 分支已合入待发布的所有 commit；本地工作树干净。
+Prerequisite: `dev` contains every intended commit and the local worktree is clean.
 
 ```bash
-# 1) 跑本地质量门（本地预检，不作为发布产物依据）
+# 1) Run the local gate. This is a preflight, not the source of release artifacts.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all
 cargo audit
 bash -n scripts/install.sh
 
-# 2) 推送 dev 分支到远端（必须完整 refspec）
+# 2) Push the dev branch with a full refspec.
 git push origin refs/heads/dev:refs/heads/dev
 
-# 3) 等待 dev 分支 CI 全绿，并确认远端分支指向本次 commit
+# 3) Wait for branch CI and confirm the remote branch points to this commit.
 gh run list --branch dev --workflow CI --limit 1
 git rev-parse refs/remotes/origin/dev
 
-# 4) 删除远端旧 dev tag（指向旧 commit，需要先删才能"移动"）
+# 4) Delete the old remote dev tag before moving it.
 git push origin :refs/tags/dev
 
-# 5) 在本地把 dev tag 重打到 HEAD
+# 5) Recreate the local dev tag at HEAD.
 git tag -d dev && git tag dev
 
-# 6) 推送新 dev tag —— 触发 CI 构建 6 平台二进制 + 覆盖 GitHub Release `dev`
+# 6) Push the tag to build six targets and replace the dev GitHub Release.
 git push origin refs/tags/dev:refs/tags/dev
 ```
 
-> 第 6 步**不能写 `git push origin dev`**：歧义错误（分支 + tag 同名）。必须用 `refs/tags/dev:refs/tags/dev`。
+> Step 6 **must not use `git push origin dev`** because the branch and tag names are ambiguous. Use `refs/tags/dev:refs/tags/dev`.
 >
-> 第 2 步同理：必须 `refs/heads/dev:refs/heads/dev`。
+> Step 2 likewise requires `refs/heads/dev:refs/heads/dev`.
 
-发布产物以 GitHub Actions `Release` workflow 构建为准，不用本地 `target/release` 作为发布依据。Release job 会先逐个验证归档对应的 `.sha256`，校验失败不会创建 GitHub Release。CI 完成后产物：
-- Linux / macOS：`cs-{linux,darwin}-{amd64,arm64}.tar.gz` + `.sha256`
-- Windows：`cs-windows-{amd64,arm64}.zip` + `.sha256`
+GitHub Actions Release builds are the only distribution source of truth; do not publish from local `target/release`. The Release job verifies every archive against its `.sha256` before creating a GitHub Release. Artifacts are:
+
+- Linux / macOS: `.tar.gz` archives named `cs-{linux,darwin}-{amd64,arm64}.tar.gz` plus `.sha256`
+- Windows: `.zip` archives named `cs-windows-{amd64,arm64}.zip` plus `.sha256`
 - `install.sh` / `install.ps1`
-- 用户侧：`codex-switch self-update --dev` 立即可拉取
+- User update path: `codex-switch self-update --dev`
 
-发布后复测至少确认：
-- GitHub Actions `Release` run 成功，6 平台 build 和 release job 通过
-- 从 GitHub Release 下载对应平台 `.tar.gz` 或 `.zip` 与 `.sha256`，校验 SHA256
-- 解包后的 release 产物 `codex-switch --version` 输出 CI 注入版本
-- 原触发路径可用，例如 `codex-switch self-update --check --dev`
+Post-release verification must confirm at least:
 
-## 发布 stable
+- The GitHub Actions Release run succeeds, including all six builds and the release job.
+- A platform archive downloaded from GitHub Releases matches its `.sha256`.
+- The unpacked release binary reports the CI-injected version with `codex-switch --version`.
+- The original release path works, for example `codex-switch self-update --check --dev`.
+
+## Publish a stable release
+
+Do not run these commands until the maintainer has explicitly accepted the final `dev` build. First verify that the tested development tag, `dev`, and the local `dev` branch all resolve to the same commit.
 
 ```bash
-# 1) 在 dev 分支充分验证后，合并到 master
+# 1) Record and compare the accepted commit before changing master.
+git rev-parse refs/heads/dev
+git rev-parse refs/tags/dev
+
+# 2) After explicit user acceptance, fast-forward master without edits.
 git checkout master && git merge --ff-only dev && git push origin master
 
-# 2) 在 master 上打版本 tag（示例：2026-07-12 当天首版）
+# 3) Tag that exact commit. This example is the first release on 2026-07-12.
 git tag v20260712.1.0
 git push origin refs/tags/v20260712.1.0:refs/tags/v20260712.1.0
 
-# 3) CI 会自动：构建 6 平台 + 创建对应 GitHub Release + 触发 homebrew job
+# 4) CI builds six targets, creates the GitHub Release, and runs the Homebrew job.
 ```
 
-发布前别忘了：
-- 先运行 `date` 获取本机真实日期，再把 `Cargo.toml` bump 到当天的 `YYYYMMDD.V.0`
-- `docs/CHANGELOG.md` 顶部新增对应的 `## vYYYYMMDD.V.0 — YYYY-MM-DD` 段
+After tagging, confirm `refs/heads/master`, `refs/tags/dev`, and the stable tag still point to the accepted SHA. A mismatch is a release blocker.
 
-## 排错
+Before release:
+
+- Run `date` to obtain the real local date, then bump `Cargo.toml` to that day's `YYYYMMDD.V.0`.
+- Add the matching `## vYYYYMMDD.V.0 — YYYY-MM-DD` section at the top of `docs/CHANGELOG.md`.
+
+## Troubleshooting
 
 **`error: src refspec dev matches more than one`**
-完整 refspec：`refs/heads/dev:refs/heads/dev`（分支） / `refs/tags/dev:refs/tags/dev`（tag）。
+Use `refs/heads/dev:refs/heads/dev` for the branch or `refs/tags/dev:refs/tags/dev` for the tag.
 
-**dev tag 推上去但 CI 没跑**
-检查 GitHub Actions 页面有没有 `Release` workflow 触发；workflow 文件 `on.push.tags` 是否仍包含 `"dev"`。
+**The dev tag was pushed but CI did not run**
+Check whether the Release workflow was triggered and whether `on.push.tags` still includes `"dev"`.
 
-**`self-update --dev` 取不到新版**
-GitHub Release 名必须是字面 `dev`（小写）。如果误推成 `v0.0.15-dev` 这类带 `v` 前缀的独立 tag，会创建独立 prerelease，客户端通道看不到。
+**`self-update --dev` cannot find the new build**
+The GitHub Release tag must be the lowercase literal `dev`. A separate tag such as `v20260712.1.0-dev` creates an independent prerelease that the client channel cannot see.
 
-**Cargo.toml 版本号该带 `-dev` 吗？**
-不带。CI 的 dev 路径会自动追加 `-dev`，本地 `Cargo.toml` 始终保持 `YYYYMMDD.V.0` 干净版本号。同一天再次发布前必须递增 `V`，否则客户端会把相同版本判定为已是最新。
+**Should the Cargo.toml version contain `-dev`?**
+No. CI appends `-dev`; the local manifest keeps the clean `YYYYMMDD.V.0` base. Increment `V` before another release on the same date or clients will treat it as the version they already have.

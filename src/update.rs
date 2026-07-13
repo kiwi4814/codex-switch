@@ -686,6 +686,22 @@ mod tests {
     }
 
     #[test]
+    fn calendar_stable_release_upgrades_every_supported_legacy_version_family() {
+        let stable = "20260713.1.0";
+        for current in [
+            "0.0.21",
+            "0.0.22-dev.20260711000000",
+            "20260712.1.0-dev.20260712000000",
+            "20260712.2.0-dev",
+        ] {
+            assert!(
+                is_newer_version(stable, current),
+                "{current} must be able to graduate to stable {stable}"
+            );
+        }
+    }
+
+    #[test]
     fn release_api_url_uses_latest_or_tag_endpoint() {
         assert_eq!(
             release_api_url(None),

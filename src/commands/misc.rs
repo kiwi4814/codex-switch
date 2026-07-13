@@ -30,7 +30,16 @@ pub(crate) async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result
         }
     }
 
-    let result = usage::consume_earliest_reset_credit(alias, &path).await?;
+    let result = match usage::consume_earliest_reset_credit(alias, &path).await {
+        Ok(result) => result,
+        Err(error) if error.outcome_unknown_after_request() => {
+            if let Err(err) = cache::invalidate(alias) {
+                tracing::warn!("Failed to invalidate usage cache for {alias}: {err}");
+            }
+            anyhow::bail!(error.user_facing_unknown_message(alias));
+        }
+        Err(error) => return Err(error.into()),
+    };
     if let Err(err) = cache::invalidate(alias) {
         tracing::warn!("Failed to invalidate usage cache for {alias}: {err}");
     }

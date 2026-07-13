@@ -24,11 +24,33 @@ struct LogState {
 
 pub(crate) fn file_log_writer() -> Result<FileLogWriter> {
     let dir = crate::auth::app_home()?.join("logs");
-    fs::create_dir_all(&dir)
+    create_private_log_dir(&dir)
         .with_context(|| format!("creating log directory {}", dir.display()))?;
     Ok(FileLogWriter {
         state: Arc::new(Mutex::new(LogState { dir })),
     })
+}
+
+fn create_private_log_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
+#[cfg(unix)]
+fn tighten_file_permissions(file: &fs::File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))
 }
 
 impl<'a> MakeWriter<'a> for FileLogWriter {
@@ -66,19 +88,35 @@ impl Write for LogFile {
 }
 
 fn append_log(dir: &Path, today: NaiveDate, bytes: &[u8]) -> io::Result<()> {
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join(".lock"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let mut lock_options = OpenOptions::new();
+    lock_options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        lock_options.mode(0o600);
+    }
+    let lock = lock_options.open(dir.join(".lock"))?;
+    #[cfg(unix)]
+    tighten_file_permissions(&lock)?;
     FileExt::lock(&lock)?;
     let result = (|| {
         prune_log_files(dir, today)?;
         enforce_log_size_limit(dir, today, bytes.len() as u64)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path(dir, today))?;
+        let mut log_options = OpenOptions::new();
+        log_options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            log_options.mode(0o600);
+        }
+        let mut file = log_options.open(log_path(dir, today))?;
+        #[cfg(unix)]
+        tighten_file_permissions(&file)?;
         file.write_all(bytes)
     })();
     FileExt::unlock(&lock)?;
@@ -207,5 +245,36 @@ mod tests {
         append_log(dir.path(), today, b"next event").unwrap();
 
         assert!(fs::metadata(log_path(dir.path(), today)).unwrap().len() <= MAX_LOG_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_log_tightens_directory_lock_and_log_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
+        let lock_path = dir.path().join(".lock");
+        let current_log = log_path(dir.path(), today);
+        fs::File::create(&lock_path).unwrap();
+        fs::File::create(&current_log).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o666)).unwrap();
+        fs::set_permissions(&current_log, fs::Permissions::from_mode(0o666)).unwrap();
+
+        append_log(dir.path(), today, b"private event").unwrap();
+
+        assert_eq!(
+            fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(current_log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

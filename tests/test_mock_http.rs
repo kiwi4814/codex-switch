@@ -395,6 +395,9 @@ async fn http_reset_card_consume_uses_earliest_expiry() {
 // ── reset-card-aware auto-switching (spawned binary, end-to-end) ──
 
 mod revival {
+    use axum::Router;
+    use axum::http::StatusCode;
+    use axum::routing::post;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output, Stdio};
@@ -551,6 +554,14 @@ mod revival {
     /// instead of hanging or reaching a real host.
     const UNROUTABLE_URL: &str = "http://127.0.0.1:1/unused";
 
+    async fn invalid_consume_url() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route("/consume", post(|| async { (StatusCode::OK, "not-json") }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/consume"), server)
+    }
+
     /// Contract 5: an eligible top candidate short-circuits card logic
     /// entirely -- the consume endpoint must never be reached, even though
     /// another account in the pool holds a reset card.
@@ -696,12 +707,230 @@ mod revival {
         // Still exhausted -> falls back to the (only, still-exhausted) scored
         // candidate rather than erroring out.
         assert_eq!(json["switched_to"], "card_holder");
+        let hint = json["hint"]
+            .as_str()
+            .expect("consumed card must be reported");
+        assert!(hint.contains("card_holder"), "{hint}");
+        assert!(hint.contains("card was consumed"), "{hint}");
+        assert!(hint.contains("could not be confirmed revived"), "{hint}");
+
+        server.shutdown();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contract7_human_output_reports_consumed_but_unconfirmed_card() {
+        let home = temp_home("contract7-human");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+        let entries = vec![(
+            "tok_card_holder".to_string(),
+            vec![mock::transformer::base_response(
+                "plus", 100.0, 1800, 50.0, 604800,
+            )],
+        )];
+        let server = mock::MockServer::start(entries).await;
+
+        let output = run_with_env(
+            &home,
+            &["use", "--consume-card"],
+            &[
+                ("CS_USAGE_URL", &server.usage_url()),
+                ("CS_RESET_CREDITS_URL", &server.reset_credits_url()),
+            ],
+        );
+
         assert!(
-            json.get("hint").is_none(),
-            "contract 7 warns via logs, not a user hint: {json}"
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("card_holder"), "{stdout}");
+        assert!(stdout.contains("card was consumed"), "{stdout}");
+        assert!(
+            stdout.contains("could not be confirmed revived"),
+            "{stdout}"
         );
 
         server.shutdown();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn consume_unknown_json_output_warns_to_verify_before_retry() {
+        let home = temp_home("consume-unknown-json");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+        let entries = vec![(
+            "tok_card_holder".to_string(),
+            vec![mock::transformer::base_response(
+                "plus", 100.0, 1800, 50.0, 604800,
+            )],
+        )];
+        let usage_server = mock::MockServer::start(entries).await;
+        let (consume_url, consume_server) = invalid_consume_url().await;
+
+        let output = run_with_env(
+            &home,
+            &["--json", "use", "--consume-card"],
+            &[
+                ("CS_USAGE_URL", &usage_server.usage_url()),
+                ("CS_RESET_CREDITS_URL", &usage_server.reset_credits_url()),
+                ("CS_RESET_CREDITS_CONSUME_URL", &consume_url),
+            ],
+        );
+
+        assert!(output.status.success());
+        let json = parse_stdout_json(&output);
+        let hint = json["hint"]
+            .as_str()
+            .expect("unknown outcome must be visible");
+        assert!(hint.contains("card_holder"), "{hint}");
+        assert!(hint.contains("consumption may have occurred"), "{hint}");
+        assert!(hint.contains("verify before retry"), "{hint}");
+
+        consume_server.abort();
+        usage_server.shutdown();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn consume_unknown_human_output_warns_to_verify_before_retry() {
+        let home = temp_home("consume-unknown-human");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+        let entries = vec![(
+            "tok_card_holder".to_string(),
+            vec![mock::transformer::base_response(
+                "plus", 100.0, 1800, 50.0, 604800,
+            )],
+        )];
+        let usage_server = mock::MockServer::start(entries).await;
+        let (consume_url, consume_server) = invalid_consume_url().await;
+
+        let output = run_with_env(
+            &home,
+            &["use", "--consume-card"],
+            &[
+                ("CS_USAGE_URL", &usage_server.usage_url()),
+                ("CS_RESET_CREDITS_URL", &usage_server.reset_credits_url()),
+                ("CS_RESET_CREDITS_CONSUME_URL", &consume_url),
+            ],
+        );
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("card_holder"), "{stdout}");
+        assert!(stdout.contains("consumption may have occurred"), "{stdout}");
+        assert!(stdout.contains("verify before retry"), "{stdout}");
+
+        consume_server.abort();
+        usage_server.shutdown();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explicit_reset_card_unknown_json_warns_to_verify_before_retry() {
+        let home = temp_home("explicit-reset-unknown-json");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+        let entries = vec![(
+            "tok_card_holder".to_string(),
+            vec![mock::transformer::base_response(
+                "plus", 100.0, 1800, 50.0, 604800,
+            )],
+        )];
+        let usage_server = mock::MockServer::start(entries).await;
+        let (consume_url, consume_server) = invalid_consume_url().await;
+
+        let output = run_with_env(
+            &home,
+            &["--json", "reset-card", "card_holder", "--yes"],
+            &[
+                ("CS_USAGE_URL", &usage_server.usage_url()),
+                ("CS_RESET_CREDITS_URL", &usage_server.reset_credits_url()),
+                ("CS_RESET_CREDITS_CONSUME_URL", &consume_url),
+            ],
+        );
+
+        assert!(!output.status.success());
+        let json = parse_stdout_json(&output);
+        let message = json["error"].as_str().expect("JSON error must be present");
+        assert!(message.contains("card_holder"), "{message}");
+        assert!(
+            message.contains("consumption may have occurred"),
+            "{message}"
+        );
+        assert!(message.contains("verify before retry"), "{message}");
+
+        consume_server.abort();
+        usage_server.shutdown();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explicit_reset_card_unknown_human_warns_to_verify_before_retry() {
+        let home = temp_home("explicit-reset-unknown-human");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+        let entries = vec![(
+            "tok_card_holder".to_string(),
+            vec![mock::transformer::base_response(
+                "plus", 100.0, 1800, 50.0, 604800,
+            )],
+        )];
+        let usage_server = mock::MockServer::start(entries).await;
+        let (consume_url, consume_server) = invalid_consume_url().await;
+
+        let output = run_with_env(
+            &home,
+            &["reset-card", "card_holder", "--yes"],
+            &[
+                ("CS_USAGE_URL", &usage_server.usage_url()),
+                ("CS_RESET_CREDITS_URL", &usage_server.reset_credits_url()),
+                ("CS_RESET_CREDITS_CONSUME_URL", &consume_url),
+            ],
+        );
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("card_holder"), "{stderr}");
+        assert!(stderr.contains("consumption may have occurred"), "{stderr}");
+        assert!(stderr.contains("verify before retry"), "{stderr}");
+
+        consume_server.abort();
+        usage_server.shutdown();
         let _ = fs::remove_dir_all(home);
     }
 

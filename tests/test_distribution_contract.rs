@@ -179,6 +179,17 @@ fn self_update_help_limits_automatic_checks_to_tui_startup() {
 }
 
 #[test]
+fn plain_self_update_keeps_dev_installs_on_the_dev_channel() {
+    let command = repo_file("src/commands/update.rs");
+
+    assert!(command.contains("update::is_dev_version(update::current_version())"));
+    assert!(command.contains("update::check_for_dev_update().await?"));
+    assert!(command.contains("update::self_update_dev(show_progress).await"));
+    assert!(command.contains("else if stable || version.is_some()"));
+    assert_before(&command, "if dev", "else if stable || version.is_some()");
+}
+
+#[test]
 fn release_docs_describe_platform_specific_archive_formats() {
     let release = repo_file("docs/RELEASE.md");
 
@@ -200,7 +211,7 @@ fn release_docs_describe_platform_specific_archive_formats() {
 fn changelog_tracks_the_calendar_version_development_cycle() {
     let changelog = repo_file("docs/CHANGELOG.md");
     assert!(
-        changelog.contains("## v20260712.2.0 — Unreleased"),
-        "the active calendar-version development cycle must be tracked before release"
+        changelog.contains("## v20260713.1.0 — 2026-07-13"),
+        "the final dev candidate must carry the stable release heading before zero-drift acceptance"
     );
 }
