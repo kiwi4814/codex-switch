@@ -111,6 +111,14 @@ codex-switch self-update --dev
 
 Downloaded archives are checked against the `.sha256` file in the same GitHub Release. This detects corruption, but it is not an independent signature: GitHub Releases over TLS remains the trust anchor. Homebrew installations must be updated with Homebrew.
 
+Direct-install ownership is platform-specific:
+
+- macOS and Linux default to `$HOME/.local/bin`; the installer manages a removable PATH block for zsh, bash, and fish, and prints manual guidance for other shells. `--system` explicitly selects `/usr/local/bin` and may require `sudo` for future updates.
+- Windows installs under `%LOCALAPPDATA%\Programs\codex-switch` and updates the user PATH. Installing the optional Task Scheduler daemon remains a separate administrator-level action.
+- Homebrew owns its Cellar binary and must remain Homebrew-managed.
+
+Before downloading an archive, self-update verifies that it can create a replacement in the current executable's directory. Legacy Unix installs in `/usr/local/bin` can be migrated by rerunning the installer; the installer installs the user-owned copy before removing the legacy binary with one elevated operation.
+
 Existing stable versions `0.0.3` through `0.0.21` can upgrade directly with `self-update`. A development build can move to stable with `self-update --stable`. Versions `0.0.1` and `0.0.2` should rerun the installer because their updater predates this migration path. The move to calendar versions preserves profiles and configuration; it is not a reset or downgrade.
 
 ## Automate safely

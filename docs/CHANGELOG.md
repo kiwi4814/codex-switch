@@ -1,8 +1,8 @@
 # Changelog
 
-## v20260713.1.0 — 2026-07-13
+## v20260713.2.0 — 2026-07-13
 
-- **Dev update compatibility** — Bumped the rolling dev base to `20260713.1.0` so clients already on legacy timestamped or short `20260712.*-dev` builds can upgrade to `20260713.1.0-dev`.
+- **Dev update compatibility** — Bumped the rolling dev base to `20260713.2.0` so clients on `20260713.1.0-dev` and earlier development builds can receive the corrected release candidate.
 
 ### Added
 
@@ -21,6 +21,7 @@
 
 ### Changed
 
+- **User-owned direct installation** — macOS and Linux now install to `$HOME/.local/bin` by default and configure the user's shell PATH; Windows keeps its existing `%LOCALAPPDATA%` installation. Unix administrators can explicitly select `/usr/local/bin` with `--system`, while Homebrew remains package-manager owned.
 - **Calendar versioning** — Release bases now use SemVer-compatible `YYYYMMDD.V.0` values, starting with `20260712.1.0`; `V` starts at 1 each day and increments for additional same-day releases. Existing `0.0.x` stable and dev builds remain directly upgradable because the calendar version sorts higher under SemVer.
 - **Short dev versions** — Rolling dev releases now use `YYYYMMDD.V.0-dev` without an appended timestamp. Additional same-day releases must increment `V` before publishing.
 - **Codex 0.144.1 authentication alignment** — Browser and device login follow the current Codex callback and polling contracts, refresh responses preserve omitted tokens, managed authentication policy is enforced, custom CA settings are honored, and `CODEX_HOME` uses the same empty-value fallback as Codex.
@@ -34,6 +35,8 @@
 
 ### Fixed
 
+- **Accurate model-pool pace windows** — Additional quota pools that expose a single seven-day window are normalized to the 7d slot, and the TUI derives both its label and pace duration from the API window instead of assuming every primary slot is 5h.
+- **Legacy direct-install updates** — The Unix installer migrates old `/usr/local/bin` direct installs without leaving a shadowing binary, and self-update now reports an unwritable install directory before downloading the release archive.
 - **Warmup deprecated-model fallback** — Warmup no longer substitutes the removed hardcoded `gpt-5.3-codex` model when the official models endpoint is unavailable. Model discovery retries transient network/5xx/429 failures three times, then reports the real discovery error instead of issuing a guaranteed-invalid request; the 400 refresh path follows the same rule.
 - **Cross-process auth transactions** — Switch, launch staging/restoration, refresh, warmup, re-login, import, rename, and delete paths serialize through stable OS file locks. Lock timeout reports the holder without unlinking a live lock, launch does not hold the auth write lock while the Codex child runs, and refreshed tokens cannot be written into another account after a concurrent switch.
 - **Cross-process cache writes** — Cache read/modify/write operations now use an OS file lock and unique temporary files; auth, current-profile, and cache replacements use a cross-platform atomic replace path that can overwrite existing files on Windows.

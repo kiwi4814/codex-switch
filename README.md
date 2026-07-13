@@ -24,6 +24,8 @@ macOS / Linux:
 curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash
 ```
 
+The Unix installer uses `$HOME/.local/bin` by default and configures PATH for zsh, bash, and fish when needed; other shells receive a manual PATH instruction. Use `--system` only when an administrator intentionally wants `/usr/local/bin`; system installs may require `sudo` for later updates.
+
 Windows PowerShell:
 
 ```powershell
@@ -83,6 +85,8 @@ brew upgrade xjoker/tap/codex-switch
 ```
 
 Versions `0.0.1` and `0.0.2` should rerun the installer because their updater predates the supported migration path. Calendar-version releases are a normal upgrade from `0.0.x`; configuration and profiles remain in place.
+
+Older macOS/Linux direct installs in `/usr/local/bin` should rerun the current installer once. It installs the user-owned binary first, then asks for `sudo` once to remove the legacy binary so PATH cannot keep selecting the old copy. Profiles and configuration under `~/.codex-switch` are preserved.
 
 ## Documentation
 

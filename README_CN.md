@@ -18,6 +18,8 @@
 curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash
 ```
 
+默认安装到当前用户的 `~/.local/bin`；安装脚本会在需要时为 zsh、bash 和 fish 配置 PATH，其他 shell 会显示手动配置提示。只有管理员明确需要系统级安装时才使用 `bash -s -- --system`，此模式安装到 `/usr/local/bin`，后续更新可能仍需 `sudo`。
+
 **Windows PowerShell**
 
 ```powershell
@@ -101,6 +103,8 @@ $env:CS_DEV="1"; irm https://raw.githubusercontent.com/xjoker/codex-switch/maste
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash -s -- --uninstall
 ```
+
+旧版曾默认安装到 `/usr/local/bin`。重新运行当前安装脚本会先安装新的用户级二进制，再请求一次 `sudo` 删除旧二进制，避免 PATH 继续命中旧版本；账号、配置及缓存不会因此迁移或删除。
 
 **Windows（PowerShell）：**
 
@@ -246,6 +250,7 @@ codex-switch self-update --version 20260712.2.0
 ```
 
 - Homebrew 安装不会被程序自行覆盖，请使用 `brew upgrade xjoker/tap/codex-switch`
+- macOS/Linux 用户级直装会在下载 release 归档前检查当前安装目录是否可替换；若旧版位于 `/usr/local/bin`，请重新运行安装脚本完成一次迁移。显式 `--system` 安装仍可能需要 `sudo codex-switch self-update`
 - 直装版本会先校验 release 对应的 `.sha256`，再替换当前二进制。校验和与二进制同属一个 GitHub Release，因此只防下载损坏、不防 Release 本身被篡改；信任锚是 TLS 之上的 GitHub Releases，目前没有独立代码签名
 - 不带参数的 `self-update` 会保持当前二进制所属的通道；使用 `--dev` 或 `--stable` 显式切换通道
 - Homebrew 用户需先 `brew uninstall codex-switch` 才能使用 `--dev`

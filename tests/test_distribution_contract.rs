@@ -85,10 +85,52 @@ fn unix_installer_verifies_checksum_before_extracting() {
     assert!(script.contains("EXPECTED_SHA256"));
     assert!(script.contains("sha256sum") && script.contains("shasum -a 256"));
     assert_before(&script, "EXPECTED_SHA256", "tar xzf");
-    assert!(
-        script.contains("install -m 0755") && script.contains("sudo install -m 0755"),
-        "Unix installer must install with executable mode in both privilege paths"
+    for required in [
+        "USER_INSTALL_DIR=\"${HOME}/.local/bin\"",
+        "SYSTEM_INSTALL_DIR=\"/usr/local/bin\"",
+        "--system",
+        "LEGACY_BIN",
+        "install -m 0755",
+        "sudo install -m 0755",
+    ] {
+        assert!(
+            script.contains(required),
+            "Unix installer must contain `{required}`"
+        );
+    }
+}
+
+#[test]
+fn unix_installer_preserves_migration_and_path_lifecycle() {
+    let script = repo_file("scripts/install.sh");
+
+    for required in [
+        "*/fish)",
+        "PROFILE_FILE=\"${HOME}/.config/fish/config.fish\"",
+        "# >>> codex-switch PATH >>>",
+        "# <<< codex-switch PATH <<<",
+        "remove_managed_path_blocks",
+        "remove_path_block \"${HOME}/.zprofile\"",
+        "remove_path_block \"${HOME}/.bash_profile\"",
+        "remove_path_block \"${HOME}/.profile\"",
+        "remove_path_block \"${HOME}/.config/fish/config.fish\"",
+        "!seen_begin || !seen_end || inside",
+    ] {
+        assert!(
+            script.contains(required),
+            "Unix installer must contain `{required}`"
+        );
+    }
+
+    assert_before(&script, "tar xzf", "sudo -v");
+    assert_before(
+        &script,
+        "mkdir -p \"$INSTALL_DIR\"",
+        "sudo rm -f \"$LEGACY_BIN\"",
     );
+    assert!(script.contains(
+        "if [ \"$SYSTEM_INSTALL\" = false ]; then\n    remove_managed_path_blocks\n  fi"
+    ));
 }
 
 #[test]
@@ -102,6 +144,19 @@ fn windows_installer_verifies_checksum_before_extracting() {
     assert!(
         script.contains("Checksum mismatch"),
         "Windows installer must fail clearly on checksum mismatch"
+    );
+    assert!(script.contains("$env:LOCALAPPDATA"));
+    assert!(script.contains("SetEnvironmentVariable(\"Path\", $NewPath, \"User\")"));
+}
+
+#[test]
+fn self_update_checks_replace_permission_before_archive_download() {
+    let update = repo_file("src/update.rs");
+
+    assert_before(
+        &update,
+        "ensure_current_executable_replaceable()?",
+        "download_file(&client, &archive_asset.browser_download_url",
     );
 }
 
@@ -211,7 +266,7 @@ fn release_docs_describe_platform_specific_archive_formats() {
 fn changelog_tracks_the_calendar_version_development_cycle() {
     let changelog = repo_file("docs/CHANGELOG.md");
     assert!(
-        changelog.contains("## v20260713.1.0 — 2026-07-13"),
+        changelog.contains("## v20260713.2.0 — 2026-07-13"),
         "the final dev candidate must carry the stable release heading before zero-drift acceptance"
     );
 }

@@ -7,6 +7,8 @@ use crate::auth;
 use super::reset_credits::parse_reset_credits_summary;
 use super::{AdditionalRateLimit, UsageInfo, WindowUsage};
 
+const SECS_7D: i64 = 7 * 86_400;
+
 pub(super) fn parse_optional_u64(value: Option<&Value>) -> Option<u64> {
     match value? {
         Value::Number(n) => n.as_u64(),
@@ -54,6 +56,16 @@ fn parse_additional_rate_limits(body: &Value) -> Vec<AdditionalRateLimit> {
             .get("secondary_window")
             .filter(|v| !v.is_null())
             .and_then(parse_window);
+        let (primary, secondary) = if primary
+            .as_ref()
+            .and_then(|window| window.window_minutes)
+            .is_some_and(|minutes| minutes.saturating_mul(60) >= SECS_7D)
+            && secondary.is_none()
+        {
+            (None, primary)
+        } else {
+            (primary, secondary)
+        };
         Some(AdditionalRateLimit {
             limit_name: item
                 .get("limit_name")
@@ -130,8 +142,6 @@ pub(super) fn parse_usage_checked(body: &Value) -> Result<UsageInfo> {
 }
 
 pub fn parse_usage(body: &Value) -> UsageInfo {
-    const SECS_7D: i64 = 7 * 86400; // 604800
-
     let primary_raw = body
         .pointer("/rate_limit/primary_window")
         .filter(|v| !v.is_null());
@@ -610,6 +620,39 @@ mod tests {
         assert_eq!(
             extra.secondary.as_ref().and_then(|w| w.resets_at),
             Some(1784430414i64)
+        );
+    }
+
+    #[test]
+    fn test_parse_usage_remaps_additional_primary_only_seven_day_window() {
+        let body = serde_json::json!({
+            "rate_limit": {"primary_window": {"used_percent": 10.0}},
+            "additional_rate_limits": [{
+                "limit_name": "GPT-5.3-Codex-Spark",
+                "metered_feature": "codex_bengalfox",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 8.0,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1784430414i64
+                    },
+                    "secondary_window": null
+                }
+            }]
+        });
+
+        let usage = parse_usage(&body);
+        let spark = &usage.additional_limits[0];
+        assert!(
+            spark.primary.is_none(),
+            "a seven-day window is not a 5h primary window"
+        );
+        assert_eq!(
+            spark
+                .secondary
+                .as_ref()
+                .and_then(|window| window.window_minutes),
+            Some(10_080)
         );
     }
 

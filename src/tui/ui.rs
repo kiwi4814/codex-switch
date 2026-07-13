@@ -619,11 +619,13 @@ pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
         if let Some(window) = primary
             && y < area.bottom()
         {
+            let (label, window_secs) =
+                quota_window_display(window, "5h", crate::usage::WINDOW_5H_SECS);
             render_usage_gauge(
                 f,
                 window,
-                "5h",
-                crate::usage::WINDOW_5H_SECS,
+                &label,
+                window_secs,
                 now,
                 Rect {
                     x: area.x,
@@ -637,11 +639,13 @@ pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
         if let Some(window) = secondary
             && y < area.bottom()
         {
+            let (label, window_secs) =
+                quota_window_display(window, "7d", crate::usage::WINDOW_7D_SECS);
             render_usage_gauge(
                 f,
                 window,
-                "7d",
-                crate::usage::WINDOW_7D_SECS,
+                &label,
+                window_secs,
                 now,
                 Rect {
                     x: area.x,
@@ -675,6 +679,23 @@ pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
             pool.secondary.as_ref(),
             pool.allowed == Some(false) || pool.limit_reached == Some(true),
         );
+    }
+}
+
+fn quota_window_display(
+    window: &crate::usage::WindowUsage,
+    fallback_label: &str,
+    fallback_secs: i64,
+) -> (String, i64) {
+    match window.window_minutes {
+        Some(minutes) if minutes % 1_440 == 0 => {
+            (format!("{}d", minutes / 1_440), minutes.saturating_mul(60))
+        }
+        Some(minutes) if minutes % 60 == 0 => {
+            (format!("{}h", minutes / 60), minutes.saturating_mul(60))
+        }
+        Some(minutes) => (format!("{minutes}m"), minutes.saturating_mul(60)),
+        None => (fallback_label.to_string(), fallback_secs),
     }
 }
 
@@ -1119,11 +1140,25 @@ fn status_bar_height(app: &App, width: u16) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        C_BLUE, C_CYAN, C_GRAY, C_MAGENTA, C_RED, C_YELLOW, plan_color, status_message_color,
-        table_text_widths, usage_gauges_height,
+        C_BLUE, C_CYAN, C_GRAY, C_MAGENTA, C_RED, C_YELLOW, plan_color, render_usage_gauges,
+        status_message_color, table_text_widths, usage_gauges_height,
     };
     use crate::usage::{AdditionalRateLimit, UsageInfo, WindowUsage};
     use ratatui::style::Modifier;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn row_text(backend: &TestBackend, y: u16) -> String {
+        let area = backend.buffer().area;
+        (0..area.width)
+            .map(|x| {
+                backend
+                    .buffer()
+                    .cell((x, y))
+                    .expect("cell inside test buffer")
+                    .symbol()
+            })
+            .collect()
+    }
 
     #[test]
     fn status_message_color_distinguishes_errors_from_information() {
@@ -1152,6 +1187,41 @@ mod tests {
         };
 
         assert_eq!(usage_gauges_height(&usage), 11);
+    }
+
+    #[test]
+    fn additional_primary_slot_uses_its_real_seven_day_window_for_label_and_pace() {
+        let usage = UsageInfo {
+            additional_limits: vec![AdditionalRateLimit {
+                limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+                metered_feature: Some("codex_bengalfox".to_string()),
+                primary: Some(WindowUsage {
+                    used_percent: Some(8.0),
+                    resets_at: Some(crate::auth::now_unix_secs() + 6 * 24 * 60 * 60),
+                    window_minutes: Some(7 * 24 * 60),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let backend = TestBackend::new(100, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_usage_gauges(frame, &usage, frame.area()))
+            .unwrap();
+
+        let row = (0..10)
+            .map(|y| row_text(terminal.backend(), y))
+            .find(|line| line.contains("7d"))
+            .expect("the real seven-day window label must be rendered");
+        assert!(!row.contains("5h"));
+        let label_x = row.find("7d").unwrap();
+        let pace_x = row.find('|').expect("pace marker");
+        assert!(
+            pace_x > label_x + 6,
+            "seven-day pace must not be clamped to the start of the bar: {row}"
+        );
     }
 
     #[test]

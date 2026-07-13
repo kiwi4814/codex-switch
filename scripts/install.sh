@@ -5,28 +5,80 @@ set -euo pipefail
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --dev          # install latest dev build
+#   curl -fsSL .../install.sh | bash -s -- --system       # install system-wide (may require sudo)
 #   curl -fsSL .../install.sh | bash -s -- --uninstall    # uninstall codex-switch
 #   CS_VERSION=20260712.1.0 curl -fsSL .../install.sh | bash  # install specific version
 
 REPO="xjoker/codex-switch"
-INSTALL_DIR="/usr/local/bin"
+USER_INSTALL_DIR="${HOME}/.local/bin"
+SYSTEM_INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="codex-switch"
 DATA_DIR="${HOME}/.codex-switch"
+LEGACY_BIN="${SYSTEM_INSTALL_DIR}/${BINARY_NAME}"
+PATH_BLOCK_BEGIN="# >>> codex-switch PATH >>>"
+PATH_BLOCK_END="# <<< codex-switch PATH <<<"
 
 info()  { printf '\033[0;34m[info]\033[0m  %s\n' "$*"; }
 warn()  { printf '\033[0;33m[warn]\033[0m  %s\n' "$*" >&2; }
 error() { printf '\033[0;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
+remove_path_block() {
+  local profile_file="$1"
+  local tmp_file
+  [ -f "$profile_file" ] || return 0
+  grep -F "$PATH_BLOCK_BEGIN" "$profile_file" >/dev/null 2>&1 || return 0
+  tmp_file="$(mktemp)"
+  if ! awk -v begin="$PATH_BLOCK_BEGIN" -v end="$PATH_BLOCK_END" '
+    $0 == begin {
+      if (inside || seen_begin) invalid = 1
+      inside = 1
+      seen_begin = 1
+      next
+    }
+    $0 == end {
+      if (!inside || seen_end) invalid = 1
+      inside = 0
+      seen_end = 1
+      next
+    }
+    !inside { print }
+    END {
+      if (invalid || !seen_begin || !seen_end || inside) exit 1
+    }
+  ' "$profile_file" > "$tmp_file"; then
+    rm -f "$tmp_file"
+    error "Failed to remove codex-switch PATH block from ${profile_file}."
+  fi
+  cat "$tmp_file" > "$profile_file"
+  rm -f "$tmp_file"
+  info "Removed codex-switch PATH entry from ${profile_file}."
+}
+
+remove_managed_path_blocks() {
+  remove_path_block "${HOME}/.zprofile"
+  remove_path_block "${HOME}/.bash_profile"
+  remove_path_block "${HOME}/.profile"
+  remove_path_block "${HOME}/.config/fish/config.fish"
+}
+
 # Parse arguments
 USE_DEV=false
 UNINSTALL=false
+SYSTEM_INSTALL=false
 for arg in "$@"; do
   case "$arg" in
     --dev)       USE_DEV=true ;;
     --uninstall) UNINSTALL=true ;;
+    --system)    SYSTEM_INSTALL=true ;;
     *)           error "Unknown argument: $arg" ;;
   esac
 done
+
+if [ "$SYSTEM_INSTALL" = true ]; then
+  INSTALL_DIR="$SYSTEM_INSTALL_DIR"
+else
+  INSTALL_DIR="$USER_INSTALL_DIR"
+fi
 
 # ── Uninstall ────────────────────────────────────────────
 if [ "$UNINSTALL" = true ]; then
@@ -36,6 +88,8 @@ if [ "$UNINSTALL" = true ]; then
   DAEMON_BIN="$(command -v codex-switch 2>/dev/null || true)"
   if [ -z "$DAEMON_BIN" ] && [ -x "${INSTALL_DIR}/${BINARY_NAME}" ]; then
     DAEMON_BIN="${INSTALL_DIR}/${BINARY_NAME}"
+  elif [ -z "$DAEMON_BIN" ] && [ "$SYSTEM_INSTALL" = false ] && [ -x "$LEGACY_BIN" ]; then
+    DAEMON_BIN="$LEGACY_BIN"
   fi
   if [ -n "$DAEMON_BIN" ]; then
     if "$DAEMON_BIN" daemon uninstall; then
@@ -96,8 +150,18 @@ if [ "$UNINSTALL" = true ]; then
   # Remove direct-install binary (skip if we just removed the Homebrew package)
   if [ "${BREW_REMOVED:-false}" != true ]; then
     BIN_PATH="${INSTALL_DIR}/${BINARY_NAME}"
+    if [ "$SYSTEM_INSTALL" = false ] && [ ! -f "$BIN_PATH" ] && [ -f "$LEGACY_BIN" ]; then
+      BIN_PATH="$LEGACY_BIN"
+    fi
     if [ -f "$BIN_PATH" ]; then
-      if [ -w "$INSTALL_DIR" ]; then
+      BIN_RESOLVED="$(readlink -f "$BIN_PATH" 2>/dev/null || realpath "$BIN_PATH" 2>/dev/null || echo "$BIN_PATH")"
+      case "$BIN_RESOLVED" in
+        */Cellar/codex-switch/*|*/Homebrew/*)
+          error "${BIN_PATH} is managed by Homebrew. Run 'brew uninstall codex-switch' instead."
+          ;;
+      esac
+      BIN_DIR="${BIN_PATH%/*}"
+      if [ -w "$BIN_DIR" ]; then
         rm -f "$BIN_PATH"
       else
         info "Removing ${BIN_PATH} (requires sudo)"
@@ -105,6 +169,10 @@ if [ "$UNINSTALL" = true ]; then
       fi
       info "Removed ${BIN_PATH}"
     fi
+  fi
+
+  if [ "$SYSTEM_INSTALL" = false ]; then
+    remove_managed_path_blocks
   fi
 
   # Remove data directory
@@ -151,6 +219,29 @@ if [ -n "$BREW_BIN" ]; then
   case "$RESOLVED" in
     */Cellar/codex-switch/*|*/Homebrew/*)
       error "codex-switch is installed via Homebrew ($BREW_BIN). Please run 'brew uninstall codex-switch' first, then re-run this installer."
+      ;;
+  esac
+fi
+
+# A pre-user-install direct binary in /usr/local/bin would otherwise shadow the
+# new user-owned binary. Validate sudo before downloading, then remove it only
+# after the new binary is installed successfully.
+MIGRATE_LEGACY=false
+LEGACY_NEEDS_SUDO=false
+if [ "$SYSTEM_INSTALL" = false ] && [ -e "$LEGACY_BIN" ]; then
+  LEGACY_RESOLVED="$(readlink -f "$LEGACY_BIN" 2>/dev/null || realpath "$LEGACY_BIN" 2>/dev/null || echo "$LEGACY_BIN")"
+  case "$LEGACY_RESOLVED" in
+    */Cellar/codex-switch/*|*/Homebrew/*)
+      error "codex-switch is installed via Homebrew ($LEGACY_BIN). Please run 'brew uninstall codex-switch' first, then re-run this installer."
+      ;;
+    *)
+      if [ ! -w "$SYSTEM_INSTALL_DIR" ]; then
+        info "Legacy system install detected at ${LEGACY_BIN}; migration requires sudo once."
+        LEGACY_NEEDS_SUDO=true
+      else
+        info "Legacy system install detected at ${LEGACY_BIN}; it will be migrated."
+      fi
+      MIGRATE_LEGACY=true
       ;;
   esac
 fi
@@ -204,12 +295,69 @@ fi
 info "Checksum verified: ${ASSET_NAME}"
 tar xzf "${TMP_DIR}/${ASSET_NAME}" -C "$TMP_DIR"
 
+if [ "$MIGRATE_LEGACY" = true ] && [ "$LEGACY_NEEDS_SUDO" = true ]; then
+  sudo -v || error "Cannot migrate ${LEGACY_BIN} without sudo. Re-run with access to remove the legacy binary, or use --system."
+fi
+
 # Install
-if [ -w "$INSTALL_DIR" ]; then
-  install -m 0755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+if [ "$SYSTEM_INSTALL" = true ]; then
+  if [ -w "$INSTALL_DIR" ]; then
+    install -m 0755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+  else
+    info "Installing system-wide to ${INSTALL_DIR} (requires sudo)"
+    sudo install -m 0755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+  fi
 else
-  info "Installing to ${INSTALL_DIR} (requires sudo)"
-  sudo install -m 0755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+  mkdir -p "$INSTALL_DIR"
+  install -m 0755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+fi
+
+if [ "$MIGRATE_LEGACY" = true ]; then
+  if [ "$LEGACY_NEEDS_SUDO" = true ]; then
+    sudo rm -f "$LEGACY_BIN"
+  else
+    rm -f "$LEGACY_BIN"
+  fi
+  info "Removed legacy install: ${LEGACY_BIN}"
+fi
+
+if [ "$SYSTEM_INSTALL" = false ]; then
+  case ":${PATH}:" in
+    *":${USER_INSTALL_DIR}:"*) ;;
+    *)
+      case "${SHELL:-}" in
+        */zsh)
+          PROFILE_FILE="${HOME}/.zprofile"
+          PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+          ;;
+        */bash)
+          if [ "$PLATFORM" = "darwin" ]; then
+            PROFILE_FILE="${HOME}/.bash_profile"
+          else
+            PROFILE_FILE="${HOME}/.profile"
+          fi
+          PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+          ;;
+        */fish)
+          PROFILE_FILE="${HOME}/.config/fish/config.fish"
+          PATH_LINE='fish_add_path "$HOME/.local/bin"'
+          mkdir -p "${HOME}/.config/fish"
+          ;;
+        *)
+          PROFILE_FILE=""
+          PATH_LINE=""
+          ;;
+      esac
+      if [ -n "$PROFILE_FILE" ]; then
+        if ! grep -F "$PATH_BLOCK_BEGIN" "$PROFILE_FILE" >/dev/null 2>&1; then
+          printf '\n%s\n%s\n%s\n' "$PATH_BLOCK_BEGIN" "$PATH_LINE" "$PATH_BLOCK_END" >> "$PROFILE_FILE"
+          info "Added ${USER_INSTALL_DIR} to PATH in ${PROFILE_FILE}; restart your shell to apply it."
+        fi
+      else
+        warn "Add ${USER_INSTALL_DIR} to your PATH to run codex-switch by name."
+      fi
+      ;;
+  esac
 fi
 
 info "Installed: $(${INSTALL_DIR}/${BINARY_NAME} --version)"

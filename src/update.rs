@@ -23,6 +23,24 @@ fn homebrew_dev_install_error() -> String {
     )
 }
 
+fn ensure_replace_parent_writable(executable: &Path) -> Result<()> {
+    let parent = executable
+        .parent()
+        .with_context(|| format!("current executable has no parent: {}", executable.display()))?;
+    tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "install directory '{}' is not writable; reinstall with the user-level installer, or use elevated privileges for an explicit system install",
+            parent.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn ensure_current_executable_replaceable() -> Result<()> {
+    let executable = std::env::current_exe().context("locating current executable")?;
+    ensure_replace_parent_writable(&executable)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallSource {
     Homebrew,
@@ -232,6 +250,7 @@ async fn download_and_replace(
     show_progress: bool,
     label_suffix: &str,
 ) -> Result<()> {
+    ensure_current_executable_replaceable()?;
     let client =
         crate::auth::build_http_client().context("building HTTP client for self-update")?;
     let archive_name = asset_name();
@@ -782,6 +801,25 @@ mod tests {
         let message = super::homebrew_dev_install_error();
         assert!(message.contains("To switch to dev, run `brew uninstall codex-switch`"));
         assert!(!message.contains("run `run `"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_preflight_rejects_a_read_only_install_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        fs::create_dir(&install_dir).unwrap();
+        let executable = install_dir.join("codex-switch");
+        fs::write(&executable, b"old binary").unwrap();
+        fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let error = ensure_replace_parent_writable(&executable).unwrap_err();
+
+        fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(error.to_string().contains("not writable"));
+        assert!(error.to_string().contains("user-level installer"));
     }
 
     #[test]

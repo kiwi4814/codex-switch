@@ -33,6 +33,8 @@ Development and pull requests normally target `dev`. The `master` branch represe
 | Installer/update | `scripts/`, `src/update.rs`, release workflow | Distribution contract tests and release artifact checks |
 | Configuration | `src/config.rs`, README configuration section | Parsing/default/warning tests |
 
+The direct-install matrix is an intentional compatibility contract: Unix defaults to `$HOME/.local/bin`, Unix `--system` uses `/usr/local/bin`, Windows uses `%LOCALAPPDATA%\Programs\codex-switch`, and Homebrew retains ownership of Cellar installs. Keep legacy Unix migration and self-update preflight behavior covered by `tests/test_distribution_contract.rs`; do not replace the platform-specific paths with a single cross-platform abstraction.
+
 Search for the current signature and existing tests before assuming an API or path. Preserve module ownership: command modules coordinate work; domain modules implement reusable behavior.
 
 ## Develop behavior test-first
