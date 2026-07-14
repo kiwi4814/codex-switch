@@ -1,21 +1,26 @@
-## Using codex-switch
+## Start here
 
 - [Home](Home)
 - [Getting started](Getting-Started)
-- [Testing development releases](Development-Releases)
-- [Feature guide](Feature-Guide)
-- [Troubleshooting](Troubleshooting)
-- [FAQ](FAQ)
 - [中文指南](Chinese-Guide)
 
-## Developing codex-switch
+## Use codex-switch
 
-- [Architecture overview](Architecture-Overview)
+- [Feature guide](Feature-Guide)
+- [Testing development releases](Development-Releases)
+
+## Get help
+
+- [Troubleshooting](Troubleshooting)
+- [FAQ](FAQ)
+
+## Contribute
+
 - [Developer onboarding](Developer-Onboarding)
+- [Architecture overview](Architecture-Overview)
 - [Contributing](Contributing)
 
-### Canonical sources
+## Source of truth
 
-- [README](https://github.com/xjoker/codex-switch/blob/master/README.md)
-- [Documentation index](https://github.com/xjoker/codex-switch/blob/master/docs/README.md)
-- [Changelog](https://github.com/xjoker/codex-switch/blob/master/docs/CHANGELOG.md)
+- [Documentation index](https://github.com/xjoker/codex-switch/blob/dev/docs/README.md)
+- [Changelog](https://github.com/xjoker/codex-switch/blob/dev/docs/CHANGELOG.md)

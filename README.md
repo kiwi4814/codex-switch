@@ -21,7 +21,7 @@ Install the stable release.
 macOS / Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash
+curl -fsSL https://github.com/xjoker/codex-switch/releases/latest/download/install.sh | bash
 ```
 
 The Unix installer uses `$HOME/.local/bin` by default and configures PATH for zsh, bash, and fish when needed; other shells receive a manual PATH instruction. Use `--system` only when an administrator intentionally wants `/usr/local/bin`; system installs may require `sudo` for later updates.
@@ -29,7 +29,7 @@ The Unix installer uses `$HOME/.local/bin` by default and configures PATH for zs
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
+irm https://github.com/xjoker/codex-switch/releases/latest/download/install.ps1 | iex
 ```
 
 Add an account and open the dashboard:
@@ -88,7 +88,13 @@ Homebrew distributes stable releases only and must retain ownership of its Cella
 
 ```bash
 brew uninstall codex-switch
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash -s -- --dev
+curl -fsSL https://github.com/xjoker/codex-switch/releases/download/dev/install.sh | bash -s -- --dev
+```
+
+On Windows, install the rolling dev build from the matching dev release asset:
+
+```powershell
+$env:CS_DEV="1"; irm https://github.com/xjoker/codex-switch/releases/download/dev/install.ps1 | iex
 ```
 
 Use `codex-switch self-update --stable` to keep a direct installation but return to the stable channel. To return to Homebrew ownership, run the direct uninstaller, keep the data directory when prompted, then reinstall with `brew install xjoker/tap/codex-switch`.

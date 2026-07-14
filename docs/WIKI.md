@@ -26,7 +26,11 @@ Official references, checked 2026-07-13:
 
 ## Edit the Wiki source
 
-Wiki source pages live in `docs/wiki/`. Keep them concise and link to canonical documents for details. Each page should answer one navigation question and identify the canonical source.
+Wiki source pages live in `docs/wiki/`. Keep them concise and link to canonical documents for details. Each page should answer one navigation question, identify the canonical source, and end with explicit next steps.
+
+The Wiki is published from `dev`, so reviewed repository-document links must target the same `dev` branch. Stable installation commands should use `/releases/latest/download/...`; rolling development installation commands should use `/releases/download/dev/...`. Do not point Wiki navigation at repository documents that exist only on `dev` through `master` URLs.
+
+Use Wiki page slugs such as `(Getting-Started)` for internal links. Every slug must match a Markdown filename in `docs/wiki/`. The distribution contract checks internal pages, repository paths, and heading anchors without making network requests.
 
 English is the primary Wiki language. A Chinese companion page may provide a quick path for Chinese readers, but detailed behavior remains in the English repository documents. When behavior changes, update the canonical English document first, then adjust the companion summary if its navigation or examples are affected.
 
@@ -45,7 +49,7 @@ Do not push a local Wiki clone during the normal documentation workflow. If auto
 After the workflow succeeds:
 
 1. Open the Wiki Home page and each sidebar link.
-2. Confirm canonical links resolve to the default branch.
+2. Confirm canonical links resolve to the reviewed `dev` branch.
 3. Confirm `_Sidebar.md` renders as navigation rather than a normal page.
 4. Compare the Wiki commit with the reviewed `docs/wiki/` source.
 5. Record the Wiki sync in the release checklist when documentation changed.

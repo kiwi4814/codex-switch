@@ -1,6 +1,6 @@
 # Troubleshooting
 
-> Canonical source: [Troubleshooting](https://github.com/xjoker/codex-switch/blob/master/docs/TROUBLESHOOTING.md).
+> Canonical source: [Troubleshooting](https://github.com/xjoker/codex-switch/blob/dev/docs/TROUBLESHOOTING.md).
 
 Start with the complete error, its file path, and the command that produced it.
 
@@ -11,3 +11,9 @@ Start with the complete error, its file path, and the command that produced it.
 - Mistaken deletion: stop the daemon and restore the newest matching directory from `deleted-profiles/`.
 
 For network failures, rerun with `--debug`, then redact tokens, emails, account IDs, workspace names, and proxy credentials before sharing output.
+
+## Next steps
+
+- Check short behavior and security answers in the [FAQ](FAQ).
+- For full recovery procedures, open the [canonical troubleshooting guide](https://github.com/xjoker/codex-switch/blob/dev/docs/TROUBLESHOOTING.md).
+- If the problem remains, report the redacted reproduction in the [GitHub issue tracker](https://github.com/xjoker/codex-switch/issues).

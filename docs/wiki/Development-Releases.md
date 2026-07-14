@@ -2,7 +2,7 @@
 
 > **Prerelease warning:** the rolling `dev` build contains changes intended for the next stable release. It may change again before release. Do not use it when you need stable production behavior.
 >
-> Canonical sources: [README — Updating existing installations](https://github.com/xjoker/codex-switch/blob/master/README.md#updating-existing-installations), [Feature guide — Update the binary](https://github.com/xjoker/codex-switch/blob/master/docs/FEATURES.md#update-the-binary), and [Troubleshooting](https://github.com/xjoker/codex-switch/blob/master/docs/TROUBLESHOOTING.md).
+> Canonical sources: [README — Updating existing installations](https://github.com/xjoker/codex-switch/blob/dev/README.md#updating-existing-installations), [Feature guide — Update the binary](https://github.com/xjoker/codex-switch/blob/dev/docs/FEATURES.md#update-the-binary), and [Troubleshooting](https://github.com/xjoker/codex-switch/blob/dev/docs/TROUBLESHOOTING.md).
 
 ## Install the rolling dev build
 
@@ -15,14 +15,16 @@ codex-switch self-update --dev
 For a new macOS or Linux installation:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash -s -- --dev
+curl -fsSL https://github.com/xjoker/codex-switch/releases/download/dev/install.sh | bash -s -- --dev
 ```
+
+Do not substitute a `raw.githubusercontent.com/.../master/scripts/install.sh` URL. That old branch can serve a retired installer which writes to `/usr/local/bin`. The dev Release asset above defaults to `$HOME/.local/bin`; it requests `sudo` only for the one-time removal of a root-owned legacy binary, or when you explicitly pass `--system`.
 
 For a new Windows installation, run this in PowerShell:
 
 ```powershell
 $env:CS_DEV="1"
-irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
+irm https://github.com/xjoker/codex-switch/releases/download/dev/install.ps1 | iex
 ```
 
 ### Move from Homebrew to dev
@@ -31,7 +33,7 @@ Homebrew distributes stable releases only and owns its Cellar binary. Do not use
 
 ```bash
 brew uninstall codex-switch
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash -s -- --dev
+curl -fsSL https://github.com/xjoker/codex-switch/releases/download/dev/install.sh | bash -s -- --dev
 ```
 
 Profiles and configuration remain under `~/.codex-switch`; changing binary ownership does not reset them.
@@ -85,7 +87,7 @@ codex-switch self-update --stable
 To return to Homebrew ownership, remove the direct installation and reinstall `xjoker/tap/codex-switch` with Homebrew.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/xjoker/codex-switch/releases/download/dev/install.sh | bash -s -- --uninstall
 brew install xjoker/tap/codex-switch
 ```
 
@@ -98,3 +100,9 @@ When the uninstaller asks whether to remove the data directory, answer `N` to pr
 Homebrew 只提供正式版。切换开发版前先运行 `brew uninstall codex-switch`，再使用带 `--dev` 的直装脚本。若测试后希望恢复 Homebrew 管理，运行直装卸载脚本、在删除数据目录的询问中选择 `N`，然后执行 `brew install xjoker/tap/codex-switch`。
 
 提交问题前请删除 Token、profile 内容、邮箱、account ID、工作区名称、可识别身份的路径和代理凭据。更多中文入口见[中文指南](Chinese-Guide)。
+
+## Next steps
+
+- Learn the supported workflows in the [Feature guide](Feature-Guide).
+- Diagnose a failed install or update with [Troubleshooting](Troubleshooting).
+- Return to the Wiki [Home](Home).

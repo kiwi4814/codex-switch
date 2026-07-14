@@ -205,16 +205,28 @@ jobs:
           cat > artifacts/INSTALL.md << 'HEREDOC'
           ## Quick Install
 
-          ### macOS / Linux (one-liner)
+          ### Stable: macOS / Linux
 
           ```bash
-          curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash
+          curl -fsSL https://github.com/xjoker/codex-switch/releases/latest/download/install.sh | bash
           ```
 
-          ### Windows (PowerShell)
+          ### Stable: Windows PowerShell
 
           ```powershell
-          irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
+          irm https://github.com/xjoker/codex-switch/releases/latest/download/install.ps1 | iex
+          ```
+
+          ### Rolling dev: macOS / Linux
+
+          ```bash
+          curl -fsSL https://github.com/xjoker/codex-switch/releases/download/dev/install.sh | bash -s -- --dev
+          ```
+
+          ### Rolling dev: Windows PowerShell
+
+          ```powershell
+          $env:CS_DEV="1"; irm https://github.com/xjoker/codex-switch/releases/download/dev/install.ps1 | iex
           ```
 
           ### Manual Download

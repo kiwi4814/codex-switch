@@ -1,31 +1,33 @@
 # codex-switch Wiki
 
-`codex-switch` is the multi-account manager for OpenAI Codex CLI. It stores multiple local file-backed Codex logins, monitors quota, selects the best account for the next session, and offers CLI, TUI, daemon, import, warmup, reset-card, and self-update workflows.
+`codex-switch` manages multiple local OpenAI Codex CLI logins, shows quota state, and selects an account for the next Codex session.
 
-> Canonical documentation lives in the [main repository](https://github.com/xjoker/codex-switch/tree/master/docs). Wiki pages are curated entry points and should not be treated as a second implementation specification.
+> **Required:** Codex must use `cli_auth_credentials_store = "file"`. Start with [Getting started](Getting-Started) before importing or switching accounts.
 
-## Using codex-switch
+## Start here
 
-- [Getting started](Getting-Started) — install, add an account, and open the dashboard.
-- [Testing development releases](Development-Releases) — install the rolling dev build, verify it, and return to stable.
-- [Feature guide](Feature-Guide) — understand the supported workflows and safety boundaries.
-- [Troubleshooting](Troubleshooting) — diagnose common failures and recover a profile.
-- [FAQ](FAQ) — concise answers to user and project questions.
+- New users: [install codex-switch and add the first account](Getting-Started).
+- Existing users: [choose a task](#choose-your-task).
+- 中文读者：[从中文指南开始](Chinese-Guide)。
 
-中文读者可以从[中文指南](Chinese-Guide)开始；详细行为仍以英文主文档为准。
+## Choose your task
 
-## Developing codex-switch
+| I want to… | Start here |
+|---|---|
+| Add, import, inspect, or switch accounts | [Feature guide](Feature-Guide) |
+| Install or test the rolling `dev` build | [Testing development releases](Development-Releases) |
+| Diagnose an error or recover a profile | [Troubleshooting](Troubleshooting) |
+| Check a short behavior or security answer | [FAQ](FAQ) |
+| Read the complete command and configuration docs | [Documentation index](https://github.com/xjoker/codex-switch/blob/dev/docs/README.md) |
 
-- [Architecture overview](Architecture-Overview) — understand state ownership and module flow.
-- [Developer onboarding](Developer-Onboarding) — prepare a development environment and find the right change boundary.
-- [Contributing](Contributing) — tests, pull request expectations, and documentation rules.
+## Contribute
 
-## Important prerequisite
+1. [Prepare a development environment](Developer-Onboarding).
+2. [Understand state ownership and safety boundaries](Architecture-Overview).
+3. [Follow the contribution and verification contract](Contributing).
 
-Codex must use its file credential store because `codex-switch` switches `$CODEX_HOME/auth.json`. Set this in `$CODEX_HOME/config.toml`:
+## Documentation model
 
-```toml
-cli_auth_credentials_store = "file"
-```
+The Wiki is a concise navigation layer. Detailed behavior lives in the reviewed [`dev` branch documentation](https://github.com/xjoker/codex-switch/tree/dev/docs), which is published alongside these Wiki sources. Stable installers and binaries come from [GitHub Releases](https://github.com/xjoker/codex-switch/releases).
 
 Do not publish auth files, profile files, tokens, unredacted debug output, proxy credentials, account IDs, email addresses, or workspace names.

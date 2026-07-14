@@ -15,7 +15,7 @@
 **macOS / Linux**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash
+curl -fsSL https://github.com/xjoker/codex-switch/releases/latest/download/install.sh | bash
 ```
 
 默认安装到当前用户的 `~/.local/bin`；安装脚本会在需要时为 zsh、bash 和 fish 配置 PATH，其他 shell 会显示手动配置提示。只有管理员明确需要系统级安装时才使用 `bash -s -- --system`，此模式安装到 `/usr/local/bin`，后续更新可能仍需 `sudo`。
@@ -23,7 +23,7 @@ curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/
 **Windows PowerShell**
 
 ```powershell
-irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
+irm https://github.com/xjoker/codex-switch/releases/latest/download/install.ps1 | iex
 ```
 
 然后添加第一个账号并打开仪表盘：
@@ -90,7 +90,7 @@ brew upgrade xjoker/tap/codex-switch
 
 ```bash
 brew uninstall codex-switch
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash -s -- --dev
+curl -fsSL https://github.com/xjoker/codex-switch/releases/download/dev/install.sh | bash -s -- --dev
 ```
 
 测试结束后，`codex-switch self-update --stable` 可以保留直装方式并回到正式通道。若要恢复由 Homebrew 管理，请运行下方直装卸载命令，在询问是否删除数据目录时选择 `N`，然后重新运行 `brew install xjoker/tap/codex-switch`。
@@ -102,13 +102,13 @@ curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/
 **macOS / Linux：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash -s -- --dev
+curl -fsSL https://github.com/xjoker/codex-switch/releases/download/dev/install.sh | bash -s -- --dev
 ```
 
 **Windows（PowerShell）：**
 
 ```powershell
-$env:CS_DEV="1"; irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
+$env:CS_DEV="1"; irm https://github.com/xjoker/codex-switch/releases/download/dev/install.ps1 | iex
 ```
 
 ### 卸载
@@ -116,7 +116,7 @@ $env:CS_DEV="1"; irm https://raw.githubusercontent.com/xjoker/codex-switch/maste
 **macOS / Linux：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/xjoker/codex-switch/releases/latest/download/install.sh | bash -s -- --uninstall
 ```
 
 旧版曾默认安装到 `/usr/local/bin`。重新运行当前安装脚本会先下载并验证产物、确认一次 `sudo` 权限，再安装新的用户级二进制并删除旧二进制，避免 PATH 继续命中旧版本；账号、配置及缓存不会因此迁移或删除。
@@ -124,7 +124,7 @@ curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/
 **Windows（PowerShell）：**
 
 ```powershell
-$env:CS_UNINSTALL="1"; irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
+$env:CS_UNINSTALL="1"; irm https://github.com/xjoker/codex-switch/releases/latest/download/install.ps1 | iex
 ```
 
 ### 手动下载

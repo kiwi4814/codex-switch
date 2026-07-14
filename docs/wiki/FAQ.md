@@ -30,4 +30,10 @@ Not currently. Archives are checked against SHA256 files from the same GitHub Re
 
 ## Where should implementation details be updated?
 
-In the main repository documentation. The Wiki is a curated navigation layer; see the [documentation index](https://github.com/xjoker/codex-switch/blob/master/docs/README.md).
+In the main repository documentation. The Wiki is a curated navigation layer; see the [documentation index](https://github.com/xjoker/codex-switch/blob/dev/docs/README.md).
+
+## Next steps
+
+- New installation: [Getting started](Getting-Started).
+- Daily workflows: [Feature guide](Feature-Guide).
+- Errors and recovery: [Troubleshooting](Troubleshooting).

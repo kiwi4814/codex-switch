@@ -1,5 +1,6 @@
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn repo_file(path: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
@@ -22,6 +23,53 @@ fn assert_before(text: &str, first: &str, second: &str) {
     assert!(
         first_pos < second_pos,
         "expected `{first}` to appear before `{second}`"
+    );
+}
+
+fn markdown_links(text: &str) -> Vec<&str> {
+    let mut links = Vec::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find("](") {
+        remaining = &remaining[start + 2..];
+        let Some(end) = remaining.find(')') else {
+            break;
+        };
+        links.push(remaining[..end].trim());
+        remaining = &remaining[end + 1..];
+    }
+    links
+}
+
+fn github_heading_slug(heading: &str) -> String {
+    heading
+        .trim()
+        .trim_end_matches('#')
+        .trim()
+        .chars()
+        .filter_map(|character| {
+            if character.is_alphanumeric() || character == '-' || character == '_' {
+                Some(character.to_ascii_lowercase())
+            } else if character.is_whitespace() {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn assert_markdown_anchor_exists(path: &Path, anchor: &str) {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    assert!(
+        text.lines()
+            .filter_map(|line| line.strip_prefix('#'))
+            .any(|line| {
+                let heading = line.trim_start_matches('#').trim();
+                github_heading_slug(heading) == anchor
+            }),
+        "missing anchor `#{anchor}` in {}",
+        path.display()
     );
 }
 
@@ -116,6 +164,122 @@ fn wiki_sync_uses_the_reviewed_repository_sources() {
     assert!(!workflow.contains("WIKI_TOKEN"));
     assert!(!workflow.contains("pull_request:"));
     assert!(!workflow.contains("branches: [dev, master]"));
+}
+
+#[test]
+fn wiki_links_resolve_to_reviewed_pages_and_sources() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let wiki_dir = root.join("docs/wiki");
+    let page_slugs: BTreeSet<String> = fs::read_dir(&wiki_dir)
+        .expect("failed to list Wiki sources")
+        .map(|entry| entry.expect("failed to read Wiki source entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
+        .filter_map(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .collect();
+    let repository_prefix = "https://github.com/xjoker/codex-switch/";
+
+    for entry in fs::read_dir(&wiki_dir).expect("failed to list Wiki sources") {
+        let path = entry.expect("failed to read Wiki source entry").path();
+        if path.extension().is_none_or(|extension| extension != "md") {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        for link in markdown_links(&text) {
+            if let Some(target) = link.strip_prefix(repository_prefix) {
+                let Some(target) = target
+                    .strip_prefix("blob/dev/")
+                    .or_else(|| target.strip_prefix("tree/dev/"))
+                else {
+                    if target.starts_with("blob/") || target.starts_with("tree/") {
+                        panic!(
+                            "{} links to an unreviewed repository branch: {link}",
+                            path.display()
+                        );
+                    }
+                    continue;
+                };
+                let (target_path, anchor) = target
+                    .split_once('#')
+                    .map_or((target, None), |(file, anchor)| (file, Some(anchor)));
+                let local_path = root.join(target_path);
+                assert!(
+                    local_path.exists(),
+                    "{} links to missing repository source: {link}",
+                    path.display()
+                );
+                if let Some(anchor) = anchor {
+                    assert_markdown_anchor_exists(&local_path, anchor);
+                }
+                continue;
+            }
+            if let Some(anchor) = link.strip_prefix('#') {
+                assert_markdown_anchor_exists(&path, anchor);
+                continue;
+            }
+            if link.contains("://") {
+                continue;
+            }
+
+            let (page, anchor) = link
+                .split_once('#')
+                .map_or((link, None), |(page, anchor)| (page, Some(anchor)));
+            let slug = page.trim_end_matches(".md");
+            assert!(
+                page_slugs.contains(slug),
+                "{} links to missing Wiki page: {link}",
+                path.display()
+            );
+            if let Some(anchor) = anchor {
+                assert_markdown_anchor_exists(&wiki_dir.join(format!("{slug}.md")), anchor);
+            }
+        }
+    }
+}
+
+#[test]
+fn wiki_navigation_is_task_oriented_and_progressive() {
+    let home = repo_file("docs/wiki/Home.md");
+    let sidebar = repo_file("docs/wiki/_Sidebar.md");
+
+    for required in ["## Start here", "## Choose your task", "## Contribute"] {
+        assert!(
+            home.contains(required),
+            "Wiki Home must contain `{required}`"
+        );
+    }
+    for required in [
+        "## Start here",
+        "## Use codex-switch",
+        "## Get help",
+        "## Contribute",
+    ] {
+        assert!(
+            sidebar.contains(required),
+            "Wiki sidebar must contain `{required}`"
+        );
+    }
+    assert!(!sidebar.contains("### Canonical sources"));
+
+    for page in [
+        "Architecture-Overview.md",
+        "Chinese-Guide.md",
+        "Contributing.md",
+        "Developer-Onboarding.md",
+        "Development-Releases.md",
+        "FAQ.md",
+        "Feature-Guide.md",
+        "Getting-Started.md",
+        "Troubleshooting.md",
+    ] {
+        assert!(
+            repo_file(&format!("docs/wiki/{page}")).contains("## Next steps"),
+            "Wiki page {page} must end with explicit next steps"
+        );
+    }
 }
 
 #[test]
@@ -392,6 +556,53 @@ fn readmes_describe_current_cli_and_codex_requirements() {
             );
         }
     }
+}
+
+#[test]
+fn installer_instructions_use_channel_matched_release_assets() {
+    let stable_unix = "https://github.com/xjoker/codex-switch/releases/latest/download/install.sh";
+    let stable_windows =
+        "https://github.com/xjoker/codex-switch/releases/latest/download/install.ps1";
+    let dev_unix = "https://github.com/xjoker/codex-switch/releases/download/dev/install.sh";
+    let dev_windows = "https://github.com/xjoker/codex-switch/releases/download/dev/install.ps1";
+
+    for path in [
+        "README.md",
+        "README_CN.md",
+        "scripts/install.sh",
+        "scripts/install.ps1",
+        ".github/workflows/release.yml",
+    ] {
+        let text = repo_file(path);
+        assert!(
+            !text.contains("raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install"),
+            "{path} must not direct users to the stale installer on the master branch"
+        );
+    }
+
+    for path in ["README.md", "README_CN.md"] {
+        let readme = repo_file(path);
+        for required in [stable_unix, stable_windows, dev_unix, dev_windows] {
+            assert!(
+                readme.contains(required),
+                "{path} must contain channel-matched installer URL `{required}`"
+            );
+        }
+    }
+
+    let unix_installer = repo_file("scripts/install.sh");
+    assert!(unix_installer.contains(stable_unix));
+    assert!(unix_installer.contains(dev_unix));
+
+    let windows_installer = repo_file("scripts/install.ps1");
+    assert!(windows_installer.contains(stable_windows));
+    assert!(windows_installer.contains(dev_windows));
+
+    let workflow = repo_file(".github/workflows/release.yml");
+    assert!(workflow.contains(stable_unix));
+    assert!(workflow.contains(stable_windows));
+    assert!(workflow.contains(dev_unix));
+    assert!(workflow.contains(dev_windows));
 }
 
 #[test]

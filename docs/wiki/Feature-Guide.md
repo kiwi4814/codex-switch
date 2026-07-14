@@ -1,6 +1,6 @@
 # Feature guide
 
-> Canonical source: [docs/FEATURES.md](https://github.com/xjoker/codex-switch/blob/master/docs/FEATURES.md).
+> Canonical source: [docs/FEATURES.md](https://github.com/xjoker/codex-switch/blob/dev/docs/FEATURES.md).
 
 The main workflows are:
 
@@ -13,4 +13,10 @@ The main workflows are:
 - prepare future sessions with the Beta daemon on macOS, Linux, and Windows
 - update direct installations from verified GitHub Release archives
 
-For behavior boundaries, automation rules, and examples, read the [canonical feature guide](https://github.com/xjoker/codex-switch/blob/master/docs/FEATURES.md).
+For behavior boundaries, automation rules, and examples, read the [canonical feature guide](https://github.com/xjoker/codex-switch/blob/dev/docs/FEATURES.md).
+
+## Next steps
+
+- Need an exact command or flag? Open the [command reference](https://github.com/xjoker/codex-switch/blob/dev/docs/COMMANDS.md).
+- Testing unreleased behavior? Follow [Testing development releases](Development-Releases).
+- Something failed? Start with [Troubleshooting](Troubleshooting).
