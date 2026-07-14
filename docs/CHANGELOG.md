@@ -1,5 +1,10 @@
 # Changelog
 
+## v20260714.2.0 — 2026-07-14
+
+- **Reliable legacy upgrade gate on macOS 26** — Release CI now fetches exact Release metadata with the job token and serves it to the reviewed v0.0.19 fixture over loopback, while the fixture still downloads and verifies the real published assets before replacing itself.
+- **Deterministic legacy runner coverage** — Pinned the legacy macOS upgrade check to macOS 26 so the `macos-latest` migration cannot silently alternate between macOS 15 and 26.
+
 ## v20260714.1.0 — 2026-07-14
 
 - **Friendly legacy migration** — Replaced the duplicated `ERROR`/`Error:` output and internal installation jargon with one actionable setup message that preserves profiles and clearly separates the recommended user install from an intentional system install.

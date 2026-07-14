@@ -285,11 +285,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-26, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
       EXPECTED_VERSION: ${{ needs.meta.outputs.version }}
       IS_DEV: ${{ needs.meta.outputs.is_dev }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Upgrade v0.0.19 on Unix
         if: runner.os != 'Windows'
@@ -316,6 +317,43 @@ jobs:
           esac
           work="${RUNNER_TEMP}/codex-switch-legacy-upgrade"
           mkdir -p "$work/home"
+          api_root="${work}/api"
+          if [[ "$IS_DEV" == "true" ]]; then
+            api_path="repos/xjoker/codex-switch/releases/tags/dev"
+          else
+            api_path="repos/xjoker/codex-switch/releases/latest"
+          fi
+          api_file="${api_root}/${api_path}"
+          mkdir -p "$(dirname "$api_file")"
+          metadata_ready=false
+          for attempt in 1 2 3 4 5; do
+            if gh api "/${api_path}" > "${api_file}.tmp"; then
+              mv "${api_file}.tmp" "$api_file"
+              metadata_ready=true
+              break
+            fi
+            if [[ "$attempt" -lt 5 ]]; then
+              echo "Retrying authenticated release metadata fetch after propagation delay"
+              sleep 5
+            fi
+          done
+          test "$metadata_ready" = true
+          if [[ "$IS_DEV" == "true" ]]; then
+            jq -e --arg version "$EXPECTED_VERSION" \
+              '.tag_name == "dev" and .name == ("dev (" + $version + ")")' "$api_file" >/dev/null
+          else
+            jq -e --arg version "$EXPECTED_VERSION" \
+              '.tag_name == ("v" + $version)' "$api_file" >/dev/null
+          fi
+          unset GH_TOKEN
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory "$api_root" >/dev/null 2>&1 &
+          metadata_server_pid=$!
+          trap 'kill "$metadata_server_pid"' EXIT
+          for attempt in 1 2 3 4 5; do
+            curl -fsS "http://127.0.0.1:8765/${api_path}" >/dev/null && break
+            test "$attempt" -lt 5
+            sleep 1
+          done
           base="https://github.com/xjoker/codex-switch/releases/download/v0.0.19"
           curl -fsSL "${base}/${asset}" -o "${work}/${asset}"
           curl -fsSL "${base}/${asset}.sha256" -o "${work}/${asset}.sha256"
@@ -327,19 +365,11 @@ jobs:
           )
           bin="${work}/codex-switch"
           test "$("$bin" --version | head -n 1)" = "codex-switch 0.0.19"
-          updated=false
-          for attempt in 1 2 3 4 5; do
-            if [[ "$IS_DEV" == "true" ]]; then
-              HOME="${work}/home" "$bin" self-update --dev && updated=true && break
-            else
-              HOME="${work}/home" "$bin" self-update --stable && updated=true && break
-            fi
-            if [[ "$attempt" -lt 5 ]]; then
-              echo "Retrying legacy self-update after GitHub Release propagation delay"
-              sleep 5
-            fi
-          done
-          test "$updated" = true
+          if [[ "$IS_DEV" == "true" ]]; then
+            HOME="${work}/home" CS_GITHUB_API_URL=http://127.0.0.1:8765 "$bin" self-update --dev
+          else
+            HOME="${work}/home" CS_GITHUB_API_URL=http://127.0.0.1:8765 "$bin" self-update --stable
+          fi
           test "$("$bin" --version | head -n 1)" = "codex-switch ${EXPECTED_VERSION}"
 
       - name: Upgrade v0.0.19 on Windows
@@ -348,6 +378,54 @@ jobs:
         run: |
           $work = Join-Path $env:RUNNER_TEMP "codex-switch-legacy-upgrade"
           New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $apiRoot = Join-Path $work "api"
+          if ($env:IS_DEV -eq "true") {
+            $apiPath = "repos/xjoker/codex-switch/releases/tags/dev"
+          } else {
+            $apiPath = "repos/xjoker/codex-switch/releases/latest"
+          }
+          $apiFile = Join-Path $apiRoot $apiPath
+          New-Item -ItemType Directory -Path (Split-Path $apiFile) -Force | Out-Null
+          $metadataReady = $false
+          foreach ($attempt in 1..5) {
+            $metadata = & gh api "/$apiPath"
+            if ($LASTEXITCODE -eq 0) {
+              [IO.File]::WriteAllText(
+                $apiFile,
+                ($metadata -join [Environment]::NewLine),
+                [Text.UTF8Encoding]::new($false)
+              )
+              $metadataReady = $true
+              break
+            }
+            if ($attempt -lt 5) {
+              Write-Host "Retrying authenticated release metadata fetch after propagation delay"
+              Start-Sleep -Seconds 5
+            }
+          }
+          if (-not $metadataReady) { throw "authenticated release metadata fetch failed" }
+          $release = Get-Content -LiteralPath $apiFile -Raw | ConvertFrom-Json
+          if ($env:IS_DEV -eq "true") {
+            if ($release.tag_name -ne "dev" -or $release.name -ne "dev ($env:EXPECTED_VERSION)") {
+              throw "dev release metadata does not match the expected version"
+            }
+          } elseif ($release.tag_name -ne "v$env:EXPECTED_VERSION") {
+            throw "stable release metadata does not match the expected version"
+          }
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          $metadataServer = Start-Process -FilePath python -ArgumentList @(
+            "-m", "http.server", "8765", "--bind", "127.0.0.1", "--directory", $apiRoot
+          ) -WindowStyle Hidden -PassThru
+          try {
+            foreach ($attempt in 1..5) {
+              try {
+                Invoke-WebRequest -Uri "http://127.0.0.1:8765/$apiPath" -UseBasicParsing | Out-Null
+                break
+              } catch {
+                if ($attempt -eq 5) { throw }
+                Start-Sleep -Seconds 1
+              }
+            }
           $asset = "cs-windows-amd64.zip"
           $base = "https://github.com/xjoker/codex-switch/releases/download/v0.0.19"
           $archive = Join-Path $work $asset
@@ -364,25 +442,18 @@ jobs:
           if (@(& $bin --version)[0] -ne "codex-switch 0.0.19") {
             throw "unexpected legacy version"
           }
-          $updated = $false
-          foreach ($attempt in 1..5) {
-            if ($env:IS_DEV -eq "true") {
-              & $bin self-update --dev
-            } else {
-              & $bin self-update --stable
-            }
-            if ($LASTEXITCODE -eq 0) {
-              $updated = $true
-              break
-            }
-            if ($attempt -lt 5) {
-              Write-Host "Retrying legacy self-update after GitHub Release propagation delay"
-              Start-Sleep -Seconds 5
-            }
+          $env:CS_GITHUB_API_URL = "http://127.0.0.1:8765"
+          if ($env:IS_DEV -eq "true") {
+            & $bin self-update --dev
+          } else {
+            & $bin self-update --stable
           }
-          if (-not $updated) { throw "v0.0.19 self-update failed" }
+          if ($LASTEXITCODE -ne 0) { throw "v0.0.19 self-update failed" }
           if (@(& $bin --version)[0] -ne "codex-switch $env:EXPECTED_VERSION") {
             throw "legacy upgrade installed an unexpected version"
+          }
+          } finally {
+            Stop-Process -Id $metadataServer.Id -Force -ErrorAction SilentlyContinue
           }
 
   homebrew:

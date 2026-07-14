@@ -39,7 +39,7 @@ fn version_file_is_the_release_source_of_truth() {
     let manifest = repo_file("Cargo.toml");
     let release = repo_file(".github/workflows/release.yml");
 
-    assert_eq!(version, "20260714.1.0");
+    assert_eq!(version, "20260714.2.0");
     assert!(manifest.contains(&format!("version = \"{version}\"")));
     assert!(release.contains("BASE=$(cat VERSION)"));
     assert!(!release.contains("BASE=$(grep '^version' Cargo.toml"));
@@ -318,13 +318,13 @@ fn release_retests_v0019_upgrade_on_all_supported_hosts() {
 }
 
 #[test]
-fn legacy_upgrade_retries_during_github_release_propagation() {
+fn legacy_upgrade_retries_authenticated_metadata_during_github_release_propagation() {
     let workflow = repo_file(".github/workflows/release.yml");
 
     for required in [
         "for attempt in 1 2 3 4 5; do",
         "foreach ($attempt in 1..5)",
-        "Retrying legacy self-update after GitHub Release propagation delay",
+        "Retrying authenticated release metadata fetch after propagation delay",
         "sleep 5",
         "Start-Sleep -Seconds 5",
     ] {
@@ -333,6 +333,32 @@ fn legacy_upgrade_retries_during_github_release_propagation() {
             "legacy upgrade must tolerate GitHub Release propagation: `{required}`"
         );
     }
+}
+
+#[test]
+fn legacy_upgrade_uses_authenticated_local_release_metadata() {
+    let workflow = repo_file(".github/workflows/release.yml");
+
+    for required in [
+        "GH_TOKEN: ${{ github.token }}",
+        "gh api",
+        "unset GH_TOKEN",
+        "Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue",
+        "CS_GITHUB_API_URL=http://127.0.0.1:8765",
+        "python3 -m http.server 8765 --bind 127.0.0.1",
+        "\"-m\", \"http.server\", \"8765\", \"--bind\", \"127.0.0.1\"",
+        "macos-26",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "legacy upgrade must avoid anonymous GitHub API access: `{required}`"
+        );
+    }
+
+    assert!(
+        !workflow.contains("os: [ubuntu-latest, macos-latest, windows-latest]"),
+        "legacy upgrade must pin the macOS 26 runner during the latest-label migration"
+    );
 }
 
 #[test]
