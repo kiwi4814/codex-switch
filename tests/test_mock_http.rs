@@ -7,10 +7,13 @@
 mod mock;
 
 use codex_switch::auth;
-use codex_switch::usage::{self, Candidate};
+use codex_switch::jwt::AccountInfo;
+use codex_switch::usage::{self, ScoredCandidate};
 use mock::scenarios;
 use serde_json::json;
 use std::path::PathBuf;
+
+static HTTP_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct EnvVarGuard {
     key: &'static str,
@@ -47,14 +50,17 @@ impl Drop for EnvVarGuard {
 }
 
 /// Create a temp directory with fake profile auth.json files.
-/// Returns (temp_dir, vec of (alias, path, token, is_team)).
+/// Returns (temp_dir, vec of (alias, path, token, JWT account info)).
 fn setup_profiles(
     entries: &[(String, Vec<serde_json::Value>)],
-) -> (tempfile::TempDir, Vec<(String, PathBuf, String, bool)>) {
+) -> (
+    tempfile::TempDir,
+    Vec<(String, PathBuf, String, AccountInfo)>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let mut profiles = Vec::new();
 
-    for (token, responses) in entries {
+    for (token, _responses) in entries {
         let alias = token.strip_prefix("tok_").unwrap_or(token).to_string();
         let profile_dir = dir.path().join(&alias);
         std::fs::create_dir_all(&profile_dir).unwrap();
@@ -73,15 +79,7 @@ fn setup_profiles(
         )
         .unwrap();
 
-        // Detect team from first response
-        let is_team = responses
-            .first()
-            .and_then(|r| r.get("plan_type"))
-            .and_then(|v| v.as_str())
-            .map(|s| s == "team")
-            .unwrap_or(false);
-
-        profiles.push((alias, auth_path, token.clone(), is_team));
+        profiles.push((alias, auth_path, token.clone(), AccountInfo::default()));
     }
 
     (dir, profiles)
@@ -91,42 +89,38 @@ fn setup_profiles(
 /// Returns (alias, score) sorted best-first.
 fn score_from_responses(
     responses: &[(String, serde_json::Value)],
-    profiles: &[(String, PathBuf, String, bool)],
+    profiles: &[(String, PathBuf, String, AccountInfo)],
     team_priority: bool,
     safety_margin_7d: f64,
     now: i64,
 ) -> Vec<(String, f64)> {
-    let pool_size = responses.len();
+    score_candidates_from_responses(responses, profiles, team_priority, safety_margin_7d, now)
+        .into_iter()
+        .map(|scored| (scored.candidate.alias, scored.score))
+        .collect()
+}
 
-    let mut candidates: Vec<Candidate> = responses
+fn score_candidates_from_responses(
+    responses: &[(String, serde_json::Value)],
+    profiles: &[(String, PathBuf, String, AccountInfo)],
+    team_priority: bool,
+    safety_margin_7d: f64,
+    now: i64,
+) -> Vec<ScoredCandidate> {
+    let inputs = responses
         .iter()
         .map(|(alias, body)| {
-            let is_team = profiles.iter().find(|(a, _, _, _)| a == alias).unwrap().3;
-            let u = usage::parse_usage(body);
-            let mut c = Candidate::from_usage(alias.clone(), &u, is_team, false, 0, now);
-            c.pool_size = pool_size;
-            c.team_priority = team_priority;
-            c
+            let account = profiles
+                .iter()
+                .find(|(profile_alias, _, _, _)| profile_alias == alias)
+                .unwrap()
+                .3
+                .clone();
+            (alias.clone(), usage::parse_usage(body), account, 0)
         })
         .collect();
-
-    // Compute pool_exhausted dynamically
-    let pool_exhausted = candidates
-        .iter()
-        .filter(|c| c.effective_used_5h() >= 100.0)
-        .count();
-    for c in &mut candidates {
-        c.pool_exhausted = pool_exhausted;
-    }
-
-    let mut scored: Vec<(String, f64)> = candidates
-        .into_iter()
-        .map(|c| {
-            let s = usage::score_unified(&c, safety_margin_7d);
-            (c.alias, s)
-        })
-        .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let mut scored = usage::score_candidates(inputs, now, safety_margin_7d, team_priority);
+    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
     scored
 }
 
@@ -134,10 +128,10 @@ fn score_from_responses(
 async fn fetch_all(
     client: &reqwest::Client,
     url: &str,
-    profiles: &[(String, PathBuf, String, bool)],
+    profiles: &[(String, PathBuf, String, AccountInfo)],
 ) -> Vec<(String, serde_json::Value)> {
     let mut results = Vec::new();
-    for (alias, _path, token, _is_team) in profiles {
+    for (alias, _path, token, _account) in profiles {
         let resp = client
             .get(url)
             .header("Authorization", format!("Bearer {token}"))
@@ -153,6 +147,158 @@ async fn fetch_all(
         results.push((alias.clone(), body));
     }
     results
+}
+
+#[test]
+fn score_candidates_pool_size_counts_successful_responses_not_profiles() {
+    let entries = scenarios::healthy_pool();
+    let (_dir, profiles) = setup_profiles(&entries);
+    let responses: Vec<_> = entries
+        .iter()
+        .take(2)
+        .map(|(token, bodies)| {
+            (
+                token.strip_prefix("tok_").unwrap_or(token).to_string(),
+                bodies[0].clone(),
+            )
+        })
+        .collect();
+
+    let scored =
+        score_candidates_from_responses(&responses, &profiles, false, 20.0, auth::now_unix_secs());
+
+    assert_eq!(profiles.len(), 3);
+    assert_eq!(scored.len(), 2);
+    assert!(
+        scored
+            .iter()
+            .all(|candidate| candidate.candidate.pool_size == 2)
+    );
+}
+
+#[tokio::test]
+async fn usage_401_refreshes_json_token_and_retries_with_new_access_token() {
+    let _lock = HTTP_ENV_LOCK.lock().await;
+    let refreshed_access_token = "mock_access_refresh_old";
+    let server = mock::MockServer::start_programmed(vec![
+        (
+            "old_access".to_string(),
+            vec![mock::MockResponse::json(
+                reqwest::StatusCode::UNAUTHORIZED,
+                json!({"error": "expired"}),
+            )],
+        ),
+        (
+            refreshed_access_token.to_string(),
+            vec![mock::MockResponse::json(
+                reqwest::StatusCode::OK,
+                mock::transformer::base_response("plus", 12.0, 18000, 20.0, 604800),
+            )],
+        ),
+    ])
+    .await;
+    let _usage_url = EnvVarGuard::set("CS_USAGE_URL", server.usage_url());
+    let _token_url = EnvVarGuard::set("CS_TOKEN_URL", server.token_url());
+    let _reset_url = EnvVarGuard::remove("CS_RESET_CREDITS_URL");
+
+    let (usage, refreshed) = usage::fetch_usage_with_refresh(
+        "refresh_case",
+        "old_access",
+        Some("old_id"),
+        Some("refresh_old"),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(usage.primary.unwrap().used_percent, Some(12.0));
+    assert_eq!(refreshed.unwrap().access_token, refreshed_access_token);
+    assert_eq!(server.request_count("old_access"), 1);
+    assert_eq!(server.request_count(refreshed_access_token), 1);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn usage_5xx_returns_contextual_error() {
+    let _lock = HTTP_ENV_LOCK.lock().await;
+    let server = mock::MockServer::start_programmed(vec![(
+        "server_error".to_string(),
+        vec![mock::MockResponse::text(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "upstream failed",
+        )],
+    )])
+    .await;
+    let _usage_url = EnvVarGuard::set("CS_USAGE_URL", server.usage_url());
+
+    let error =
+        usage::fetch_usage_with_refresh("server_error", "server_error", None, None, None, false)
+            .await
+            .err()
+            .expect("HTTP 500 must fail");
+
+    assert!(error.to_string().contains("HTTP 500"), "{error:#}");
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn usage_malformed_json_returns_parse_context() {
+    let _lock = HTTP_ENV_LOCK.lock().await;
+    let server = mock::MockServer::start_programmed(vec![(
+        "malformed".to_string(),
+        vec![mock::MockResponse::text(
+            reqwest::StatusCode::OK,
+            "not-json",
+        )],
+    )])
+    .await;
+    let _usage_url = EnvVarGuard::set("CS_USAGE_URL", server.usage_url());
+
+    let error = usage::fetch_usage_with_refresh("malformed", "malformed", None, None, None, false)
+        .await
+        .err()
+        .expect("malformed JSON must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to parse usage response (HTTP 200 OK)"),
+        "{error:#}"
+    );
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn usage_retry_exhaustion_returns_last_error_after_three_attempts() {
+    let _lock = HTTP_ENV_LOCK.lock().await;
+    let server = mock::MockServer::start_programmed(vec![(
+        "retry_exhausted".to_string(),
+        vec![mock::MockResponse::text(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "still unavailable",
+        )],
+    )])
+    .await;
+    let _usage_url = EnvVarGuard::set("CS_USAGE_URL", server.usage_url());
+    let dir = tempfile::tempdir().unwrap();
+    let auth_path = dir.path().join("auth.json");
+    std::fs::write(
+        &auth_path,
+        serde_json::to_vec(&json!({
+            "tokens": {"access_token": "retry_exhausted"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = usage::fetch_usage_retried_force("retry_exhausted", &auth_path, "")
+        .await
+        .unwrap_err();
+
+    assert!(error.detail.contains("HTTP 503"), "{}", error.detail);
+    assert_eq!(server.request_count("retry_exhausted"), 3);
+    server.shutdown();
 }
 
 // ── Tests ──
@@ -370,6 +516,7 @@ async fn http_mock_returns_correct_structure() {
 
 #[tokio::test]
 async fn http_reset_card_consume_uses_earliest_expiry() {
+    let _lock = HTTP_ENV_LOCK.lock().await;
     let entries = scenarios::healthy_pool();
     let (_dir, profiles) = setup_profiles(&entries);
     let server = mock::MockServer::start(entries).await;

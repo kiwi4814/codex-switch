@@ -18,15 +18,33 @@ use serde_json::{Value, json};
 
 /// Per-token state: a list of responses and a cursor tracking the next response to return.
 struct TokenState {
-    responses: Vec<Value>,
+    responses: Vec<MockResponse>,
     cursor: usize,
+    requests: usize,
 }
 
 type SharedState = Arc<Mutex<HashMap<String, TokenState>>>;
 
 pub struct MockServer {
     addr: SocketAddr,
+    state: SharedState,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+#[derive(Clone)]
+pub enum MockResponse {
+    Json(StatusCode, Value),
+    Text(StatusCode, String),
+}
+
+impl MockResponse {
+    pub fn json(status: StatusCode, body: Value) -> Self {
+        Self::Json(status, body)
+    }
+
+    pub fn text(status: StatusCode, body: impl Into<String>) -> Self {
+        Self::Text(status, body.into())
+    }
 }
 
 impl MockServer {
@@ -37,6 +55,23 @@ impl MockServer {
     /// returns the next response in the list, advancing the cursor.
     /// If the cursor exceeds the list length, the last response is repeated.
     pub async fn start(entries: Vec<(String, Vec<Value>)>) -> Self {
+        let entries = entries
+            .into_iter()
+            .map(|(token, responses)| {
+                (
+                    token,
+                    responses
+                        .into_iter()
+                        .map(|response| MockResponse::json(StatusCode::OK, response))
+                        .collect(),
+                )
+            })
+            .collect();
+        Self::start_programmed(entries).await
+    }
+
+    /// Start the mock server with status/body response sequences per token.
+    pub async fn start_programmed(entries: Vec<(String, Vec<MockResponse>)>) -> Self {
         let mut state_map = HashMap::new();
         for (token, responses) in entries {
             state_map.insert(
@@ -44,6 +79,7 @@ impl MockServer {
                 TokenState {
                     responses,
                     cursor: 0,
+                    requests: 0,
                 },
             );
         }
@@ -60,7 +96,7 @@ impl MockServer {
                 post(reset_credits_consume_handler),
             )
             .route("/oauth/token", post(token_handler))
-            .with_state(state);
+            .with_state(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -76,7 +112,11 @@ impl MockServer {
                 .unwrap();
         });
 
-        Self { addr, shutdown_tx }
+        Self {
+            addr,
+            state,
+            shutdown_tx,
+        }
     }
 
     /// The base URL for setting CS_USAGE_URL (e.g. "http://127.0.0.1:PORT").
@@ -95,6 +135,15 @@ impl MockServer {
     /// The base URL for setting CS_TOKEN_URL.
     pub fn token_url(&self) -> String {
         format!("http://{}/oauth/token", self.addr)
+    }
+
+    pub fn request_count(&self, token: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .get(token)
+            .map(|state| state.requests)
+            .unwrap_or(0)
     }
 
     /// Shut down the mock server.
@@ -209,29 +258,18 @@ async fn usage_handler(State(state): State<SharedState>, headers: HeaderMap) -> 
     let idx = ts.cursor.min(ts.responses.len().saturating_sub(1));
     let response = ts.responses[idx].clone();
     ts.cursor += 1;
+    ts.requests += 1;
 
-    axum::Json(response).into_response()
+    match response {
+        MockResponse::Json(status, body) => (status, axum::Json(body)).into_response(),
+        MockResponse::Text(status, body) => (status, body).into_response(),
+    }
 }
 
 /// POST /oauth/token handler — mock token refresh.
 /// Validates grant_type=refresh_token is present, then returns dummy tokens.
-async fn token_handler(body: String) -> impl IntoResponse {
-    // Parse form body into key-value pairs
-    let params: HashMap<String, String> = body
-        .split('&')
-        .filter_map(|pair| {
-            let (key, val) = pair.split_once('=')?;
-            Some((
-                key.to_string(),
-                urlencoding::decode(val)
-                    .map(|v| v.into_owned())
-                    .unwrap_or_else(|_| val.to_string()),
-            ))
-        })
-        .collect();
-
-    // Validate grant_type
-    let grant_type = params.get("grant_type").map(|s| s.as_str());
+async fn token_handler(axum::Json(body): axum::Json<Value>) -> impl IntoResponse {
+    let grant_type = body.get("grant_type").and_then(Value::as_str);
     if grant_type != Some("refresh_token") {
         return (
             StatusCode::BAD_REQUEST,
@@ -246,10 +284,20 @@ async fn token_handler(body: String) -> impl IntoResponse {
             .into_response();
     }
 
-    let refresh_token = params
+    let Some(refresh_token) = body
         .get("refresh_token")
-        .cloned()
-        .unwrap_or_else(|| "unknown".to_string());
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": "invalid_request",
+                "error_description": "refresh_token is required"
+            })),
+        )
+            .into_response();
+    };
 
     let response = json!({
         "id_token": format!("mock_id_{refresh_token}"),

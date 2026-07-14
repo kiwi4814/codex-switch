@@ -221,3 +221,92 @@ fn restore_launch_auth(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::sync::MutexGuard;
+
+    use super::restore_launch_auth;
+
+    struct TestAppHome {
+        _lock: MutexGuard<'static, ()>,
+        home: tempfile::TempDir,
+        previous: Option<OsString>,
+    }
+
+    impl TestAppHome {
+        fn new() -> Self {
+            let lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os("CODEX_SWITCH_HOME");
+            unsafe {
+                std::env::set_var("CODEX_SWITCH_HOME", home.path());
+            }
+            Self {
+                _lock: lock,
+                home,
+                previous,
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self.home.path()
+        }
+    }
+
+    impl Drop for TestAppHome {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("CODEX_SWITCH_HOME", value),
+                    None => std::env::remove_var("CODEX_SWITCH_HOME"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn restore_launch_auth_restores_original_and_removes_backup() {
+        let home = TestAppHome::new();
+        let codex_auth = home.path().join("codex/auth.json");
+        let backup = home.path().join("auth.backup");
+        std::fs::create_dir_all(codex_auth.parent().unwrap()).unwrap();
+        std::fs::write(&codex_auth, b"staged profile").unwrap();
+        std::fs::write(&backup, b"original auth").unwrap();
+
+        restore_launch_auth(&codex_auth, &backup, true).unwrap();
+
+        assert_eq!(std::fs::read(&codex_auth).unwrap(), b"original auth");
+        assert!(!backup.exists());
+        assert!(home.path().join("auth.lock").exists());
+    }
+
+    #[test]
+    fn restore_launch_auth_removes_staged_auth_without_original() {
+        let home = TestAppHome::new();
+        let codex_auth = home.path().join("codex/auth.json");
+        let backup = home.path().join("auth.backup");
+        std::fs::create_dir_all(codex_auth.parent().unwrap()).unwrap();
+        std::fs::write(&codex_auth, b"staged profile").unwrap();
+
+        restore_launch_auth(&codex_auth, &backup, false).unwrap();
+
+        assert!(!codex_auth.exists());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn restore_launch_auth_without_original_or_staged_file_is_noop() {
+        let home = TestAppHome::new();
+        let codex_auth = home.path().join("codex/auth.json");
+        let backup = home.path().join("auth.backup");
+
+        restore_launch_auth(&codex_auth, &backup, false).unwrap();
+
+        assert!(!codex_auth.exists());
+        assert!(!backup.exists());
+    }
+}

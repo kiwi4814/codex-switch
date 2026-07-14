@@ -552,10 +552,7 @@ async fn verify_checksum(client: &reqwest::Client, url: &str, archive_path: &Pat
         .await
         .with_context(|| format!("reading checksum response from {url}"))?;
 
-    let expected = checksum_text
-        .split_whitespace()
-        .next()
-        .filter(|value| !value.is_empty())
+    let expected = extract_checksum_digest(&checksum_text)
         .context("checksum file did not contain a SHA256 digest")?;
 
     let actual = {
@@ -574,6 +571,13 @@ async fn verify_checksum(client: &reqwest::Client, url: &str, archive_path: &Pat
     }
 
     Ok(())
+}
+
+fn extract_checksum_digest(checksum_text: &str) -> Option<&str> {
+    checksum_text
+        .split_whitespace()
+        .next()
+        .filter(|value| !value.is_empty())
 }
 
 fn checksum_matches(expected: &str, actual: &str) -> bool {
@@ -1180,5 +1184,47 @@ mod tests {
             "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2",
             "0000000000000000000000000000000000000000000000000000000000000000"
         ));
+    }
+
+    #[test]
+    fn checksum_digest_extracts_gnu_two_column_format() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let text = format!("{digest}  cs-darwin-arm64.tar.gz\n");
+
+        assert_eq!(extract_checksum_digest(&text), Some(digest));
+        assert!(checksum_matches(
+            extract_checksum_digest(&text).unwrap(),
+            digest
+        ));
+    }
+
+    #[test]
+    fn checksum_digest_matches_uppercase_hash() {
+        let lowercase = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let uppercase = lowercase.to_ascii_uppercase();
+        let text = format!("{uppercase}  archive.tar.gz\n");
+
+        assert!(checksum_matches(
+            extract_checksum_digest(&text).unwrap(),
+            lowercase
+        ));
+    }
+
+    #[test]
+    fn checksum_digest_rejects_wrong_hash() {
+        let actual = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let wrong = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let text = format!("{wrong}  archive.tar.gz\n");
+
+        assert!(!checksum_matches(
+            extract_checksum_digest(&text).unwrap(),
+            actual
+        ));
+    }
+
+    #[test]
+    fn checksum_digest_rejects_empty_or_whitespace_only_files() {
+        assert_eq!(extract_checksum_digest(""), None);
+        assert_eq!(extract_checksum_digest(" \t\n"), None);
     }
 }

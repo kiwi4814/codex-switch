@@ -234,16 +234,23 @@ fn truncate_line(line: &Line<'_>, max_width: usize) -> Line<'static> {
     let mut acc: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     for span in &line.spans {
-        let span_w = span.content.chars().count();
+        let span_w = span.width();
         if used + span_w <= target {
             acc.push(Span::styled(span.content.to_string(), span.style));
             used += span_w;
             continue;
         }
-        // partial
-        let remain = target.saturating_sub(used);
-        if remain > 0 {
-            let partial: String = span.content.chars().take(remain).collect();
+
+        let mut partial = String::new();
+        for grapheme in span.styled_graphemes(Style::default()) {
+            let grapheme_width = Span::raw(grapheme.symbol).width();
+            if used + grapheme_width > target {
+                break;
+            }
+            partial.push_str(grapheme.symbol);
+            used += grapheme_width;
+        }
+        if !partial.is_empty() {
             acc.push(Span::styled(partial, span.style));
         }
         break;
@@ -253,4 +260,58 @@ fn truncate_line(line: &Line<'_>, max_width: usize) -> Line<'static> {
         Style::default().fg(DIM),
     ));
     Line::from(acc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn content(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn truncate_line_returns_original_when_shorter_or_exact_width() {
+        let short = Line::from("abc");
+        let exact = Line::from("abcd");
+
+        assert_eq!(content(&truncate_line(&short, 4)), "abc");
+        assert_eq!(content(&truncate_line(&exact, 4)), "abcd");
+    }
+
+    #[test]
+    fn truncate_line_handles_cjk_and_emoji_by_display_width() {
+        let truncated = truncate_line(&Line::from("中🙂abc"), 4);
+
+        assert!(truncated.width() <= 4, "line was {truncated:?}");
+        assert!(content(&truncated).ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_line_keeps_unicode_grapheme_clusters_intact() {
+        let heart = truncate_line(&Line::from("❤️a"), 2);
+        let developer = truncate_line(&Line::from("👩‍💻ab"), 3);
+
+        assert!(heart.width() <= 2, "line was {heart:?}");
+        assert_eq!(content(&developer), "👩‍💻…");
+        assert_eq!(developer.width(), 3);
+    }
+
+    #[test]
+    fn truncate_line_preserves_partial_content_across_spans() {
+        let line = Line::from(vec![
+            Span::styled("ab", Style::default().fg(Color::Red)),
+            Span::styled("cdef", Style::default().fg(Color::Blue)),
+        ]);
+
+        let truncated = truncate_line(&line, 5);
+
+        assert_eq!(content(&truncated), "abcd…");
+        assert_eq!(truncated.width(), 5);
+        assert_eq!(truncated.spans[0].style.fg, Some(Color::Red));
+        assert_eq!(truncated.spans[1].style.fg, Some(Color::Blue));
+    }
 }

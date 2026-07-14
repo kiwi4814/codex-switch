@@ -192,3 +192,44 @@ pub(crate) fn print_usage_line(u: &usage::UsageInfo) {
         println!("  {}", color::dim(&line));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{format_reset_short_relative, render_progress_bar};
+    use crate::usage::WindowUsage;
+
+    #[test]
+    fn progress_bar_clamps_used_and_pace_positions() {
+        assert_eq!(render_progress_bar(0.0, None, 10), "----------");
+        assert_eq!(render_progress_bar(100.0, None, 10), "==========");
+        assert_eq!(render_progress_bar(0.0, Some(150.0), 10), "---------|");
+        assert_eq!(render_progress_bar(50.0, Some(50.0), 10), "=====|----");
+    }
+
+    fn reset_after(seconds: i64) -> WindowUsage {
+        WindowUsage {
+            resets_at: Some(crate::auth::now_unix_secs() + seconds),
+            ..WindowUsage::default()
+        }
+    }
+
+    #[test]
+    fn short_relative_reset_uses_minute_hour_and_day_boundaries() {
+        assert_eq!(
+            format_reset_short_relative(&reset_after(59 * 60 + 30)),
+            "~59m"
+        );
+        assert_eq!(
+            format_reset_short_relative(&reset_after(60 * 60 + 30)),
+            "~1h0m"
+        );
+        assert_eq!(
+            format_reset_short_relative(&reset_after(23 * 60 * 60 + 59 * 60 + 30)),
+            "~23h59m"
+        );
+        assert_eq!(
+            format_reset_short_relative(&reset_after(24 * 60 * 60 + 30)),
+            "~1d0h"
+        );
+    }
+}

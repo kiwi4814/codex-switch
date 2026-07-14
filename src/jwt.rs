@@ -242,6 +242,56 @@ mod tests {
     }
 
     #[test]
+    fn is_team_accepts_plan_type_alone() {
+        let info = AccountInfo {
+            plan_type: Some("team".to_string()),
+            ..AccountInfo::default()
+        };
+
+        assert!(info.is_team());
+    }
+
+    #[test]
+    fn is_team_accepts_organization_alone() {
+        let info = AccountInfo {
+            organizations: vec![OrgInfo::default()],
+            ..AccountInfo::default()
+        };
+
+        assert!(info.is_team());
+    }
+
+    #[test]
+    fn is_team_accepts_workspace_name_alone() {
+        let info = AccountInfo {
+            workspace_name: Some("Workspace".to_string()),
+            ..AccountInfo::default()
+        };
+
+        assert!(info.is_team());
+    }
+
+    #[test]
+    fn is_team_rejects_personal_account_without_team_signals() {
+        assert!(!AccountInfo::default().is_team());
+    }
+
+    #[test]
+    fn is_free_defaults_missing_plan_to_free() {
+        assert!(AccountInfo::default().is_free());
+    }
+
+    #[test]
+    fn is_free_rejects_plus_plan() {
+        let info = AccountInfo {
+            plan_type: Some("plus".to_string()),
+            ..AccountInfo::default()
+        };
+
+        assert!(!info.is_free());
+    }
+
+    #[test]
     fn test_parse_account_info_extracts_email_and_plan() {
         let auth = json!({
             "tokens": {

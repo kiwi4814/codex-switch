@@ -804,6 +804,38 @@ mod tests {
     }
 
     #[test]
+    fn pkce_challenge_is_s256_of_rfc7636_verifier() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use sha2::{Digest, Sha256};
+
+        let pkce = generate_pkce();
+        let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce.code_verifier.as_bytes()));
+
+        assert_eq!(pkce.code_challenge, expected);
+        assert!((43..=128).contains(&pkce.code_verifier.len()));
+        assert!(pkce.code_verifier.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_' | '~')
+        }));
+        assert!(!pkce.code_verifier.contains('='));
+        assert!(!pkce.code_challenge.contains('='));
+    }
+
+    #[test]
+    fn generated_states_are_nonempty_unique_and_url_safe() {
+        let first = generate_state();
+        let second = generate_state();
+
+        assert!(!first.is_empty());
+        assert_ne!(first, second);
+        assert!(
+            first.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            )
+        );
+        assert!(!first.contains('='));
+    }
+
+    #[test]
     fn test_build_auth_json_structure() {
         let tokens = LoginTokens {
             id_token: "id-token".to_string(),

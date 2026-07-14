@@ -99,6 +99,9 @@ fn launch_lock_path() -> Result<PathBuf> {
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn lock_live_auth() -> Result<File> {
     let path = auth_lock_path()?;
     acquire_file_lock(&path, LOCK_WAIT_TIMEOUT, "auth")
@@ -914,15 +917,13 @@ pub fn save_auth_value(val: serde_json::Value, hint_alias: Option<&str>) -> Resu
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::sync::{LazyLock, Mutex, MutexGuard};
+    use std::sync::MutexGuard;
     use std::time::Duration;
 
     use anyhow::Result;
     use fs4::FileExt;
 
     use super::{cmd_delete, cmd_use, rename_profile, switch_profile, validate_alias};
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     struct TestEnv {
         _lock: MutexGuard<'static, ()>,
@@ -934,7 +935,7 @@ mod tests {
 
     impl TestEnv {
         fn new() -> Self {
-            let lock = ENV_LOCK
+            let lock = super::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let home = tempfile::tempdir().unwrap();

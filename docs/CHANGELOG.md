@@ -1,5 +1,11 @@
 # Changelog
 
+## v20260714.3.0 — 2026-07-14
+
+- **Trustworthy integration coverage** — Scoring and mock HTTP tests now exercise the production ranking, token refresh, retry, malformed-response, and failure paths instead of duplicating implementation logic in test code.
+- **Boundary regression coverage** — Added focused tests for launch auth restoration, JWT plan detection, login PKCE/state generation, checksum parsing, progress rendering, and popup width limits.
+- **Unicode-safe popup truncation** — Popup lines now truncate by terminal grapheme width so CJK text and VS16/ZWJ emoji stay within the requested width without splitting a displayed character.
+
 ## v20260714.2.0 — 2026-07-14
 
 - **Reliable legacy upgrade gate on macOS 26** — Release CI now fetches exact Release metadata with the job token and serves it to the reviewed v0.0.19 fixture over loopback, while the fixture still downloads and verifies the real published assets before replacing itself.
