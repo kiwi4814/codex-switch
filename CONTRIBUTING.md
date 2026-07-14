@@ -5,7 +5,7 @@ Thank you for improving `codex-switch`. Contributions should be small enough to 
 ## Before you start
 
 1. Search existing issues and pull requests.
-2. Read the [development guide](docs/DEVELOPMENT.md) and [architecture](docs/ARCHITECTURE.md).
+2. Read the [developer onboarding](docs/wiki/Developer-Onboarding.md) and [architecture overview](docs/wiki/Architecture-Overview.md) pages.
 3. Base normal work on `dev`; `master` tracks stable releases.
 4. For a substantial feature or architecture change, open an issue before implementation so the boundary can be agreed first.
 
@@ -38,13 +38,13 @@ If a command is unavailable on your platform, state exactly what was not run in 
 
 Update documentation in the same pull request when behavior changes:
 
-- `README.md` for installation, commands, configuration, and common workflows
-- `docs/FEATURES.md` for feature behavior and user safety boundaries
-- `docs/ARCHITECTURE.md` for module, storage, or data-flow changes
-- `docs/DEVELOPMENT.md` for engineering workflow changes
-- `docs/CHANGELOG.md` for the current Unreleased release
+- `docs/wiki/` pages for user-visible behavior: `Feature-Guide.md`, `Command-Reference.md`, `Configuration.md`, `Updating.md`, `Troubleshooting.md`
+- `README.md` when the quick start or installation flow is affected
+- `docs/wiki/Architecture-Overview.md` for module, storage, or data-flow changes
+- `docs/wiki/Developer-Onboarding.md` for engineering workflow changes
+- `docs/CHANGELOG.md` for the current development cycle
 
-The repository documents are canonical. Wiki pages are navigation sources under `docs/wiki/`; do not create a second detailed implementation document only in the Wiki.
+The `docs/wiki/` sources are the reader documentation and are published to the GitHub Wiki by CI; never edit the published Wiki directly.
 
 ## Open the pull request
 

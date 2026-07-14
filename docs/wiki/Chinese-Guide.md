@@ -1,6 +1,6 @@
 # 中文指南
 
-> 英文文档是 `codex-switch` 的主文档与行为依据。本页提供中文快速入口，不单独维护第二套实现说明。
+> 英文 Wiki 是 `codex-switch` 的主文档与行为依据。本页提供中文快速入口，不单独维护第二套实现说明。
 
 `codex-switch` 用于管理本机多个 OpenAI Codex CLI 登录、查看额度，并在新会话前选择合适账号。它会操作 Codex 的文件型认证，因此请勿分享 profile、`auth.json`、Token、代理凭据或未经脱敏的 debug 输出。
 
@@ -33,7 +33,7 @@ codex-switch login
 codex-switch tui
 ```
 
-无浏览器服务器使用 `codex-switch login --device`。完整中文说明见主仓库的 [README_CN.md](https://github.com/xjoker/codex-switch/blob/dev/README_CN.md)。
+无浏览器服务器使用 `codex-switch login --device`。
 
 ## 参与开发版测试
 
@@ -43,10 +43,13 @@ codex-switch tui
 
 - [开始使用](Getting-Started) — 安装、登录和首次启动
 - [功能指南](Feature-Guide) — 主要工作流与安全边界
+- [命令参考](Command-Reference) — 全部命令、全局选项和 TUI 快捷键
+- [配置](Configuration) — 路径、代理、daemon 与 launch 设置
+- [更新](Updating) — 更新方式、通道切换和旧版本迁移
 - [故障排查](Troubleshooting) — 常见错误与恢复方式
 - [常见问题](FAQ) — 简短项目说明
-- [命令参考](https://github.com/xjoker/codex-switch/blob/dev/docs/COMMANDS.md) — 以已安装版本的 `--help` 为最终依据
-- [中文 README](https://github.com/xjoker/codex-switch/blob/dev/README_CN.md) — 更完整的中文使用说明
+
+命令行为以已安装版本的 `codex-switch <命令> --help` 为最终依据。
 
 ## 反馈问题
 

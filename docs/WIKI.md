@@ -1,16 +1,17 @@
 # GitHub Wiki maintenance
 
-The `codex-switch` Wiki is a curated entry point for users, contributors, and coding agents. Canonical technical content remains in the main repository so it can be reviewed in pull requests, protected with the code, and included in an ordinary clone.
+The `codex-switch` Wiki is the reader-facing documentation for users, contributors, and coding agents. Its source of truth is `docs/wiki/` in the main repository, so every page is reviewed in pull requests, protected with the code, and included in an ordinary clone; the published Wiki is a generated projection.
 
 ## Documentation decision
 
-Three approaches were evaluated against discoverability, review history, clone access, and maintenance cost:
+Revised 2026-07-14. The original 2026-07-13 decision kept full content in separate `docs/*.md` files and used the Wiki as a thin navigation layer; in practice the Wiki pages carried no usable content and the README absorbed the details, so the two were merged.
 
 | Approach | Decision | Reason |
 |---|---|---|
 | Repository documents only | Not selected | Strongest review and clone behavior, but misses the requested Wiki navigation and Wiki search experience. |
-| Wiki as the primary documentation | Rejected | The Wiki is a separate Git repository and can drift from reviewed code; a normal source clone does not include it. |
-| Canonical repository documents plus Wiki navigation | Selected | Keeps one reviewed source of truth while providing a task-oriented Wiki entry point. |
+| Wiki edited as its own repository | Rejected | The Wiki repository has no pull-request or branch-protection workflow and drifts from reviewed code. |
+| Thin Wiki navigation over separate `docs/*.md` files | Superseded | Produced stub pages that bounced readers back to the repository and duplicated structure in two places. |
+| Full content in `docs/wiki/`, published to the Wiki by CI | Selected | One reviewed source of truth that is also the complete, searchable reader documentation. |
 
 GitHub documents Wiki page history, diffs, reverts, sidebars, and local Git editing. It does not document the Wiki as having the same pull request and branch-protection workflow as the main repository, so this project does not rely on that assumption.
 
@@ -26,13 +27,13 @@ Official references, checked 2026-07-13:
 
 ## Edit the Wiki source
 
-Wiki source pages live in `docs/wiki/`. Keep them concise and link to canonical documents for details. Each page should answer one navigation question, identify the canonical source, and end with explicit next steps.
+Wiki source pages live in `docs/wiki/`. Each page owns one topic completely (getting started, features, commands, configuration, updating, troubleshooting, architecture, onboarding); pages cross-link instead of repeating each other, and every page ends with explicit next steps. Maintainer-only material (release process, changelog, ADRs) stays outside the Wiki under `docs/`.
 
 The Wiki is published from `dev`, so reviewed repository-document links must target the same `dev` branch. Stable installation commands should use `/releases/latest/download/...`; rolling development installation commands should use `/releases/download/dev/...`. Do not point Wiki navigation at repository documents that exist only on `dev` through `master` URLs.
 
 Use Wiki page slugs such as `(Getting-Started)` for internal links. Every slug must match a Markdown filename in `docs/wiki/`. The distribution contract checks internal pages, repository paths, and heading anchors without making network requests.
 
-English is the primary Wiki language. A Chinese companion page may provide a quick path for Chinese readers, but detailed behavior remains in the English repository documents. When behavior changes, update the canonical English document first, then adjust the companion summary if its navigation or examples are affected.
+English is the primary Wiki language. A Chinese companion page may provide a quick path for Chinese readers, but detailed behavior remains in the English pages. When behavior changes, update the English page first, then adjust the companion summary if its navigation or examples are affected.
 
 Do not edit the published Wiki directly except to recover from a publishing failure. A direct fix must be copied back to `docs/wiki/` immediately.
 

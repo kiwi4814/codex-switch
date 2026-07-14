@@ -2,7 +2,7 @@
 
 > **Prerelease warning:** the rolling `dev` build contains changes intended for the next stable release. It may change again before release. Do not use it when you need stable production behavior.
 >
-> Canonical sources: [README — Updating existing installations](https://github.com/xjoker/codex-switch/blob/dev/README.md#updating-existing-installations), [Feature guide — Update the binary](https://github.com/xjoker/codex-switch/blob/dev/docs/FEATURES.md#update-the-binary), and [Troubleshooting](https://github.com/xjoker/codex-switch/blob/dev/docs/TROUBLESHOOTING.md).
+> For stable-channel updates, Homebrew rules, and legacy-install migration, see [Updating](Updating).
 
 ## Install the rolling dev build
 
@@ -104,5 +104,5 @@ Homebrew 只提供正式版。切换开发版前先运行 `brew uninstall codex-
 ## Next steps
 
 - Learn the supported workflows in the [Feature guide](Feature-Guide).
+- Review stable-channel and migration details in [Updating](Updating).
 - Diagnose a failed install or update with [Troubleshooting](Troubleshooting).
-- Return to the Wiki [Home](Home).

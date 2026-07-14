@@ -14,11 +14,14 @@
 
 | I want to… | Start here |
 |---|---|
-| Add, import, inspect, or switch accounts | [Feature guide](Feature-Guide) |
+| Install codex-switch and add my first account | [Getting started](Getting-Started) |
+| Manage accounts, watch quota, select, launch, or run the daemon | [Feature guide](Feature-Guide) |
+| Look up an exact command, flag, or TUI shortcut | [Command reference](Command-Reference) |
+| Configure paths, proxy, cache, daemon, or launch behavior | [Configuration](Configuration) |
+| Update the binary or move between release channels | [Updating](Updating) |
 | Install or test the rolling `dev` build | [Testing development releases](Development-Releases) |
 | Diagnose an error or recover a profile | [Troubleshooting](Troubleshooting) |
 | Check a short behavior or security answer | [FAQ](FAQ) |
-| Read the complete command and configuration docs | [Documentation index](https://github.com/xjoker/codex-switch/blob/dev/docs/README.md) |
 
 ## Contribute
 
@@ -28,6 +31,6 @@
 
 ## Documentation model
 
-The Wiki is a concise navigation layer. Detailed behavior lives in the reviewed [`dev` branch documentation](https://github.com/xjoker/codex-switch/tree/dev/docs), which is published alongside these Wiki sources. Stable installers and binaries come from [GitHub Releases](https://github.com/xjoker/codex-switch/releases).
+These Wiki pages are the user and contributor documentation for `codex-switch`. Their sources live in [`docs/wiki/` on the `dev` branch](https://github.com/xjoker/codex-switch/tree/dev/docs/wiki), are reviewed in pull requests with the code, and are published here automatically. Maintainer-only material stays in the repository: the [release process](https://github.com/xjoker/codex-switch/blob/dev/docs/RELEASE.md) and the [changelog](https://github.com/xjoker/codex-switch/blob/dev/docs/CHANGELOG.md). Stable installers and binaries come from [GitHub Releases](https://github.com/xjoker/codex-switch/releases).
 
 Do not publish auth files, profile files, tokens, unredacted debug output, proxy credentials, account IDs, email addresses, or workspace names.

@@ -7,6 +7,9 @@
 ## Use codex-switch
 
 - [Feature guide](Feature-Guide)
+- [Command reference](Command-Reference)
+- [Configuration](Configuration)
+- [Updating](Updating)
 - [Testing development releases](Development-Releases)
 
 ## Get help
@@ -20,7 +23,7 @@
 - [Architecture overview](Architecture-Overview)
 - [Contributing](Contributing)
 
-## Source of truth
+## Project
 
-- [Documentation index](https://github.com/xjoker/codex-switch/blob/dev/docs/README.md)
 - [Changelog](https://github.com/xjoker/codex-switch/blob/dev/docs/CHANGELOG.md)
+- [Releases](https://github.com/xjoker/codex-switch/releases)

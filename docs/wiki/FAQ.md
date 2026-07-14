@@ -20,6 +20,10 @@ No. Inactive profiles are archived under `deleted-profiles/`. The active profile
 
 No. It is an optional Beta feature. `codex-switch use`, `list`, `launch`, and the TUI work without it.
 
+## What do the version numbers mean?
+
+Releases use calendar versions in the form `YYYYMMDD.N.0`. Rolling dev builds end in `-dev`. Calendar versions are a normal upgrade from the earlier `0.0.x` series; see [Updating](Updating).
+
 ## How do I test the next release?
 
 Use the rolling dev channel only when you are prepared to test prerelease behavior. Follow [Testing development releases](Development-Releases) for installation, verification, rollback, and issue-reporting steps.
@@ -28,9 +32,9 @@ Use the rolling dev channel only when you are prepared to test prerelease behavi
 
 Not currently. Archives are checked against SHA256 files from the same GitHub Release, which detects corruption but shares the Release trust domain.
 
-## Where should implementation details be updated?
+## Where should documentation fixes go?
 
-In the main repository documentation. The Wiki is a curated navigation layer; see the [documentation index](https://github.com/xjoker/codex-switch/blob/dev/docs/README.md).
+These Wiki pages are generated from [`docs/wiki/` on the `dev` branch](https://github.com/xjoker/codex-switch/tree/dev/docs/wiki). Open a pull request against those sources; do not edit the published Wiki directly.
 
 ## Next steps
 

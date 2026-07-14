@@ -267,6 +267,8 @@ fn wiki_navigation_is_task_oriented_and_progressive() {
     for page in [
         "Architecture-Overview.md",
         "Chinese-Guide.md",
+        "Command-Reference.md",
+        "Configuration.md",
         "Contributing.md",
         "Developer-Onboarding.md",
         "Development-Releases.md",
@@ -274,6 +276,7 @@ fn wiki_navigation_is_task_oriented_and_progressive() {
         "Feature-Guide.md",
         "Getting-Started.md",
         "Troubleshooting.md",
+        "Updating.md",
     ] {
         assert!(
             repo_file(&format!("docs/wiki/{page}")).contains("## Next steps"),
