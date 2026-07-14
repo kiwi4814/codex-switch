@@ -11,7 +11,7 @@ This page takes you from nothing to a working multi-account setup: install codex
 cli_auth_credentials_store = "file"
 ```
 
-Explicit `keyring`, `auto`, and `ephemeral` stores are rejected. A managed Codex configuration with `forced_login_method = "api"` is also incompatible, because codex-switch manages ChatGPT login profiles. In both cases codex-switch stops with an actionable error instead of modifying authentication state.
+Explicit `keyring`, `auto`, and `ephemeral` stores are rejected — permanently by design, because OS keyrings cannot provide the locking and atomic-replace guarantees switching depends on (see [why only the file store is supported](Configuration#why-only-the-file-store-is-supported)). A managed Codex configuration with `forced_login_method = "api"` is also incompatible, because codex-switch manages ChatGPT login profiles. In both cases codex-switch stops with an actionable error instead of modifying authentication state; after switching to the file store, log in again.
 
 ## Install
 

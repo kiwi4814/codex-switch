@@ -2,7 +2,7 @@
 
 ## Does codex-switch support keyring-backed Codex credentials?
 
-No. Its core operation is atomic replacement of `$CODEX_HOME/auth.json`, so Codex must use `cli_auth_credentials_store = "file"`.
+No, and this is permanent by design. OS keyrings provide no locking or atomic-replace semantics, and Codex's keyring entry format is an undocumented internal layout that has already changed between versions and platforms. Codex must use `cli_auth_credentials_store = "file"`; if it previously used a keyring store, switch the setting and log in again. See [why only the file store is supported](Configuration#why-only-the-file-store-is-supported).
 
 ## Does switching affect an already-running Codex session?
 

@@ -14,6 +14,16 @@ cli_auth_credentials_store = "file"
 
 Explicit `keyring`, `auto`, and `ephemeral` modes are rejected. A managed configuration with `forced_login_method = "api"` is also incompatible with ChatGPT login profiles.
 
+### Why only the file store is supported
+
+This is a deliberate limitation, not a temporary gap:
+
+- Every reliability guarantee codex-switch makes — cross-process locking, atomic replacement, backup rotation — is built on file primitives. OS keyrings (macOS Keychain, Windows Credential Manager, Linux Secret Service) expose no locking or atomic-replace semantics, so a switch racing a running Codex process could silently select the wrong account instead of failing loudly.
+- Codex's keyring entry layout is an undocumented internal format. It was already reworked once (June 2026, when Windows moved to an encrypted sidecar because of a Credential Manager size limit) and now differs between Windows and other platforms. Depending on it would break silently whenever Codex changes it.
+- An `ephemeral` store persists nothing, so there is nothing to switch.
+
+Accounts are added by logging in with `codex-switch login` or by importing an existing `auth.json`; codex-switch never reads credentials out of an OS keyring. If Codex was previously used with a keyring store, set `cli_auth_credentials_store = "file"` and log in again.
+
 ## Paths
 
 | Path | Purpose |
