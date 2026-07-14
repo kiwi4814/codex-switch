@@ -21,20 +21,36 @@ jobs:
       is_dev: ${{ steps.parse.outputs.is_dev }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Parse tag
         id: parse
         run: |
           RAW_TAG="${GITHUB_REF#refs/tags/}"
+          BASE=$(cat VERSION)
+          MANIFEST_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [[ ! "$BASE" =~ ^[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "VERSION must contain a SemVer-compatible numeric base" >&2
+            exit 1
+          fi
+          if [[ "$MANIFEST_VERSION" != "$BASE" ]]; then
+            echo "Cargo.toml version must match VERSION" >&2
+            exit 1
+          fi
           if [[ "$RAW_TAG" == "dev" ]]; then
-            # dev tag: use base version from Cargo.toml with -dev suffix
-            BASE=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-            # Strip any existing pre-release suffix (e.g. "0.0.11-dev" -> "0.0.11")
-            BASE="${BASE%%-*}"
+            # dev tag: use the repository VERSION base with a -dev suffix
             echo "version=${BASE}-dev" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
             echo "is_dev=true" >> "$GITHUB_OUTPUT"
           else
             TAG="${RAW_TAG#v}"
+            PRERELEASE_IDENTIFIER='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+            BASE_PATTERN="${BASE//./\\.}"
+            TAG_PATTERN="^${BASE_PATTERN}(-${PRERELEASE_IDENTIFIER}(\.${PRERELEASE_IDENTIFIER})*)?$"
+            if [[ ! "$TAG" =~ $TAG_PATTERN ]]; then
+              echo "release tag must match VERSION with an optional SemVer prerelease suffix" >&2
+              exit 1
+            fi
             echo "version=${TAG}" >> "$GITHUB_OUTPUT"
             echo "is_dev=false" >> "$GITHUB_OUTPUT"
             if [[ "$TAG" == *-* ]]; then
@@ -46,6 +62,8 @@ jobs:
 
   build:
     needs: meta
+    env:
+      RELEASE_VERSION: ${{ needs.meta.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -95,7 +113,7 @@ jobs:
       - name: Inject version into Cargo.toml
         shell: bash
         run: |
-          VERSION="${{ needs.meta.outputs.version }}"
+          VERSION="$RELEASE_VERSION"
           sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
           rm -f Cargo.toml.bak
           echo "Building version: ${VERSION}"
@@ -140,10 +158,14 @@ jobs:
   release:
     needs: [meta, build]
     runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.meta.outputs.version }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -180,7 +202,6 @@ jobs:
 
       - name: Generate install script body
         run: |
-          VERSION="${{ needs.meta.outputs.version }}"
           cat > artifacts/INSTALL.md << 'HEREDOC'
           ## Quick Install
 
@@ -217,7 +238,7 @@ jobs:
         id: dev_body
         run: |
           cat > dev_body.md << EOF
-          Development build from \`${{ github.ref }}\` at ${{ github.sha }}.
+          Development build from \`${GITHUB_REF}\` at ${GITHUB_SHA}.
 
           **This is a pre-release build for testing.** Use \`codex-switch self-update --dev\` to install, or \`codex-switch self-update --stable\` to return to the latest stable release.
 
@@ -225,7 +246,7 @@ jobs:
 
           \`curl -fsSL https://github.com/xjoker/codex-switch/releases/download/dev/install.sh | bash -s -- --dev\`
 
-          Version: \`${{ needs.meta.outputs.version }}\`
+          Version: \`${RELEASE_VERSION}\`
           EOF
 
       - name: Create GitHub Release (dev)
@@ -260,6 +281,7 @@ jobs:
 
   legacy-upgrade:
     needs: [meta, release]
+    if: needs.meta.outputs.is_dev == 'true' || needs.meta.outputs.prerelease == 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -367,10 +389,12 @@ jobs:
     needs: [meta, release]
     if: needs.meta.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.meta.outputs.version }}
     steps:
       - name: Download sha256 files
         run: |
-          VERSION="${{ needs.meta.outputs.version }}"
+          VERSION="$RELEASE_VERSION"
           BASE="https://github.com/xjoker/codex-switch/releases/download/v${VERSION}"
           for name in cs-darwin-arm64 cs-darwin-amd64 cs-linux-arm64 cs-linux-amd64; do
             curl -fsSL "${BASE}/${name}.tar.gz.sha256" -o "${name}.sha256"
@@ -386,7 +410,7 @@ jobs:
 
       - name: Generate formula
         run: |
-          VERSION="${{ needs.meta.outputs.version }}"
+          VERSION="$RELEASE_VERSION"
           BASE="https://github.com/xjoker/codex-switch/releases/download/v${VERSION}"
 
           # Generate latest formula (codex-switch.rb)
@@ -475,7 +499,7 @@ jobs:
 
       - name: Push formula to tap
         run: |
-          VERSION="${{ needs.meta.outputs.version }}"
+          VERSION="$RELEASE_VERSION"
           git clone https://x-access-token:${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/xjoker/homebrew-tap.git tap
           mkdir -p tap/Formula
           cp codex-switch.rb tap/Formula/codex-switch.rb

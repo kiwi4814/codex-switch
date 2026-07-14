@@ -14,6 +14,12 @@ const SYSTEM_INSTALL_DIR: &str = "/usr/local/bin";
 const SYSTEM_INSTALL_MARKER_NAME: &str = ".codex-switch-system-install-v1";
 const UPDATE_TTL_SECS: i64 = 12 * 60 * 60;
 
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct LegacySystemInstallMigrationRequired {
+    message: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdatePlatform {
     Unix,
@@ -67,7 +73,7 @@ fn legacy_system_install_migration_hint(
         .is_some_and(|version| Version::parse(version).is_err())
     {
         return Some(format!(
-            "legacy direct install detected at '{}'; the requested version is not valid, so no migration command was generated. Use a semantic version such as `20260712.2.0`",
+            "One-time setup could not start\n\nThe requested version is not valid. Use a semantic version such as `20260712.2.0`, then retry. The existing installation at '{}' was not changed.",
             executable.display()
         ));
     }
@@ -101,7 +107,7 @@ fn legacy_system_install_migration_hint(
     };
 
     Some(format!(
-        "legacy direct install detected at '{}'; direct self-update is paused so future updates no longer require sudo. Run the user-level installer once: `{user_command}`. Profiles and configuration in ~/.codex-switch are preserved. If this was an intentional system install, record that choice with `{system_command}` instead",
+        "One-time setup required\n\ncodex-switch is still installed system-wide at '{}'. Choose how future updates should work.\n\nRecommended — move it to your user account:\n  {user_command}\n\nProfiles and configuration are preserved. Future updates will not need sudo.\n\nKeep the system-wide install instead:\n  {system_command}\n\nFuture updates will continue to require sudo.",
         executable.display()
     ))
 }
@@ -129,7 +135,7 @@ pub fn ensure_legacy_system_install_migrated(
         use_dev,
         requested_version,
     ) {
-        anyhow::bail!(hint);
+        return Err(LegacySystemInstallMigrationRequired { message: hint }.into());
     }
     Ok(())
 }
@@ -1032,10 +1038,31 @@ mod tests {
         )
         .expect("markerless /usr/local install must migrate");
 
-        assert!(hint.contains("legacy direct install"));
+        assert!(hint.contains("One-time setup required"));
         assert!(hint.contains("releases/download/dev/install.sh"));
         assert!(hint.contains("bash -s -- --dev"));
         assert!(hint.contains("--dev --system"));
+    }
+
+    #[test]
+    fn legacy_migration_message_is_actionable_without_internal_jargon() {
+        let hint = legacy_system_install_migration_hint(
+            Path::new("/usr/local/bin/codex-switch"),
+            UpdatePlatform::Unix,
+            false,
+            true,
+            None,
+        )
+        .expect("markerless /usr/local install must migrate");
+
+        assert!(hint.starts_with("One-time setup required"));
+        assert!(hint.contains("Recommended"));
+        assert!(hint.contains("Future updates will not need sudo"));
+        assert!(hint.contains("Profiles and configuration are preserved"));
+        assert!(hint.contains("Keep the system-wide install instead"));
+        assert!(hint.contains('\n'));
+        assert!(!hint.contains("legacy direct install detected"));
+        assert!(!hint.contains("direct self-update is paused"));
     }
 
     #[test]

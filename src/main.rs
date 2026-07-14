@@ -34,6 +34,10 @@ impl std::fmt::Display for OutputAlreadyReported {
 
 impl std::error::Error for OutputAlreadyReported {}
 
+fn should_report_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<OutputAlreadyReported>().is_none()
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -102,15 +106,26 @@ async fn main() {
     let result = dispatch(cli.command, use_json).await;
 
     if let Err(e) = result {
-        tracing::error!(error = %format!("{e:#}"), "command failed");
-        if use_json {
-            if e.downcast_ref::<OutputAlreadyReported>().is_none() {
+        if should_report_error(&e) {
+            tracing::error!(error = %format!("{e:#}"), "command failed");
+            if use_json {
                 print_error(&format!("{e:#}"));
+            } else {
+                eprintln!("{}", color::error(&format!("Error: {e:#}")));
             }
-        } else {
-            eprintln!("{}", color::error(&format!("Error: {e:#}")));
         }
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod error_reporting_tests {
+    use super::{OutputAlreadyReported, should_report_error};
+
+    #[test]
+    fn already_reported_errors_are_not_printed_or_logged_again() {
+        assert!(!should_report_error(&OutputAlreadyReported.into()));
+        assert!(should_report_error(&anyhow::anyhow!("new failure")));
     }
 }
 

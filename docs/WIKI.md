@@ -32,28 +32,20 @@ English is the primary Wiki language. A Chinese companion page may provide a qui
 
 Do not edit the published Wiki directly except to recover from a publishing failure. A direct fix must be copied back to `docs/wiki/` immediately.
 
-## Initialize the Wiki
+## Publish the Wiki
 
-GitHub requires the first page to be created in the web interface before the separate Wiki Git repository exists. After creating the initial `Home` page, publish the reviewed sources:
+The Wiki repository has been initialized with its first `Home` page. `.github/workflows/wiki.yml` publishes the reviewed `docs/wiki/*.md` sources automatically when they change on `dev`, the single Wiki publication branch. A maintainer can also run the `Sync Wiki` workflow manually from `dev`.
 
-```bash
-git clone https://github.com/xjoker/codex-switch.wiki.git ../codex-switch.wiki
-cp docs/wiki/*.md ../codex-switch.wiki/
-git -C ../codex-switch.wiki add --all
-git -C ../codex-switch.wiki commit -m "docs: sync project wiki"
-git -C ../codex-switch.wiki push origin HEAD
-```
+The workflow uses the job-scoped `GITHUB_TOKEN` with only `contents: write`; no long-lived personal access token is configured. It replaces the Wiki pages with the reviewed repository sources and commits only when content changed. Before publishing, it compares the run against the latest `dev` Wiki sources and skips stale runs.
 
-Pushing the Wiki is a remote publication and requires maintainer authorization. Review the source-repository diff before syncing.
+Do not push a local Wiki clone during the normal documentation workflow. If automation fails, inspect the `Sync Wiki` run before considering a manual recovery push.
 
 ## Verify publication
 
-After the push:
+After the workflow succeeds:
 
 1. Open the Wiki Home page and each sidebar link.
 2. Confirm canonical links resolve to the default branch.
 3. Confirm `_Sidebar.md` renders as navigation rather than a normal page.
 4. Compare the Wiki commit with the reviewed `docs/wiki/` source.
 5. Record the Wiki sync in the release checklist when documentation changed.
-
-Manual sync is intentionally used for the first version. Automated token or workflow publication has not been adopted because it adds credentials and failure modes without removing the need to review canonical documentation.

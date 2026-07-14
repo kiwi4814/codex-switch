@@ -1,5 +1,11 @@
 # Changelog
 
+## v20260714.1.0 — 2026-07-14
+
+- **Friendly legacy migration** — Replaced the duplicated `ERROR`/`Error:` output and internal installation jargon with one actionable setup message that preserves profiles and clearly separates the recommended user install from an intentional system install.
+- **Automatic GitHub Wiki publication** — Added a least-privilege GitHub Actions workflow that publishes reviewed `docs/wiki/` pages from `dev`, skips stale runs, and uses no long-lived personal access token.
+- **Version source of truth** — Added the root `VERSION` file and made release CI validate the synchronized Cargo manifest before building dev or stable artifacts.
+
 ## v20260713.6.0 — 2026-07-13
 
 - **Repository-backed GitHub Wiki** — Added task-oriented Wiki sources with English as the canonical language, a Chinese companion entry point, and a development-release testing guide.

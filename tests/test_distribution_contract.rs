@@ -34,6 +34,18 @@ fn repository_text_normalizes_windows_line_endings() {
 }
 
 #[test]
+fn version_file_is_the_release_source_of_truth() {
+    let version = repo_file("VERSION").trim().to_string();
+    let manifest = repo_file("Cargo.toml");
+    let release = repo_file(".github/workflows/release.yml");
+
+    assert_eq!(version, "20260714.1.0");
+    assert!(manifest.contains(&format!("version = \"{version}\"")));
+    assert!(release.contains("BASE=$(cat VERSION)"));
+    assert!(!release.contains("BASE=$(grep '^version' Cargo.toml"));
+}
+
+#[test]
 fn ci_covers_dev_and_all_supported_hosts() {
     let workflow = repo_file(".github/workflows/ci.yml");
 
@@ -75,6 +87,48 @@ fn ci_runs_build_test_lint_format_audit_and_script_parsers() {
         workflow.contains("Parser]::ParseFile") && workflow.contains("scripts/install.ps1"),
         "Windows CI must parse install.ps1 with the PowerShell parser"
     );
+}
+
+#[test]
+fn wiki_sync_uses_the_reviewed_repository_sources() {
+    let workflow = repo_file(".github/workflows/wiki.yml");
+
+    for required in [
+        "workflow_dispatch:",
+        "branches: [dev]",
+        "docs/wiki/**",
+        "permissions:",
+        "contents: write",
+        "${{ secrets.GITHUB_TOKEN }}",
+        "${GITHUB_REPOSITORY}.wiki.git",
+        "refs/heads/dev:refs/remotes/origin/dev",
+        "git diff --quiet \"$GITHUB_SHA\" refs/remotes/origin/dev -- docs/wiki .github/workflows/wiki.yml",
+        "for page in docs/wiki/*.md; do",
+        "[[ -f \"$page\" && ! -L \"$page\" ]]",
+        "cp -- \"$page\" \"$wiki_dir\"/",
+        "push origin HEAD:master",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "Wiki workflow must contain `{required}`"
+        );
+    }
+    assert!(!workflow.contains("WIKI_TOKEN"));
+    assert!(!workflow.contains("pull_request:"));
+    assert!(!workflow.contains("branches: [dev, master]"));
+}
+
+#[test]
+fn release_rejects_shell_metacharacters_in_tags_and_uses_env_in_scripts() {
+    let workflow = repo_file(".github/workflows/release.yml");
+
+    assert!(workflow.contains("TAG_PATTERN="));
+    assert!(workflow.contains("BASE_PATTERN=\"${BASE//./\\\\.}\""));
+    assert!(workflow.contains("[[ ! \"$TAG\" =~ $TAG_PATTERN ]]"));
+    assert!(!workflow.contains("VERSION=\"${{ needs.meta.outputs.version }}\""));
+    assert!(!workflow.contains("${{ github.ref }}` at ${{ github.sha }}"));
+    assert!(workflow.contains("RELEASE_VERSION: ${{ needs.meta.outputs.version }}"));
+    assert!(workflow.contains("persist-credentials: false"));
 }
 
 #[test]
@@ -187,7 +241,7 @@ fn self_update_gates_markerless_system_installs_before_network_checks() {
 
     assert_before(
         &command,
-        "ensure_legacy_system_install_migrated(use_dev, version)?",
+        "ensure_legacy_system_install_migrated(use_dev, version)",
         "if check",
     );
 }
@@ -242,6 +296,7 @@ fn release_retests_v0019_upgrade_on_all_supported_hosts() {
     for required in [
         "legacy-upgrade:",
         "needs: [meta, release]",
+        "if: needs.meta.outputs.is_dev == 'true' || needs.meta.outputs.prerelease == 'false'",
         "ubuntu-latest",
         "macos-latest",
         "windows-latest",

@@ -21,7 +21,17 @@ pub(crate) async fn self_update_cmd(
         update::is_dev_version(update::current_version())
     };
 
-    update::ensure_legacy_system_install_migrated(use_dev, version)?;
+    if let Err(error) = update::ensure_legacy_system_install_migrated(use_dev, version) {
+        if !json
+            && error
+                .downcast_ref::<update::LegacySystemInstallMigrationRequired>()
+                .is_some()
+        {
+            output::user_println(&color::warn(&error.to_string()));
+            return Err(crate::OutputAlreadyReported.into());
+        }
+        return Err(error);
+    }
 
     if check {
         let current_version = update::current_version().to_string();

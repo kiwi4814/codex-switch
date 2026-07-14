@@ -9,7 +9,7 @@ This document is for maintainers. Users should follow the installation and updat
 All of the following must be true before any release push:
 
 - The local branch is `dev`, the worktree is clean, and all intended changes are committed.
-- `Cargo.toml` contains the target base version and the top of `docs/CHANGELOG.md` contains the matching release section. Ordinary dev builds may keep it Unreleased; the final dev candidate must carry the intended stable date so promotion requires no edit.
+- `VERSION` contains the target base version, `Cargo.toml` matches it, and the top of `docs/CHANGELOG.md` contains the matching release section. Ordinary dev builds may keep it Unreleased; the final dev candidate must carry the intended stable date so promotion requires no edit.
 - Independent code review has no CRITICAL or HIGH findings. Authentication, update, or user-data changes also require security review.
 - The local quality gate and a real CLI smoke test pass.
 - `git push` has explicit authorization and the commit to publish is recorded.
@@ -24,7 +24,7 @@ The final development release before a stable release has an additional acceptan
 - Fast-forward `master` to that exact commit and create the stable tag on the same commit.
 - If any change is needed, publish and test a new `dev` build; the previous acceptance no longer qualifies.
 
-Publishing the separate GitHub Wiki repository after the stable release does not change the accepted source commit. Its reviewed source must already match `docs/wiki/` in that commit.
+The Wiki sync workflow publishes the reviewed `docs/wiki/` sources from `dev`. This publication does not change the accepted source commit; the Wiki content must already match that commit.
 
 ## Version policy
 
@@ -42,7 +42,7 @@ Base versions use the SemVer-compatible `YYYYMMDD.V.0` format:
 | `vYYYYMMDD.V.0-<suffix>` (permanent prerelease) | `YYYYMMDD.V.0-<suffix>` | Same as tag | Unavailable to the hardcoded `dev` channel | No |
 | `vYYYYMMDD.V.0` (stable) | `YYYYMMDD.V.0` | Same as tag | Default channel | Yes |
 
-> The `version` field in `Cargo.toml` never includes `-dev`; CI adds it during version injection.
+> The root `VERSION` file is the release source of truth. The `version` field in `Cargo.toml` mirrors it and never includes `-dev`; CI validates the match and adds the suffix during version injection.
 > The final dev and stable builds come from the same commit. The Release workflow adds `-dev` for the rolling `dev` tag and leaves the manifest base unchanged for the stable tag; this version display difference does not require a source edit.
 >
 > The `--dev` path in `src/update.rs` calls `fetch_release(Some("dev"))`, so self-update cannot discover an independently named prerelease tag.
@@ -99,6 +99,8 @@ GitHub Actions Release builds are the only distribution source of truth; do not 
 
 After creating the GitHub Release, the `legacy-upgrade` job downloads the official `v0.0.19` binary on macOS, Linux, and Windows, runs its original self-update command against the new channel release, and verifies the resulting binary version. This is the compatibility floor for direct self-update; `v0.0.1` and `v0.0.2` remain installer-only.
 
+The compatibility job runs for the rolling `dev` channel and stable releases. Permanent prerelease tags are not discoverable through either self-update channel, so they skip this channel-upgrade check.
+
 Post-release verification must confirm at least:
 
 - The GitHub Actions Release run succeeds, including all six builds and the release job.
@@ -130,7 +132,7 @@ After tagging, confirm `refs/heads/master`, `refs/tags/dev`, and the stable tag 
 
 Before release:
 
-- Run `date` to obtain the real local date, then bump `Cargo.toml` to that day's `YYYYMMDD.V.0`.
+- Run `date` to obtain the real local date, then bump `VERSION` and the synchronized `Cargo.toml` to that day's `YYYYMMDD.V.0`.
 - Add the matching `## vYYYYMMDD.V.0 — YYYY-MM-DD` section at the top of `docs/CHANGELOG.md`.
 
 ## Troubleshooting
