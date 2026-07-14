@@ -6,6 +6,7 @@
 - **Boundary regression coverage** — Added focused tests for launch auth restoration, JWT plan detection, login PKCE/state generation, checksum parsing, progress rendering, and popup width limits.
 - **Unicode-safe popup truncation** — Popup lines now truncate by terminal grapheme width so CJK text and VS16/ZWJ emoji stay within the requested width without splitting a displayed character.
 - **Wiki is now the complete documentation** — `docs/wiki/` pages carry the full user and contributor guides (getting started, features, command reference, configuration, updating, troubleshooting, architecture, onboarding), rewritten against the current CLI behavior; the former `docs/FEATURES.md`, `COMMANDS.md`, `CONFIGURATION.md`, `TROUBLESHOOTING.md`, `ARCHITECTURE.md`, and `DEVELOPMENT.md` were merged into them. Newly documented behavior includes external-login detection, the full TUI keymap, log retention, log-level precedence, and the `CODEX_SWITCH_HOME` daemon-service caveat.
+- **Homebrew dev hint follows the published Wiki** — The Homebrew-to-dev guidance now links to the published Wiki page, which always tracks `dev`, instead of a repository file on `master` that goes stale between stable releases.
 - **Focused READMEs** — `README.md` and `README_CN.md` now cover the pitch, quick start, a breaking-changes upgrade notice (calendar versioning, user-owned Unix installs), and Wiki entry points instead of duplicating the full documentation.
 
 ## v20260714.2.0 — 2026-07-14

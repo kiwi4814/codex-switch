@@ -164,7 +164,7 @@ fn replacement_permission_hint(
 }
 
 pub(crate) fn homebrew_dev_install_hint() -> &'static str {
-    "run `brew uninstall codex-switch`, then follow the development-release instructions at https://github.com/xjoker/codex-switch/blob/master/docs/wiki/Development-Releases.md#install-the-rolling-dev-build"
+    "run `brew uninstall codex-switch`, then follow the development-release instructions at https://github.com/xjoker/codex-switch/wiki/Development-Releases#install-the-rolling-dev-build"
 }
 
 fn homebrew_dev_install_error() -> String {
@@ -944,8 +944,12 @@ mod tests {
         let hint = super::homebrew_dev_install_hint();
         assert!(hint.contains("brew uninstall codex-switch"));
         assert!(hint.contains(
-            "github.com/xjoker/codex-switch/blob/master/docs/wiki/Development-Releases.md#install-the-rolling-dev-build"
+            "github.com/xjoker/codex-switch/wiki/Development-Releases#install-the-rolling-dev-build"
         ));
+        assert!(
+            !hint.contains("blob/master/"),
+            "hint must not point at repository files on master; the published Wiki follows dev"
+        );
         assert!(!hint.contains("| bash"));
         assert!(!hint.contains("self-update"));
     }
