@@ -26,7 +26,11 @@ Windows PowerShell：
 irm https://github.com/xjoker/codex-switch/releases/latest/download/install.ps1 | iex
 ```
 
-Homebrew 用户：`brew install xjoker/tap/codex-switch`。然后添加账号并打开仪表盘：
+Homebrew 用户：`brew install xjoker/tap/codex-switch`。
+
+> **注意**：本项目不在 crates.io 分发——请勿 `cargo install codex-switch`，该包名属于另一个无关的同名项目。
+
+然后添加账号并打开仪表盘：
 
 ```bash
 codex-switch login        # 无浏览器服务器加 --device

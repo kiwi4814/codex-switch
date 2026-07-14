@@ -41,6 +41,8 @@ brew install xjoker/tap/codex-switch
 
 Homebrew distributes stable releases only and keeps ownership of its binary; update it with `brew upgrade xjoker/tap/codex-switch`, not with `self-update`.
 
+> **Note:** this project is not distributed on crates.io. Do not `cargo install codex-switch` — that package name belongs to an unrelated project of the same name.
+
 Verify the installation:
 
 ```bash
