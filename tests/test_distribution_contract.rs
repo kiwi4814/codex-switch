@@ -87,7 +87,7 @@ fn version_file_is_the_release_source_of_truth() {
     let manifest = repo_file("Cargo.toml");
     let release = repo_file(".github/workflows/release.yml");
 
-    assert_eq!(version, "20260714.3.0");
+    assert_eq!(version, "20260718.1.0");
     assert!(manifest.contains(&format!("version = \"{version}\"")));
     assert!(release.contains("BASE=$(cat VERSION)"));
     assert!(!release.contains("BASE=$(grep '^version' Cargo.toml"));
