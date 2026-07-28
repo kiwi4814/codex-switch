@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -92,6 +93,47 @@ struct ConcurrentWinner {
     refresh_token: String,
 }
 
+/// Parks every token request inside the handler until the test lets it go.
+///
+/// Slowness is expressed as an explicit signal, never as a sleep the test hopes
+/// is long enough: `arrived` reports that the request has really reached the
+/// auth server (so the rotation is already spent), and the response is only
+/// produced once a permit is added to `release`.
+#[derive(Clone)]
+struct TokenGate {
+    arrived: tokio::sync::mpsc::UnboundedSender<String>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+/// Test-side handle for the requests [`TokenGate`] is holding.
+struct HeldTokenRequests {
+    arrivals: tokio::sync::mpsc::UnboundedReceiver<String>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl HeldTokenRequests {
+    /// Block until `n` refresh requests are parked in the handler. Returns the
+    /// `refresh_token` each of them presented, in arrival order.
+    async fn wait_for(&mut self, n: usize) -> Vec<String> {
+        let mut seen = Vec::new();
+        while seen.len() < n {
+            let next = tokio::time::timeout(Duration::from_secs(10), self.arrivals.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("expected {n} token request(s), only {seen:?} arrived within 10s")
+                })
+                .expect("token endpoint gate closed");
+            seen.push(next);
+        }
+        seen
+    }
+
+    /// Let every parked request — and any that arrives later — answer.
+    fn release_all(&self) {
+        self.release.add_permits(64);
+    }
+}
+
 #[derive(Default)]
 struct MockState {
     /// Usage replies keyed by bearer token; the last entry repeats.
@@ -110,6 +152,8 @@ struct MockState {
     /// Keyed by the presented `refresh_token`: rewrite a profile with a
     /// concurrent winner's credentials *before* answering this request.
     winner_writes: HashMap<String, ConcurrentWinner>,
+    /// When set, hold every token request until the test releases it.
+    gate: Option<TokenGate>,
 }
 
 type SharedState = Arc<Mutex<MockState>>;
@@ -190,6 +234,17 @@ impl MockServer {
             .insert(presented.to_string(), winner);
     }
 
+    /// Hold every token request until the returned handle releases it.
+    fn hold_token_requests(&self) -> HeldTokenRequests {
+        let (arrived, arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        self.state.lock().unwrap().gate = Some(TokenGate {
+            arrived,
+            release: release.clone(),
+        });
+        HeldTokenRequests { arrivals, release }
+    }
+
     fn token_calls(&self) -> Vec<String> {
         self.state.lock().unwrap().token_calls.clone()
     }
@@ -234,35 +289,56 @@ async fn token_handler(
     State(state): State<SharedState>,
     axum::Json(body): axum::Json<Value>,
 ) -> impl IntoResponse {
-    let mut guard = state.lock().unwrap();
     let presented = body
         .get("refresh_token")
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    guard.token_calls.push(presented.clone());
-    if let Some(winner) = guard.winner_writes.get(&presented).cloned() {
-        write_auth_file(
-            &winner.profile_path,
-            &winner.id_token,
-            &winner.access_token,
-            &winner.refresh_token,
-        );
-    }
-    let chosen = match guard.token_by_refresh.get(&presented) {
-        Some(reply) => reply.clone(),
-        None => {
-            let cursor = guard.token_calls.len() - 1;
-            next_reply(&guard.token_replies, cursor)
+
+    // Record the call and pick the reply under the lock, then drop the guard —
+    // a gated request parks on an await that must not hold a std mutex.
+    let (chosen, gate) = {
+        let mut guard = state.lock().unwrap();
+        guard.token_calls.push(presented.clone());
+        if let Some(winner) = guard.winner_writes.get(&presented).cloned() {
+            write_auth_file(
+                &winner.profile_path,
+                &winner.id_token,
+                &winner.access_token,
+                &winner.refresh_token,
+            );
         }
+        let chosen = match guard.token_by_refresh.get(&presented) {
+            Some(reply) => reply.clone(),
+            None => {
+                let cursor = guard.token_calls.len() - 1;
+                next_reply(&guard.token_replies, cursor)
+            }
+        };
+        (chosen, guard.gate.clone())
     };
+
+    // The rotation is spent from here on: the server has "seen" the token, so
+    // the client may no longer treat the request as cancellable.
+    if let Some(gate) = gate {
+        let _ = gate.arrived.send(presented);
+        if let Ok(permit) = gate.release.acquire().await {
+            permit.forget();
+        }
+    }
+
     (chosen.status, axum::Json(chosen.body)).into_response()
 }
 
-fn expired_jwt() -> String {
-    let exp = codex_switch::auth::now_unix_secs() - 3600;
+/// A JWT whose `exp` is `secs` from now (negative = already expired).
+fn jwt_expiring_in(secs: i64) -> String {
+    let exp = codex_switch::auth::now_unix_secs() + secs;
     let payload = URL_SAFE_NO_PAD.encode(json!({"exp": exp}).to_string());
     format!("header.{payload}.signature")
+}
+
+fn expired_jwt() -> String {
+    jwt_expiring_in(-3600)
 }
 
 fn write_auth_file(path: &Path, id: &str, access: &str, refresh: &str) {
@@ -866,6 +942,199 @@ async fn opportunistic_refresh_keeps_going_after_one_profile_fails_to_save() {
     server.shutdown();
 }
 
+/// Writable profiles, all already past expiry so opportunistic refresh picks
+/// every one of them up. Expiry increases with the position in `aliases`, which
+/// is the order the batch starts them in (soonest first).
+struct ExpiringFixture {
+    profiles: Vec<PathBuf>,
+    _guards: Vec<EnvVarGuard>,
+    _home: tempfile::TempDir,
+}
+
+fn expiring_profiles_fixture(server: &MockServer, aliases: &[&str]) -> ExpiringFixture {
+    let home = tempfile::tempdir().unwrap();
+    let guards = env_guards(server, home.path());
+    let profiles = aliases
+        .iter()
+        .enumerate()
+        .map(|(index, alias)| {
+            write_profile(
+                home.path(),
+                alias,
+                "old_id",
+                &jwt_expiring_in(-300 + index as i64 * 100),
+                &format!("refresh_{alias}"),
+            )
+        })
+        .collect();
+    ExpiringFixture {
+        profiles,
+        _guards: guards,
+        _home: home,
+    }
+}
+
+/// The rotation the auth server hands back for `refresh_<alias>`.
+fn rotation_for(alias: &str) -> (String, Reply) {
+    (
+        format!("refresh_{alias}"),
+        reply(
+            StatusCode::OK,
+            json!({
+                "id_token": format!("id_{alias}_new"),
+                "access_token": format!("access_{alias}_new"),
+                "refresh_token": format!("refresh_{alias}_new"),
+            }),
+        ),
+    )
+}
+
+/// D12: the start budget must never cancel a rotation that is already in
+/// flight. The moment the request reaches the auth server the presented
+/// `refresh_token` is dead and its replacement exists only in that one
+/// response, so dropping the task (which `JoinSet::drop` does, by aborting it)
+/// leaves the profile holding a credential nothing will ever accept again.
+/// A slow answer therefore still has to be read and written.
+#[tokio::test]
+async fn refresh_slower_than_the_budget_still_reaches_disk() {
+    let _lock = ENV_LOCK.lock().await;
+    let server = MockServer::start_keyed_by_refresh_token(vec![rotation_for("slow")]).await;
+    let fx = expiring_profiles_fixture(&server, &["slow"]);
+    let mut held = server.hold_token_requests();
+    let budget = Duration::from_millis(200);
+
+    let (failures, ()) = tokio::join!(
+        codex_switch::usage::refresh_expiring_tokens_within(budget),
+        async {
+            // The request is parked inside the handler, so the rotation is
+            // already spent. Only then let the budget run out — the reply can
+            // physically not be observed before that point.
+            held.wait_for(1).await;
+            tokio::time::sleep(budget * 3).await;
+            held.release_all();
+        }
+    );
+
+    assert_eq!(
+        stored_refresh_token(&fx.profiles[0]),
+        "refresh_slow_new",
+        "a rotation that outlived the start budget was abandoned; the profile is \
+         left holding a refresh token the auth server has already invalidated \
+         (failures: {:?})",
+        failures
+            .iter()
+            .map(|f| f.alias.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        failures.is_empty(),
+        "the late rotation saved fine, so nothing should be reported: {:?}",
+        failures
+            .iter()
+            .map(|f| f.alias.as_str())
+            .collect::<Vec<_>>()
+    );
+    server.shutdown();
+}
+
+/// D13: the budget bounds how long the batch keeps *opening* new rotations, not
+/// how long it waits for the open ones. Once it is spent, the candidates that
+/// were never started must not be contacted at all: a request that is sent and
+/// then abandoned is precisely the loss this design exists to prevent, and a
+/// profile nobody contacted keeps a perfectly usable token for the next run.
+#[tokio::test]
+async fn budget_exhaustion_stops_starting_new_refreshes() {
+    let _lock = ENV_LOCK.lock().await;
+    let aliases = ["first", "second", "third"];
+    let server = MockServer::start_keyed_by_refresh_token(
+        aliases.iter().map(|alias| rotation_for(alias)).collect(),
+    )
+    .await;
+    let fx = expiring_profiles_fixture(&server, &aliases);
+    let mut held = server.hold_token_requests();
+    let budget = Duration::from_millis(200);
+
+    let (_failures, ()) = tokio::join!(
+        codex_switch::usage::refresh_expiring_tokens_within(budget),
+        async {
+            // Every in-flight slot is occupied and stays occupied until the
+            // budget is gone, so no further candidate may be started.
+            held.wait_for(2).await;
+            tokio::time::sleep(budget * 3).await;
+            held.release_all();
+        }
+    );
+
+    let mut seen = server.token_calls();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec!["refresh_first".to_string(), "refresh_second".to_string()],
+        "a refresh was started after the budget was spent; every request sent is \
+         a rotation that can be lost"
+    );
+    assert_eq!(
+        stored_refresh_token(&fx.profiles[2]),
+        "refresh_third",
+        "the candidate that was never contacted must keep the token it had"
+    );
+    assert_eq!(
+        stored_refresh_token(&fx.profiles[0]),
+        "refresh_first_new",
+        "the rotations that were started must still be saved"
+    );
+    assert_eq!(
+        stored_refresh_token(&fx.profiles[1]),
+        "refresh_second_new",
+        "the rotations that were started must still be saved"
+    );
+    server.shutdown();
+}
+
+/// D14: none of the above may cost the ordinary case. When the auth server
+/// answers promptly, every expiring profile is still refreshed and saved within
+/// the production budget, even though only a bounded number run at a time.
+#[tokio::test]
+async fn every_expiring_profile_is_refreshed_when_the_server_answers_promptly() {
+    let _lock = ENV_LOCK.lock().await;
+    let aliases = ["alpha", "beta", "gamma"];
+    let server = MockServer::start_keyed_by_refresh_token(
+        aliases.iter().map(|alias| rotation_for(alias)).collect(),
+    )
+    .await;
+    let fx = expiring_profiles_fixture(&server, &aliases);
+
+    let failures = codex_switch::usage::refresh_expiring_tokens().await;
+
+    assert!(
+        failures.is_empty(),
+        "no profile was unwritable: {:?}",
+        failures
+            .iter()
+            .map(|f| f.alias.as_str())
+            .collect::<Vec<_>>()
+    );
+    for (index, alias) in aliases.iter().enumerate() {
+        assert_eq!(
+            stored_refresh_token(&fx.profiles[index]),
+            format!("refresh_{alias}_new"),
+            "{alias} was not refreshed"
+        );
+    }
+    let mut seen = server.token_calls();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            "refresh_alpha".to_string(),
+            "refresh_beta".to_string(),
+            "refresh_gamma".to_string(),
+        ],
+        "every expiring profile must get exactly one refresh attempt"
+    );
+    server.shutdown();
+}
+
 /// D8: `import` refreshes the credential *before* it validates usage, and the
 /// auth value it mutates is a local of the caller. If the rotated tokens are
 /// not handed back alongside the failure, the only credential the auth server
@@ -1027,6 +1296,28 @@ async fn refresh_rejected_with_an_unchanged_profile_still_requires_a_new_login()
 /// because a third rotation landed meanwhile, the account has to stop rather
 /// than chase the profile forever — otherwise two peers can keep re-arming each
 /// other and neither ever reports anything.
+///
+/// **The verdict asserted below is a deliberate trade-off, not a healthy
+/// outcome.** The account in this scenario is fine: some other process holds a
+/// working credential and keeps rotating it. Bounding recovery to a single
+/// retry means that in this case we report `re-login required` about an account
+/// that does not need one — a false alarm that costs the user a pointless
+/// browser round trip.
+///
+/// It is chosen over the alternative because the alternative is unbounded: a
+/// recovery that re-arms itself every time the profile changes on disk can be
+/// driven forever by a peer that keeps rotating, and then *nothing* is ever
+/// reported and the round trips never stop. A bounded false alarm is visible
+/// and recoverable; a livelock is neither. Reaching this state also needs three
+/// rotations to land inside one call — two peers racing the same profile while
+/// a third rotation slips in between — which the CLI and daemon timings make
+/// vanishingly rare.
+///
+/// So: do not "fix" this by widening the retry budget, and do not read the
+/// assertion below as "reporting a healthy account as dead is correct". If the
+/// false alarm ever shows up in practice, the fix is to make the retry
+/// distinguish *whose* rotation it observed (e.g. verify the adopted token
+/// before condemning the account), not to let recovery loop.
 #[tokio::test]
 async fn concurrent_rotation_recovery_is_granted_at_most_once() {
     let _lock = ENV_LOCK.lock().await;
@@ -1065,7 +1356,11 @@ async fn concurrent_rotation_recovery_is_granted_at_most_once() {
     );
     assert!(
         err.summary.contains("re-login required"),
-        "after the single retry the terminal verdict must be reported: {}",
+        "recovery is bounded to one retry, so this run stops here and reports the \
+         server's last verdict — a known false alarm for this account, accepted \
+         because the unbounded alternative livelocks (see the comment above). \
+         Reaching this line is the trade-off working as designed, not evidence \
+         that the account is dead: {}",
         err.summary
     );
     server.shutdown();

@@ -17,6 +17,8 @@ pub use api::{
 #[allow(unused_imports)]
 pub use api::fetch_usage_with_refresh;
 #[allow(unused_imports)]
+pub use api::refresh_expiring_tokens_within;
+#[allow(unused_imports)]
 pub use parse::parse_usage;
 pub use reset_credits::{consume_earliest_reset_credit, earliest_reset_credit};
 pub use scoring::{

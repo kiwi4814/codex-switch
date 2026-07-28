@@ -750,17 +750,50 @@ pub(crate) async fn do_refresh_token(
 const OPPORTUNISTIC_REFRESH_LIMIT: usize = 3;
 /// Refresh tokens expiring within this many seconds.
 const OPPORTUNISTIC_REFRESH_MARGIN: i64 = 1800; // 30 minutes
-/// Total wall-clock timeout for all opportunistic refreshes (concurrent).
-const OPPORTUNISTIC_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How many rotations may be in flight at once. Each in-flight request holds a
+/// credential that only exists in its own response, so this also bounds how
+/// much can be lost if the process dies mid-batch.
+const OPPORTUNISTIC_REFRESH_CONCURRENCY: usize = 2;
+/// Wall-clock budget for *starting* opportunistic refreshes. It never cancels
+/// one — see [`refresh_expiring_tokens_within`].
+const OPPORTUNISTIC_START_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Opportunistically refresh tokens that are about to expire.
-/// Runs concurrently with a bounded total timeout.
 ///
 /// Refresh *failures* are logged, not propagated — a token the server refused
 /// costs nothing but a retry later. Failures to **save** a rotated token are
 /// returned instead: the old credential is already dead server-side, so a lost
 /// write silently bricks that profile and the caller has to tell someone.
 pub async fn refresh_expiring_tokens() -> Vec<TokenPersistFailure> {
+    refresh_expiring_tokens_within(OPPORTUNISTIC_START_BUDGET).await
+}
+
+/// As [`refresh_expiring_tokens`], with an explicit start budget.
+///
+/// `budget` bounds how long this keeps **opening** new rotations; it is never a
+/// deadline for the ones already open. `refresh_token` is single-use: as soon as
+/// a request reaches the auth server the presented token is dead and its
+/// replacement exists only in that one response. Abandoning the request — which
+/// is what a `timeout` around the join loop does, since `JoinSet::drop` aborts
+/// every unfinished task — would therefore leave the profile holding a
+/// credential nothing will ever accept again. So every started refresh is
+/// awaited to completion, and the budget only decides whether the *next*
+/// candidate is contacted at all. A candidate that is never contacted loses
+/// nothing: it keeps its working token for the next invocation.
+///
+/// Residual window we cannot close: the HTTP client in `auth::build_http_client`
+/// carries its own total timeout, and if that fires the server may already have
+/// rotated the credential while we never read the answer. Nothing on this side
+/// can prevent that — the loss is decided by whether the request reached the
+/// server, not by how long we wait. Shortening either timeout only *widens* the
+/// window (more rotations cut off mid-flight), so neither is tuned for latency.
+///
+/// Worst-case wall clock for a synchronous caller (`list`, `best`) is therefore
+/// `budget` + one HTTP client timeout: a refresh started just before the budget
+/// expired may still hang for the client's full timeout.
+pub async fn refresh_expiring_tokens_within(
+    budget: std::time::Duration,
+) -> Vec<TokenPersistFailure> {
     let profiles = match crate::profile::list_profiles() {
         Ok(p) => p,
         Err(_) => return Vec::new(),
@@ -820,58 +853,66 @@ pub async fn refresh_expiring_tokens() -> Vec<TokenPersistFailure> {
         OPPORTUNISTIC_REFRESH_MARGIN
     );
 
-    // Spawn all refreshes concurrently, bounded by total timeout
+    // Start refreshes while the budget lasts, then wait for every started one:
+    // an in-flight rotation is not cancellable without losing the credential.
+    let started_at = std::time::Instant::now();
+    let mut queued = candidates.into_iter();
     let mut tasks = tokio::task::JoinSet::new();
-    for (alias, _path, id_token, access_token, rt, exp) in candidates {
-        tasks.spawn(async move {
-            let remaining = exp - auth::now_unix_secs();
-            debug!("[{alias}] token expires in {remaining}s, refreshing");
+    let mut failures = Vec::new();
 
-            let client = match auth::build_http_client() {
-                Ok(c) => c,
-                Err(e) => {
-                    debug!("[{alias}] skipping refresh: {e}");
-                    return None;
-                }
+    loop {
+        while tasks.len() < OPPORTUNISTIC_REFRESH_CONCURRENCY && started_at.elapsed() < budget {
+            let Some((alias, _path, id_token, access_token, rt, exp)) = queued.next() else {
+                break;
             };
+            tasks.spawn(async move {
+                let remaining = exp - auth::now_unix_secs();
+                debug!("[{alias}] token expires in {remaining}s, refreshing");
 
-            match do_refresh_token(
-                &alias,
-                &client,
-                id_token.as_deref(),
-                Some(&access_token),
-                &rt,
-            )
-            .await
-            {
-                Ok(new_tokens) => match persist_refreshed_tokens(&alias, &new_tokens) {
-                    Ok(()) => {
-                        info!("[{alias}] opportunistic token refresh succeeded");
+                let client = match auth::build_http_client() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        debug!("[{alias}] skipping refresh: {e}");
+                        return None;
+                    }
+                };
+
+                match do_refresh_token(
+                    &alias,
+                    &client,
+                    id_token.as_deref(),
+                    Some(&access_token),
+                    &rt,
+                )
+                .await
+                {
+                    Ok(new_tokens) => match persist_refreshed_tokens(&alias, &new_tokens) {
+                        Ok(()) => {
+                            info!("[{alias}] opportunistic token refresh succeeded");
+                            None
+                        }
+                        // Report rather than abort: the remaining profiles still
+                        // deserve their refresh, and this one is only recoverable
+                        // once a human hears about it.
+                        Err(error) => Some(TokenPersistFailure { alias, error }),
+                    },
+                    Err(e) => {
+                        debug!("[{alias}] opportunistic token refresh failed: {e}");
                         None
                     }
-                    // Report rather than abort: the remaining profiles still
-                    // deserve their refresh, and this one is only recoverable
-                    // once a human hears about it.
-                    Err(error) => Some(TokenPersistFailure { alias, error }),
-                },
-                Err(e) => {
-                    debug!("[{alias}] opportunistic token refresh failed: {e}");
-                    None
                 }
-            }
-        });
-    }
-
-    // Wait for all with total timeout — don't block CLI too long
-    let mut failures = Vec::new();
-    let _ = tokio::time::timeout(OPPORTUNISTIC_TOTAL_TIMEOUT, async {
-        while let Some(joined) = tasks.join_next().await {
-            if let Ok(Some(failure)) = joined {
-                failures.push(failure);
-            }
+            });
         }
-    })
-    .await;
+
+        // No timeout here on purpose: this awaits requests the auth server has
+        // already been told about.
+        let Some(joined) = tasks.join_next().await else {
+            break;
+        };
+        if let Ok(Some(failure)) = joined {
+            failures.push(failure);
+        }
+    }
 
     failures
 }
