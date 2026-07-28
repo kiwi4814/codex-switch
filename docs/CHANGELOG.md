@@ -1,5 +1,12 @@
 # Changelog
 
+## v20260728.1.0 — 2026-07-28
+
+- **Accounts no longer break after a failed usage refresh** — The auth server rotates `refresh_token` on every use and permanently rejects the previous one. When anything failed after a refresh had already succeeded — a network error, an unparseable response, a usage endpoint answering 401 — the newly issued credentials were discarded, and the retry replayed the token the server had just invalidated. A single transient failure was enough to leave a profile unusable until you signed in again. Rotated credentials are now saved before anything else can fail, and each retry presents the current token.
+- **A rejected refresh says why** — Refresh failures surfaced as `invalid type: map, expected a string` because the server's error object did not fit the expected shape, hiding the actual reason. The server's own code and message are now reported, for example `refresh_token_reused: Your refresh token has already been used ... Please try signing in again`. Failures that re-signing cannot fix stop immediately instead of spending six auth round trips per account, so a listing that previously took a minute against a slow network now finishes in seconds.
+- **Browser sign-in survives a network blip** — The final token exchange made a single attempt, and the retry meant to cover transport failures never fired: reqwest classifies both a refused connection and a TLS handshake that dies mid-negotiation as a request error, not a connect error. Transient transport failures and 5xx responses now retry with backoff. A 4xx still fails at once, because the authorization code is single-use and retrying it cannot succeed.
+- **System proxy settings are honored on macOS and Windows** — Disabling default features had also dropped reqwest's system-proxy support, so a proxy configured in macOS System Settings or the Windows registry was ignored and connections failed in ways the browser did not. Environment variables and `--proxy` were unaffected and still take precedence.
+
 ## v20260718.1.0 — 2026-07-18
 
 - **Dependency refresh** — Bumped `toml` from 1.1.2 to 1.1.3 (routine bugfix release, no security advisory).

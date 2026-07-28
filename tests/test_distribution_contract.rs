@@ -87,7 +87,28 @@ fn version_file_is_the_release_source_of_truth() {
     let manifest = repo_file("Cargo.toml");
     let release = repo_file(".github/workflows/release.yml");
 
-    assert_eq!(version, "20260718.1.0");
+    // Pin the documented YYYYMMDD.V.0 shape rather than one literal version, which
+    // every release had to edit. This also catches the two forms RELEASE.md warns
+    // about: the two-component `20260712.1`, and YYYYDDMM, which sorts wrongly.
+    let (date, rest) = version.split_once('.').expect("version needs a date part");
+    let (sequence, patch) = rest.split_once('.').expect("version must be YYYYMMDD.V.0");
+    assert!(
+        date.len() == 8 && date.chars().all(|c| c.is_ascii_digit()),
+        "version must start with an 8-digit YYYYMMDD date, got {date:?}"
+    );
+    let month: u32 = date[4..6].parse().expect("month must be numeric");
+    let day: u32 = date[6..8].parse().expect("day must be numeric");
+    assert!(
+        (1..=12).contains(&month) && (1..=31).contains(&day),
+        "version date must be YYYYMMDD, got month {month} day {day} in {date:?}"
+    );
+    assert!(
+        !sequence.is_empty()
+            && sequence.chars().all(|c| c.is_ascii_digit())
+            && !sequence.starts_with('0'),
+        "release sequence must be a positive integer starting at 1, got {sequence:?}"
+    );
+    assert_eq!(patch, "0", "the third component is always 0 for SemVer");
     assert!(manifest.contains(&format!("version = \"{version}\"")));
     assert!(release.contains("BASE=$(cat VERSION)"));
     assert!(!release.contains("BASE=$(grep '^version' Cargo.toml"));
