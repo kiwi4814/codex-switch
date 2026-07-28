@@ -78,6 +78,20 @@ fn rotation(n: u32) -> Reply {
     )
 }
 
+/// Simulates the process that *won* a concurrent rotation race.
+///
+/// The auth server only starts answering `refresh_token_reused` once it has
+/// issued the winner's replacement, and the winner writes that replacement to
+/// the profile. Performing the write inside the token handler reproduces that
+/// ordering exactly, without any sleep-based coordination in the test.
+#[derive(Clone)]
+struct ConcurrentWinner {
+    profile_path: PathBuf,
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+}
+
 #[derive(Default)]
 struct MockState {
     /// Usage replies keyed by bearer token; the last entry repeats.
@@ -93,6 +107,9 @@ struct MockState {
     token_by_refresh: HashMap<String, Reply>,
     /// `refresh_token` values seen by the token endpoint, in order.
     token_calls: Vec<String>,
+    /// Keyed by the presented `refresh_token`: rewrite a profile with a
+    /// concurrent winner's credentials *before* answering this request.
+    winner_writes: HashMap<String, ConcurrentWinner>,
 }
 
 type SharedState = Arc<Mutex<MockState>>;
@@ -163,6 +180,16 @@ impl MockServer {
         format!("http://{}/oauth/token", self.addr)
     }
 
+    /// Register a concurrent winner: the next time the token endpoint is asked
+    /// to rotate `presented`, `winner`'s credentials land in its profile first.
+    fn set_concurrent_winner(&self, presented: &str, winner: ConcurrentWinner) {
+        self.state
+            .lock()
+            .unwrap()
+            .winner_writes
+            .insert(presented.to_string(), winner);
+    }
+
     fn token_calls(&self) -> Vec<String> {
         self.state.lock().unwrap().token_calls.clone()
     }
@@ -214,6 +241,14 @@ async fn token_handler(
         .unwrap_or_default()
         .to_string();
     guard.token_calls.push(presented.clone());
+    if let Some(winner) = guard.winner_writes.get(&presented).cloned() {
+        write_auth_file(
+            &winner.profile_path,
+            &winner.id_token,
+            &winner.access_token,
+            &winner.refresh_token,
+        );
+    }
     let chosen = match guard.token_by_refresh.get(&presented) {
         Some(reply) => reply.clone(),
         None => {
@@ -327,6 +362,20 @@ fn usage_ok() -> Reply {
                     "limit_window_seconds": 18_000,
                     "reset_at": codex_switch::auth::now_unix_secs() + 3_600,
                 }
+            }
+        }),
+    )
+}
+
+fn reused_refresh_reply() -> Reply {
+    reply(
+        StatusCode::UNAUTHORIZED,
+        json!({
+            "error": {
+                "code": "refresh_token_reused",
+                "message": "Your refresh token has already been used to generate a new access token. Please try signing in again.",
+                "param": null,
+                "type": "invalid_request_error",
             }
         }),
     )
@@ -870,6 +919,154 @@ async fn import_validation_hands_back_rotated_tokens_when_usage_fails() {
         server.token_calls(),
         vec!["refresh_old".to_string()],
         "the consumed refresh token must never be replayed"
+    );
+    server.shutdown();
+}
+
+/// D9: the same profile is refreshed concurrently — the daemon timer and a CLI
+/// `list` both read RT1 and both present it. The auth server hands the rotation
+/// to one of them and answers the other `refresh_token_reused`. That loser is
+/// looking at a perfectly healthy account whose live credentials are already on
+/// disk, so concluding "re-login required" costs the user a browser round trip
+/// for nothing. A rejection must be re-checked against the profile before it is
+/// believed.
+#[tokio::test]
+async fn refresh_rejected_by_a_concurrent_winner_recovers_from_the_stored_token() {
+    let _lock = ENV_LOCK.lock().await;
+    let stale_access = expired_jwt();
+    let server = MockServer::start_with(
+        vec![("access_winner".to_string(), vec![usage_ok()])],
+        Vec::new(),
+        HashMap::from([("refresh_old".to_string(), reused_refresh_reply())]),
+    )
+    .await;
+    let fx = fixture(&server, "team8", &stale_access);
+    server.set_concurrent_winner(
+        "refresh_old",
+        ConcurrentWinner {
+            profile_path: fx.profile_path.clone(),
+            id_token: "id_winner".to_string(),
+            access_token: "access_winner".to_string(),
+            refresh_token: "refresh_winner".to_string(),
+        },
+    );
+
+    let usage = codex_switch::usage::fetch_usage_retried_force("team8", &fx.profile_path, "team8")
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "a profile whose token another process just rotated is healthy, \
+                 but it was reported as: {} / {}",
+                err.summary, err.detail
+            )
+        });
+
+    assert_eq!(
+        usage.primary.as_ref().and_then(|w| w.used_percent),
+        Some(12.5),
+        "the retry must return the account's real usage"
+    );
+    assert_eq!(
+        server.token_calls(),
+        vec!["refresh_old".to_string()],
+        "the stored token is already fresh; refreshing it again would burn a rotation"
+    );
+    assert_eq!(
+        stored_refresh_token(&fx.profile_path),
+        "refresh_winner",
+        "the winner's rotation must be left untouched"
+    );
+    server.shutdown();
+}
+
+/// D10: the guard for D9 must not swallow real terminal failures. When the
+/// profile on disk still holds the very token the auth server just rejected,
+/// nobody rotated anything and the account genuinely needs a new login — that
+/// verdict has to survive, and must not turn into extra rounds.
+#[tokio::test]
+async fn refresh_rejected_with_an_unchanged_profile_still_requires_a_new_login() {
+    let _lock = ENV_LOCK.lock().await;
+    let stale_access = expired_jwt();
+    let server = MockServer::start_with(
+        Vec::new(),
+        Vec::new(),
+        HashMap::from([("refresh_old".to_string(), reused_refresh_reply())]),
+    )
+    .await;
+    let fx = fixture(&server, "team9", &stale_access);
+
+    let err = codex_switch::usage::fetch_usage_retried_force("team9", &fx.profile_path, "team9")
+        .await
+        .expect_err("an unchanged profile means the rejection is real");
+
+    assert!(
+        err.summary.contains("re-login required"),
+        "a genuinely dead credential must still ask for a new login: {}",
+        err.summary
+    );
+    assert!(
+        err.detail.contains("refresh_token_reused"),
+        "the server verdict must stay visible: {}",
+        err.detail
+    );
+    assert_eq!(
+        server.token_calls(),
+        vec!["refresh_old".to_string()],
+        "re-reading the profile costs no round trip; a dead token must not be replayed"
+    );
+    assert_eq!(
+        stored_refresh_token(&fx.profile_path),
+        "refresh_old",
+        "nothing rotated, so the profile must be left as it was"
+    );
+    server.shutdown();
+}
+
+/// D11: the D9 recovery reads state two processes are both writing, so it must
+/// not be able to feed itself. If the token adopted from disk is *also* rejected
+/// because a third rotation landed meanwhile, the account has to stop rather
+/// than chase the profile forever — otherwise two peers can keep re-arming each
+/// other and neither ever reports anything.
+#[tokio::test]
+async fn concurrent_rotation_recovery_is_granted_at_most_once() {
+    let _lock = ENV_LOCK.lock().await;
+    let stale_access = expired_jwt();
+    let server = MockServer::start_with(
+        Vec::new(),
+        Vec::new(),
+        HashMap::from([
+            ("refresh_old".to_string(), reused_refresh_reply()),
+            ("refresh_w1".to_string(), reused_refresh_reply()),
+            ("refresh_w2".to_string(), reused_refresh_reply()),
+        ]),
+    )
+    .await;
+    let fx = fixture(&server, "team10", &stale_access);
+    for (presented, next) in [("refresh_old", "refresh_w1"), ("refresh_w1", "refresh_w2")] {
+        server.set_concurrent_winner(
+            presented,
+            ConcurrentWinner {
+                profile_path: fx.profile_path.clone(),
+                id_token: "id_winner".to_string(),
+                access_token: stale_access.clone(),
+                refresh_token: next.to_string(),
+            },
+        );
+    }
+
+    let err = codex_switch::usage::fetch_usage_retried_force("team10", &fx.profile_path, "team10")
+        .await
+        .expect_err("every refresh in this scenario is rejected");
+
+    assert_eq!(
+        server.token_calls(),
+        vec!["refresh_old".to_string(), "refresh_w1".to_string()],
+        "recovery must be granted once, not once per rotation the profile picks up"
+    );
+    assert!(
+        err.summary.contains("re-login required"),
+        "after the single retry the terminal verdict must be reported: {}",
+        err.summary
     );
     server.shutdown();
 }

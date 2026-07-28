@@ -227,6 +227,41 @@ fn resolve_refreshed_tokens(
     })
 }
 
+/// Credentials re-read from a profile after a refresh was rejected.
+struct ReloadedCredentials {
+    id_token: Option<String>,
+    access_token: String,
+    refresh_token: String,
+}
+
+/// Re-read `profile_path` after the auth server rejected a refresh outright.
+///
+/// The daemon timer and the CLI (`list`, `best`) refresh the same profile from
+/// separate processes, so both can read the same `refresh_token` and present
+/// it. The server rotates it for exactly one of them and answers the other
+/// `refresh_token_reused` — a verdict about that *token*, not about the
+/// account, whose live credentials the winner has meanwhile written to disk.
+///
+/// Returns the stored credentials only when their `refresh_token` differs from
+/// `presented`. An unchanged profile means nobody rotated anything, so the
+/// rejection is the real thing and the caller must keep reporting it.
+fn reload_rotated_credentials(
+    profile_path: &Path,
+    presented: Option<&str>,
+) -> Option<ReloadedCredentials> {
+    let val = auth::read_auth(profile_path).ok()?;
+    let (access_token, refresh_token) = auth::extract_tokens(&val);
+    let refresh_token = refresh_token?;
+    if Some(refresh_token.as_str()) == presented {
+        return None;
+    }
+    Some(ReloadedCredentials {
+        id_token: auth::extract_id_token(&val),
+        access_token: access_token?,
+        refresh_token,
+    })
+}
+
 async fn fetch_usage_retried_inner(
     alias: &str,
     profile_path: &Path,
@@ -269,11 +304,39 @@ async fn fetch_usage_retried_inner(
 
     let mut last_err = String::new();
     let mut last_summary = String::new();
-    for attempt in 0..MAX_RETRIES {
+    // A rejected refresh may just mean a concurrent refresh of the same profile
+    // won the rotation, so one such rejection buys a single extra round in which
+    // the winner's stored token is tried. Granted at most once: two peers each
+    // re-arming on the other's write would otherwise keep this loop alive
+    // without either ever reporting a result.
+    let mut recovery_round_used = false;
+    let mut pending_terminal: Option<UsageError> = None;
+    let mut max_attempts = MAX_RETRIES;
+    let mut attempt = 0;
+    while attempt < max_attempts {
         if attempt > 0 {
-            debug!("[{alias}] retry attempt {}/{MAX_RETRIES}", attempt + 1);
+            debug!("[{alias}] retry attempt {}/{max_attempts}", attempt + 1);
             tokio::time::sleep(RETRY_DELAY).await;
         }
+
+        // Deliberately *after* the delay. The winner writes the rotated token
+        // only once the server has issued it, which is already when our replay
+        // starts being refused — reading the profile the instant the rejection
+        // arrives can still find the old token and mislabel a healthy account.
+        if let Some(terminal) = pending_terminal.take() {
+            let Some(stored) = reload_rotated_credentials(profile_path, refresh_token.as_deref())
+            else {
+                return Err(terminal);
+            };
+            info!(
+                "[{alias}] refresh was rejected but the profile now holds a different token; \
+                 a concurrent refresh won the rotation, retrying with the stored credentials"
+            );
+            at = stored.access_token;
+            id_token = stored.id_token;
+            refresh_token = Some(stored.refresh_token);
+        }
+
         let outcome = fetch_usage_with_refresh(
             alias,
             &at,
@@ -308,19 +371,31 @@ async fn fetch_usage_retried_inner(
             Err(e) => {
                 let msg = format!("{e:#}");
                 warn!(
-                    "[{alias}] attempt {}/{MAX_RETRIES} failed: {msg}",
+                    "[{alias}] attempt {}/{max_attempts} failed: {msg}",
                     attempt + 1
                 );
                 if let Some(terminal) = e.downcast_ref::<TerminalAuthError>() {
-                    return Err(UsageError {
+                    let error = UsageError {
                         summary: terminal.summary(),
                         detail: msg,
-                    });
+                    };
+                    if recovery_round_used {
+                        return Err(error);
+                    }
+                    recovery_round_used = true;
+                    // Add the round rather than spend one of the existing ones,
+                    // so a rejection arriving on the final attempt is still
+                    // checked against the profile before the account is failed.
+                    max_attempts += 1;
+                    pending_terminal = Some(error);
+                    attempt += 1;
+                    continue;
                 }
                 last_summary = extract_error_summary(&msg);
                 last_err = msg;
             }
         }
+        attempt += 1;
     }
     Err(UsageError {
         summary: last_summary,
