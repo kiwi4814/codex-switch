@@ -221,18 +221,41 @@ fn restore_launch_auth(
     alias: &str,
 ) -> Result<()> {
     let _lock = profile::lock_live_auth().context("acquiring auth lock for restore")?;
-    // Saving the refreshed copy must never block the rollback: leaving another
-    // account's credentials live is worse than failing to archive a refresh.
     match preserve_refreshed_launch_auth(codex_auth, alias) {
         Ok(true) => user_println(&format!(
             "Codex refreshed the credentials of profile '{alias}'; saved them before restoring."
         )),
         Ok(false) => {}
+        // An error here means the live file holds credentials newer than the
+        // profile's that could not be stored: either they belong to another
+        // account, or the write failed. Rolling back would overwrite — or with
+        // no original, delete — the only copy the auth server still accepts,
+        // and rotation makes that irreversible. Leaving the live file in place
+        // is the recoverable outcome: `codex-switch use` fixes a wrong account,
+        // nothing fixes a destroyed token.
         Err(err) => {
-            tracing::warn!("launch restore could not save refreshed credentials: {err:#}");
-            user_println(&format!(
-                "Warning: could not preserve credentials Codex may have refreshed for profile '{alias}': {err:#}"
-            ));
+            return Err(err).with_context(|| {
+                let recovery = if had_original {
+                    format!(
+                        "The pre-launch auth.json is kept at {}, so nothing is lost: save the \
+                         live credentials with `codex-switch import {}`, then restore that \
+                         backup by hand.",
+                        backup.display(),
+                        codex_auth.display()
+                    )
+                } else {
+                    format!(
+                        "There was no pre-launch auth.json, so deleting this file would lose \
+                         these credentials outright: save them with `codex-switch import {}`.",
+                        codex_auth.display()
+                    )
+                };
+                format!(
+                    "refusing to roll back {}: it holds newer credentials that could not be \
+                     saved into profile '{alias}'. {recovery}",
+                    codex_auth.display()
+                )
+            });
         }
     }
     if had_original {
@@ -639,24 +662,65 @@ mod tests {
         assert_eq!(read_json(&profile_path), staged);
     }
 
+    // ── Rollback must never destroy credentials it could not archive ──
+    //
+    // Once preserving fails, the live auth.json may hold the only refresh_token
+    // that still works (OpenAI revokes the previous one the moment Codex uses
+    // it). Rolling the backup over it, or deleting it, is unrecoverable; the
+    // cost of *not* rolling back is one `codex-switch use <alias>`.
+
     #[test]
-    fn restore_ignores_live_credentials_from_another_account() {
+    fn restore_keeps_live_credentials_it_could_not_preserve() {
         let home = TestAppHome::new();
         let staged = auth_value("a", "refresh-old", "2026-07-01T00:00:00Z");
         let (profile_path, codex_auth, backup) = staged_launch(&home, &staged);
 
-        crate::auth::write_auth(
-            &codex_auth,
-            &auth_value("b", "refresh-b", "2026-07-20T10:00:00Z"),
-        )
-        .unwrap();
+        // Newer, but not this profile's account: it cannot be folded into the
+        // profile, and it is the only copy of whatever was logged in there.
+        let foreign = auth_value("b", "refresh-b", "2026-07-20T10:00:00Z");
+        crate::auth::write_auth(&codex_auth, &foreign).unwrap();
 
-        restore_launch_auth(&codex_auth, &backup, true, "work").unwrap();
+        let err = restore_launch_auth(&codex_auth, &backup, true, "work").unwrap_err();
 
         assert_eq!(
             read_json(&profile_path),
             staged,
             "another account's credentials must not pollute this profile"
         );
+        assert_eq!(
+            read_json(&codex_auth),
+            foreign,
+            "the rollback must not overwrite credentials it failed to archive"
+        );
+        assert!(
+            backup.exists(),
+            "the pre-launch auth.json must stay on disk so the user can converge by hand"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&backup.display().to_string()) && msg.contains("codex-switch import"),
+            "the refusal must name the backup and how to recover, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn restore_keeps_live_credentials_it_could_not_preserve_without_an_original() {
+        let home = TestAppHome::new();
+        let staged = auth_value("a", "refresh-old", "2026-07-01T00:00:00Z");
+        let (profile_path, codex_auth, backup) = staged_launch(&home, &staged);
+        std::fs::remove_file(&backup).unwrap();
+
+        let foreign = auth_value("b", "refresh-b", "2026-07-20T10:00:00Z");
+        crate::auth::write_auth(&codex_auth, &foreign).unwrap();
+
+        let err = restore_launch_auth(&codex_auth, &backup, false, "work").unwrap_err();
+
+        assert_eq!(
+            read_json(&codex_auth),
+            foreign,
+            "deleting the staged file would destroy the only copy of these credentials"
+        );
+        assert_eq!(read_json(&profile_path), staged);
+        assert!(format!("{err:#}").contains("codex-switch import"));
     }
 }
