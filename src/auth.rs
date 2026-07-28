@@ -517,6 +517,22 @@ fn sanitize_proxy_url(url: &str) -> String {
     sanitized
 }
 
+/// An intercepting proxy re-signs traffic with its own CA, and rustls reports
+/// that as a bare "UnknownIssuer" with no indication of what to do. The OS trust
+/// store is consulted first, so reaching here means the CA is not installed
+/// there either and has to be supplied explicitly.
+fn tls_trust_hint(message: &str) -> Option<&'static str> {
+    if message.contains("UnknownIssuer") || message.contains("invalid peer certificate") {
+        return Some(
+            "\n  hint: the server's certificate was not signed by a CA this machine trusts. \
+             An intercepting proxy (Proxyman, Charles, a corporate MITM) re-signs traffic with \
+             its own CA — add that CA to the system trust store, or export it as PEM and point \
+             CODEX_CA_CERTIFICATE at the file.",
+        );
+    }
+    None
+}
+
 /// Format a reqwest error with the full source chain for diagnostics.
 pub fn format_reqwest_error(context: &str, err: &reqwest::Error) -> anyhow::Error {
     let mut msg = format!("{context}: {err}");
@@ -524,6 +540,9 @@ pub fn format_reqwest_error(context: &str, err: &reqwest::Error) -> anyhow::Erro
     while let Some(cause) = source {
         msg.push_str(&format!("\n  caused by: {cause}"));
         source = std::error::Error::source(cause);
+    }
+    if let Some(hint) = tls_trust_hint(&msg) {
+        msg.push_str(hint);
     }
     anyhow::anyhow!("{msg}")
 }
@@ -789,5 +808,24 @@ mod tests {
         assert_eq!(redacted["data"]["items"][0]["refresh_token"], "***");
         assert_eq!(redacted["data"]["items"][1]["keep"], "value");
         assert_eq!(redacted["keep_top"], "value");
+    }
+
+    #[test]
+    fn unknown_issuer_error_explains_how_to_trust_an_intercepting_proxy() {
+        let msg = "Usage API request failed: error sending request\n  caused by: invalid peer certificate: UnknownIssuer";
+        let hint = super::tls_trust_hint(msg).expect("UnknownIssuer must carry a hint");
+        assert!(
+            hint.contains("CODEX_CA_CERTIFICATE"),
+            "the hint must name the variable that fixes it: {hint}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_connection_failure_gets_no_certificate_hint() {
+        let msg = "Usage API request failed: error sending request\n  caused by: tcp connect error: Connection refused (os error 61)";
+        assert!(
+            super::tls_trust_hint(msg).is_none(),
+            "a hint about certificates would misdirect a plain connection failure"
+        );
     }
 }
