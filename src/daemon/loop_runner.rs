@@ -23,6 +23,10 @@ fn poll_backoff_secs(poll_secs: u64, consecutive_failures: u32) -> u64 {
 
 /// Main daemon event loop: periodically checks usage and switches account when needed.
 pub async fn run_daemon_loop() -> Result<()> {
+    // Registered before anything else can block: from here on every signal is
+    // recorded, even while a branch body is busy.
+    let mut shutdown = ShutdownListener::new()?;
+
     let cfg = config::get();
     let poll_secs = cfg.daemon.poll_interval_secs;
     let token_secs = cfg.daemon.token_check_interval_secs;
@@ -138,7 +142,7 @@ pub async fn run_daemon_loop() -> Result<()> {
                 st.last_cache_refresh_at = Some(auth::now_unix_secs());
                 state::write(&mut st);
             }
-            _ = shutdown_signal() => {
+            _ = shutdown.recv() => {
                 tracing::info!("Received shutdown signal, exiting daemon loop");
                 break;
             }
@@ -302,6 +306,39 @@ mod tests {
         assert_eq!(poll_backoff_secs(60, 4), 960);
         assert_eq!(poll_backoff_secs(60, 10), 960);
     }
+
+    /// `daemon stop` sends a single SIGTERM. The daemon's select loop spends a
+    /// large share of every second inside a branch body (the poll branch does
+    /// HTTP round trips), and during that time nothing polls the shutdown
+    /// branch. Tokio drops a delivered signal outright when no listener is
+    /// registered at broadcast time, so the listener has to survive across
+    /// loop iterations rather than be rebuilt inside `select!`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_listener_catches_a_signal_raised_while_it_is_not_polled() {
+        use super::ShutdownListener;
+        use std::time::Duration;
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut listener = ShutdownListener::new().expect("shutdown listener");
+
+        // A second listener registered up front turns "tokio has finished
+        // broadcasting the signal" into an awaitable event, so the assertion
+        // below never depends on sleeping long enough.
+        let mut witness = signal(SignalKind::terminate()).expect("witness listener");
+
+        // SAFETY: raising SIGTERM at our own process. Both listeners above are
+        // registered first, so tokio's handler is installed and the default
+        // terminate action cannot fire.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        witness.recv().await;
+
+        // `listener` was never polled before the broadcast -- exactly the state
+        // the daemon loop is in while a poll body runs.
+        tokio::time::timeout(Duration::from_secs(5), listener.recv())
+            .await
+            .expect("a SIGTERM delivered while the loop was busy must not be lost");
+    }
 }
 
 #[derive(Default)]
@@ -386,19 +423,57 @@ async fn refresh_profile_cache(auto_warmup: bool) -> Result<CacheRefreshSummary>
     Ok(summary)
 }
 
-async fn shutdown_signal() {
+/// Shutdown signal listener, registered once and kept alive for the whole
+/// daemon loop.
+///
+/// It must outlive the loop rather than be created inside `select!`: tokio
+/// only delivers a signal to listeners that are registered at the moment it
+/// broadcasts, and drops it for good otherwise. A listener built inside the
+/// select is torn down every time another branch wins, leaving the daemon deaf
+/// for the entire duration of each poll / cache-refresh body — and those do
+/// HTTP round trips. A `daemon stop` landing in that window used to be lost
+/// outright, leaving the daemon running with no second chance.
+struct ShutdownListener {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-        tokio::select! {
-            _ = sigterm.recv() => {},
-            _ = sigint.recv() => {},
+    sigterm: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    sigint: tokio::signal::unix::Signal,
+    #[cfg(not(unix))]
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+impl ShutdownListener {
+    fn new() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                sigterm: signal(SignalKind::terminate())?,
+                sigint: signal(SignalKind::interrupt())?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                ctrl_c: tokio::signal::windows::ctrl_c()?,
+            })
         }
     }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await.expect("Ctrl+C handler");
+
+    /// Resolves once a shutdown signal has been received. Safe to cancel: the
+    /// registration lives in `self`, so a signal that arrives while this future
+    /// is not being polled is still observed by the next call.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.sigterm.recv() => {},
+                _ = self.sigint.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.ctrl_c.recv().await;
+        }
     }
 }
