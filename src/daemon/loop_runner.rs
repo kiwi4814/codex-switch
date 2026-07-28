@@ -116,7 +116,14 @@ pub async fn run_daemon_loop() -> Result<()> {
                 state::write(&mut st);
             }
             _ = token_interval.tick() => {
-                usage::refresh_expiring_tokens().await;
+                // Runs unattended on a timer: a lost write here bricks the
+                // profile with nobody watching, so it gets ERROR, not debug.
+                for failure in usage::refresh_expiring_tokens().await {
+                    // `detail` already opens with `[alias]` and carries the
+                    // underlying IO/permission cause; the field makes the
+                    // affected profile filterable in structured log output.
+                    tracing::error!(alias = %failure.alias, "{}", failure.error.detail);
+                }
             }
             _ = cache_refresh_interval.tick() => {
                 match refresh_profile_cache(auto_warmup).await {

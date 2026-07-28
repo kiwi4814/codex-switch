@@ -9,6 +9,14 @@ use tracing::{debug, warn};
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 
+fn responses_url() -> String {
+    std::env::var("CS_RESPONSES_URL").unwrap_or_else(|_| RESPONSES_URL.to_string())
+}
+
+fn models_url() -> String {
+    std::env::var("CS_MODELS_URL").unwrap_or_else(|_| MODELS_URL.to_string())
+}
+
 static CODEX_VERSION: OnceCell<String> = OnceCell::const_new();
 // tokio Mutex held across the await in resolve_model, ensuring only one fetch per process.
 // Keyed by account (alias) so one account's resolved model never leaks into another's warmup.
@@ -66,7 +74,7 @@ fn build_models_request(
 ) -> reqwest::RequestBuilder {
     crate::usage::apply_account_routing_headers(
         client
-            .get(MODELS_URL)
+            .get(models_url())
             .query(&[("client_version", version)])
             .bearer_auth(access_token),
         account_id,
@@ -421,7 +429,7 @@ fn make_request(
 ) -> reqwest::RequestBuilder {
     crate::usage::apply_account_routing_headers(
         client
-            .post(RESPONSES_URL)
+            .post(responses_url())
             .bearer_auth(access_token)
             .header("Content-Type", "application/json"),
         account_id,
@@ -501,6 +509,12 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
 
     let client = crate::auth::build_http_client()?;
 
+    // Set when the pre-warmup proactive refresh below is rejected by the auth
+    // server outright (e.g. `refresh_token_reused`): that refresh_token is now
+    // permanently dead, so a later 401/403 must not spend a second round trip
+    // replaying it — it can only re-trigger reuse detection.
+    let mut rejected_refresh: Option<anyhow::Error> = None;
+
     // Pre-refresh: if token is about to expire, refresh proactively
     if let Some(ref rt) = refresh_token
         && crate::jwt::is_token_expiring(&access_token, 60) == Some(true)
@@ -528,7 +542,16 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                 id_token = Some(refreshed.id_token);
                 refresh_token = Some(refreshed.refresh_token);
             }
-            Err(e) => warn!("[{alias}] pre-warmup token refresh failed: {e}"),
+            Err(e) => {
+                if e.downcast_ref::<crate::usage::TerminalAuthError>()
+                    .is_some()
+                {
+                    warn!("[{alias}] pre-warmup token refresh rejected permanently: {e:#}");
+                    rejected_refresh = Some(e);
+                } else {
+                    warn!("[{alias}] pre-warmup token refresh failed: {e}");
+                }
+            }
         }
     }
 
@@ -627,6 +650,14 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
             bail!("{alias}: HTTP 400 — {snippet}")
         }
         401 | 403 => {
+            // The pre-warmup proactive refresh already got a terminal rejection
+            // from the auth server for this same refresh_token — retrying here
+            // would just replay a dead credential and burn another round trip.
+            if let Some(e) = rejected_refresh {
+                return Err(e.context(format!(
+                    "{alias}: authentication failed (HTTP {status}) after proactive token refresh was already rejected"
+                )));
+            }
             // Retry once with refreshed token
             if let Some(ref rt) = refresh_token {
                 debug!("[{alias}] got {status}, attempting token refresh and retry");
@@ -716,7 +747,8 @@ pub(crate) async fn fetch_models_for_profile(
 
     if let Some(ref rt) = refresh_token
         && crate::jwt::is_token_expiring(&access_token, 60) == Some(true)
-        && let Ok(refreshed) = crate::usage::do_refresh_token(
+    {
+        match crate::usage::do_refresh_token(
             alias,
             &client,
             id_token.as_deref(),
@@ -724,16 +756,27 @@ pub(crate) async fn fetch_models_for_profile(
             rt,
         )
         .await
-    {
-        if let Err(e) = crate::profile::update_profile_tokens_and_live_if_current(
-            alias,
-            &refreshed.id_token,
-            &refreshed.access_token,
-            &refreshed.refresh_token,
-        ) {
-            warn!("[{alias}] failed to persist refreshed tokens: {e}");
+        {
+            Ok(refreshed) => {
+                if let Err(e) = crate::profile::update_profile_tokens_and_live_if_current(
+                    alias,
+                    &refreshed.id_token,
+                    &refreshed.access_token,
+                    &refreshed.refresh_token,
+                ) {
+                    warn!("[{alias}] failed to persist refreshed tokens: {e}");
+                }
+                access_token = refreshed.access_token;
+            }
+            // Deliberate degrade: fall through and try /models with the
+            // existing (possibly expiring) token rather than failing here.
+            // Still worth a diagnosable trace — silently swallowing this
+            // sent people chasing an unrelated /models error instead of the
+            // real cause (a rejected/expired refresh_token).
+            Err(e) => warn!(
+                "[{alias}] proactive token refresh failed, continuing with existing token: {e:#}"
+            ),
         }
-        access_token = refreshed.access_token;
     }
 
     fetch_models(&client, &access_token, account_id.as_deref(), is_fedramp).await
@@ -1161,5 +1204,270 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
+    }
+
+    // ── Terminal refresh failure must not be replayed ──────────────────
+    //
+    // `CS_TOKEN_URL`, `CS_MODELS_URL` and `CS_RESPONSES_URL` are process-global
+    // env vars (see `responses_url()` / `models_url()` and
+    // `auth::token_url()`), and login's tests retarget `CS_TOKEN_URL` as well,
+    // so every test in this group takes the crate-wide `auth::URL_ENV_LOCK`
+    // rather than a lock private to this module.
+    mod refresh_short_circuit {
+        use super::*;
+        use axum::http::StatusCode;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::auth::URL_ENV_LOCK as ENV_LOCK;
+
+        struct EnvVarGuard {
+            key: &'static str,
+            previous: Option<String>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let previous = std::env::var(key).ok();
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+                Self { key, previous }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.previous {
+                        Some(value) => std::env::set_var(self.key, value),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+
+        fn make_jwt(claims: &serde_json::Value) -> String {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+            format!("header.{payload}.signature")
+        }
+
+        /// An access_token JWT that `is_token_expiring` already treats as expired,
+        /// so `warmup_account`'s pre-warmup proactive refresh always fires.
+        fn expired_access_token() -> String {
+            make_jwt(&serde_json::json!({ "exp": crate::auth::now_unix_secs() - 10 }))
+        }
+
+        fn write_test_auth(path: &std::path::Path, access_token: &str, refresh_token: &str) {
+            let val = serde_json::json!({
+                "tokens": {
+                    "id_token": make_jwt(&serde_json::json!({})),
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                }
+            });
+            crate::auth::write_auth(path, &val).unwrap();
+        }
+
+        /// Starts a mock server answering all three warmup-relevant endpoints and
+        /// points `CS_TOKEN_URL` / `CS_MODELS_URL` / `CS_RESPONSES_URL` at it.
+        /// Returns the request counters and the env guards (drop order keeps the
+        /// guards alive for the caller's whole test).
+        async fn start_mock_server(
+            token_status: StatusCode,
+            token_body: serde_json::Value,
+            responses_status: StatusCode,
+        ) -> (Arc<AtomicUsize>, Vec<EnvVarGuard>) {
+            let token_calls = Arc::new(AtomicUsize::new(0));
+            let counter = token_calls.clone();
+
+            let app = Router::new()
+                .route(
+                    "/oauth/token",
+                    post(move || {
+                        let counter = counter.clone();
+                        let body = token_body.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            (token_status, Json(body))
+                        }
+                    }),
+                )
+                .route(
+                    "/codex/models",
+                    get(|| async {
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "models": [{"slug": "gpt-5-mini", "supported_in_api": true}]
+                            })),
+                        )
+                    }),
+                )
+                .route(
+                    "/codex/responses",
+                    post(move || async move { (responses_status, "") }),
+                );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let guards = vec![
+                EnvVarGuard::set("CS_TOKEN_URL", &format!("http://{addr}/oauth/token")),
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models")),
+                EnvVarGuard::set(
+                    "CS_RESPONSES_URL",
+                    &format!("http://{addr}/codex/responses"),
+                ),
+            ];
+            (token_calls, guards)
+        }
+
+        // `CODEX_SWITCH_HOME` is also mutated by `profile::tests` under its own
+        // `TEST_ENV_LOCK` — take that lock too for the whole test body, or the two
+        // test modules race on the same process-global env var when the harness
+        // runs them in parallel. Holding it across `.await` is safe here: these
+        // are `#[tokio::test]` current-thread runtimes, so no other task on this
+        // thread ever needs the lock back before the test finishes.
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn terminal_pre_refresh_failure_is_not_replayed_on_the_401_retry() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = tempfile::tempdir().unwrap();
+            let _codex_switch_home =
+                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+
+            let alias = "terminal-refresh-test";
+            // Pre-populate the usage cache so `warmup_account` never calls the
+            // (unrelated) usage-fetch path, which has its own independent
+            // proactive-refresh call — that would inflate the auth-endpoint
+            // call count for a reason this test isn't about.
+            crate::cache::put(alias, &crate::usage::UsageInfo::default());
+
+            let profile_path = home.path().join("auth.json");
+            write_test_auth(&profile_path, &expired_access_token(), "refresh-token-1");
+
+            // Every refresh attempt is rejected as reused; the auth server never
+            // issues new tokens. The warmup POST is unreachable with a live token,
+            // so it must also come back unauthorized.
+            let (token_calls, _guards) = start_mock_server(
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!({
+                    "error": {
+                        "code": "refresh_token_reused",
+                        "message": "This refresh token has already been used.",
+                    }
+                }),
+                StatusCode::UNAUTHORIZED,
+            )
+            .await;
+
+            let result = warmup_account(alias, &profile_path).await;
+
+            assert!(
+                result.is_err(),
+                "a permanently rejected refresh_token must not be reported as a successful warmup"
+            );
+            assert_eq!(
+                token_calls.load(Ordering::SeqCst),
+                1,
+                "a terminal refresh rejection must not be replayed a second time from the \
+                 401 handler — it can only ever fail again and costs a full round trip"
+            );
+        }
+
+        // ── `fetch_models_for_profile` must not swallow a refresh failure ──
+
+        #[derive(Clone, Default)]
+        struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+            type Writer = LogBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        impl LogBuf {
+            fn contents(&self) -> String {
+                String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+            }
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn fetch_models_for_profile_logs_the_reason_when_proactive_refresh_fails() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = tempfile::tempdir().unwrap();
+            let _codex_switch_home =
+                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+
+            let alias = "fetch-models-refresh-log-test";
+            let profile_path = home.path().join("auth.json");
+            write_test_auth(&profile_path, &expired_access_token(), "refresh-token-2");
+
+            // `fetch_models_for_profile` never sends a warmup ping, so the
+            // responses-endpoint status is irrelevant here.
+            let (_token_calls, _guards) = start_mock_server(
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!({
+                    "error": {
+                        "code": "refresh_token_reused",
+                        "message": "This refresh token has already been used.",
+                    }
+                }),
+                StatusCode::UNAUTHORIZED,
+            )
+            .await;
+
+            let log_buf = LogBuf::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(log_buf.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .without_time()
+                .finish();
+
+            let result = {
+                let _tracing_guard = tracing::subscriber::set_default(subscriber);
+                fetch_models_for_profile(alias, &profile_path).await
+            };
+
+            // Existing degrade-gracefully behavior must be preserved: a failed
+            // proactive refresh still falls through to /models with the old token.
+            assert!(
+                result.is_ok(),
+                "a refresh failure must not abort the /models fetch: {result:?}"
+            );
+
+            let logs = log_buf.contents();
+            assert!(
+                logs.contains("refresh_token_reused"),
+                "the real rejection reason must be traceable in the logs, not silently \
+                 dropped — captured log output was: {logs:?}"
+            );
+        }
     }
 }

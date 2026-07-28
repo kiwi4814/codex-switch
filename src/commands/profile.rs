@@ -5,6 +5,20 @@ use crate::output::{
 use crate::{auth, cache, color, config, jwt, profile, usage, workspace};
 use anyhow::{Context, Result};
 
+/// Surface profiles whose rotated credentials could not be written.
+///
+/// The auth server has already invalidated their previous refresh token, so
+/// staying quiet hands the user an account that stops working later with no
+/// clue why. Printed to stderr so `--json` stdout stays machine-readable.
+fn report_token_persist_failures(failures: &[usage::TokenPersistFailure]) {
+    for failure in failures {
+        eprintln!(
+            "{}",
+            color::error(&format!("Warning: {}", failure.error.detail))
+        );
+    }
+}
+
 // ── use ──────────────────────────────────────────────────
 
 pub(crate) async fn use_cmd(alias: Option<&str>, json: bool, consume_card: bool) -> Result<()> {
@@ -240,7 +254,7 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
     }
 
     // Opportunistically refresh tokens about to expire (background, bounded)
-    usage::refresh_expiring_tokens().await;
+    report_token_persist_failures(&usage::refresh_expiring_tokens().await);
 
     Ok(())
 }
@@ -699,7 +713,7 @@ async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
     }
 
     // Opportunistically refresh tokens about to expire (background, bounded)
-    usage::refresh_expiring_tokens().await;
+    report_token_persist_failures(&usage::refresh_expiring_tokens().await);
 
     Ok(())
 }

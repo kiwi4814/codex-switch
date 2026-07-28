@@ -276,6 +276,39 @@ pub struct UsageError {
     pub detail: String,
 }
 
+impl UsageError {
+    /// The auth server issued rotated credentials but they could not be written
+    /// to disk.
+    ///
+    /// This is *not* a rejected refresh: the new tokens are valid, they simply
+    /// never reached the profile, while the previous `refresh_token` is already
+    /// dead server-side. Continuing would leave the user with an account that
+    /// silently stops working at the next start, so the wording has to point at
+    /// the local write failure and carry the underlying IO/permission cause.
+    pub fn token_persist_failed(alias: &str, cause: &anyhow::Error) -> Self {
+        Self {
+            summary: "refreshed token not saved".to_string(),
+            detail: format!(
+                "[{alias}] token refresh succeeded but the rotated credentials could not be saved: \
+                 {cause:#}. The auth server has already invalidated the previous refresh token, so \
+                 this profile may need to sign in again once the write problem is fixed."
+            ),
+        }
+    }
+}
+
+/// One profile whose rotated credentials could not be written to disk during an
+/// opportunistic refresh.
+///
+/// Opportunistic refresh is a batch, and the daemon runs it on a timer, so a
+/// single failure must neither abort the remaining profiles nor disappear into
+/// a log line: it is collected and handed back for the caller to surface.
+#[derive(Debug, Clone)]
+pub struct TokenPersistFailure {
+    pub alias: String,
+    pub error: UsageError,
+}
+
 impl std::fmt::Display for UsageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.detail)

@@ -10,8 +10,8 @@ use crate::auth::{self, CLIENT_ID, format_reqwest_error};
 use super::parse::parse_usage_checked;
 use super::reset_credits::enrich_reset_credits;
 use super::{
-    MAX_RETRIES, RETRY_DELAY, RefreshedTokens, TerminalAuthError, UsageError, UsageFetchOutcome,
-    UsageInfo,
+    MAX_RETRIES, RETRY_DELAY, RefreshedTokens, TerminalAuthError, TokenPersistFailure, UsageError,
+    UsageFetchOutcome, UsageInfo,
 };
 
 pub(crate) fn apply_account_routing_headers(
@@ -154,18 +154,23 @@ pub async fn fetch_usage_retried_force(
     fetch_usage_retried_inner(alias, profile_path, current_alias, true).await
 }
 
-fn persist_refreshed_tokens(alias: &str, profile_path: &Path, new_tokens: &RefreshedTokens) {
-    if let Err(err) = crate::profile::update_profile_tokens_and_live_if_current(
+/// Write credentials the auth server just rotated back to the profile.
+///
+/// The previous `refresh_token` is dead the moment these were issued, so a
+/// failed write leaves only an in-memory copy of the sole credential the server
+/// still accepts. Losing it bricks the account, which makes this a reportable
+/// failure rather than something to warn about and walk past.
+fn persist_refreshed_tokens(
+    alias: &str,
+    new_tokens: &RefreshedTokens,
+) -> std::result::Result<(), UsageError> {
+    crate::profile::update_profile_tokens_and_live_if_current(
         alias,
         &new_tokens.id_token,
         &new_tokens.access_token,
         &new_tokens.refresh_token,
-    ) {
-        warn!(
-            "[{alias}] Failed to atomically persist refreshed tokens to {} and live auth: {err}",
-            profile_path.display()
-        );
-    }
+    )
+    .map_err(|err| UsageError::token_persist_failed(alias, &err))
 }
 
 fn resolve_refreshed_tokens(
@@ -283,8 +288,13 @@ async fn fetch_usage_retried_inner(
         // previous one as reused. Persist and adopt the new credentials before
         // looking at the result, or the next attempt would replay a dead token
         // and turn a transient failure into a permanent lockout.
+        //
+        // A write failure aborts this account outright: the rotated token lives
+        // only in memory while the old one is already dead, and another round
+        // would just spend a second single-use token we equally cannot keep.
+        // Other aliases refresh in their own calls and are unaffected.
         if let Some(new_tokens) = &outcome.refreshed {
-            persist_refreshed_tokens(alias, profile_path, new_tokens);
+            persist_refreshed_tokens(alias, new_tokens)?;
             at = new_tokens.access_token.clone();
             id_token = Some(new_tokens.id_token.clone());
             refresh_token = Some(new_tokens.refresh_token.clone());
@@ -651,11 +661,15 @@ const OPPORTUNISTIC_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 /// Opportunistically refresh tokens that are about to expire.
 /// Runs concurrently with a bounded total timeout.
-/// Errors are logged, not propagated — safe to await at end of CLI commands.
-pub async fn refresh_expiring_tokens() {
+///
+/// Refresh *failures* are logged, not propagated — a token the server refused
+/// costs nothing but a retry later. Failures to **save** a rotated token are
+/// returned instead: the old credential is already dead server-side, so a lost
+/// write silently bricks that profile and the caller has to tell someone.
+pub async fn refresh_expiring_tokens() -> Vec<TokenPersistFailure> {
     let profiles = match crate::profile::list_profiles() {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => return Vec::new(),
     };
 
     let now = auth::now_unix_secs();
@@ -699,7 +713,7 @@ pub async fn refresh_expiring_tokens() {
     }
 
     if candidates.is_empty() {
-        return;
+        return Vec::new();
     }
 
     // Sort by expiration: soonest first
@@ -714,7 +728,7 @@ pub async fn refresh_expiring_tokens() {
 
     // Spawn all refreshes concurrently, bounded by total timeout
     let mut tasks = tokio::task::JoinSet::new();
-    for (alias, path, id_token, access_token, rt, exp) in candidates {
+    for (alias, _path, id_token, access_token, rt, exp) in candidates {
         tasks.spawn(async move {
             let remaining = exp - auth::now_unix_secs();
             debug!("[{alias}] token expires in {remaining}s, refreshing");
@@ -723,7 +737,7 @@ pub async fn refresh_expiring_tokens() {
                 Ok(c) => c,
                 Err(e) => {
                     debug!("[{alias}] skipping refresh: {e}");
-                    return;
+                    return None;
                 }
             };
 
@@ -736,22 +750,36 @@ pub async fn refresh_expiring_tokens() {
             )
             .await
             {
-                Ok(new_tokens) => {
-                    persist_refreshed_tokens(&alias, &path, &new_tokens);
-                    info!("[{alias}] opportunistic token refresh succeeded");
-                }
+                Ok(new_tokens) => match persist_refreshed_tokens(&alias, &new_tokens) {
+                    Ok(()) => {
+                        info!("[{alias}] opportunistic token refresh succeeded");
+                        None
+                    }
+                    // Report rather than abort: the remaining profiles still
+                    // deserve their refresh, and this one is only recoverable
+                    // once a human hears about it.
+                    Err(error) => Some(TokenPersistFailure { alias, error }),
+                },
                 Err(e) => {
                     debug!("[{alias}] opportunistic token refresh failed: {e}");
+                    None
                 }
             }
         });
     }
 
     // Wait for all with total timeout — don't block CLI too long
+    let mut failures = Vec::new();
     let _ = tokio::time::timeout(OPPORTUNISTIC_TOTAL_TIMEOUT, async {
-        while tasks.join_next().await.is_some() {}
+        while let Some(joined) = tasks.join_next().await {
+            if let Ok(Some(failure)) = joined {
+                failures.push(failure);
+            }
+        }
     })
     .await;
+
+    failures
 }
 
 #[cfg(test)]
