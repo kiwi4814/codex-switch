@@ -79,14 +79,7 @@ pub(crate) async fn launch_cmd(
             let _lock = profile::lock_live_auth().context("acquiring auth lock")?;
 
             if had_original {
-                std::fs::copy(&codex_auth2, &backup2)
-                    .with_context(|| format!("backing up {}", codex_auth2.display()))?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(&backup2, std::fs::Permissions::from_mode(0o600));
-                }
+                backup_launch_auth(&codex_auth2, &backup2)?;
             }
 
             profile::stage_profile_auth(&target_alias2)?;
@@ -202,6 +195,20 @@ pub(crate) async fn launch_cmd(
     Ok(())
 }
 
+/// Snapshot the live auth.json into `backup` before it is overwritten by the
+/// staged profile.
+///
+/// Written via `atomic_write_private` (temp file + rename) rather than
+/// `std::fs::copy`, and for the same reason `restore_launch_auth` avoids it:
+/// this file holds a one-time-use `refresh_token`, so a truncated copy left
+/// behind by a mid-write crash is unrecoverable without a fresh login.
+fn backup_launch_auth(codex_auth: &std::path::Path, backup: &std::path::Path) -> Result<()> {
+    let original = std::fs::read(codex_auth)
+        .with_context(|| format!("reading {} for backup", codex_auth.display()))?;
+    auth::atomic_write_private(backup, &original)
+        .with_context(|| format!("backing up {}", codex_auth.display()))
+}
+
 /// Roll the staged profile back out of the live auth.json, keeping anything
 /// Codex refreshed while it was staged.
 ///
@@ -229,7 +236,9 @@ fn restore_launch_auth(
         }
     }
     if had_original {
-        std::fs::copy(backup, codex_auth).with_context(|| {
+        let saved = std::fs::read(backup)
+            .with_context(|| format!("reading launch auth backup {}", backup.display()))?;
+        auth::atomic_write_private(codex_auth, &saved).with_context(|| {
             format!(
                 "restoring launch auth backup {} -> {}",
                 backup.display(),
@@ -332,7 +341,7 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::MutexGuard;
 
-    use super::restore_launch_auth;
+    use super::{backup_launch_auth, restore_launch_auth};
 
     struct TestAppHome {
         _lock: MutexGuard<'static, ()>,
@@ -413,6 +422,79 @@ mod tests {
 
         assert!(!codex_auth.exists());
         assert!(!backup.exists());
+    }
+
+    // ── Atomic write contract ───────────────────────────────────────
+    //
+    // Both the backup and the restore write the live auth.json, which holds a
+    // one-time-use refresh_token: a crash mid-write must never leave a
+    // truncated file, and the file must never be group/world readable. These
+    // are the two observable differences between `atomic_write_private` and
+    // `std::fs::copy` (which preserves source permissions and copies bytes
+    // in place rather than via a temp file + rename), so we assert on them
+    // rather than trying to simulate a crash directly.
+
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_launch_auth_writes_backup_with_private_permissions() {
+        let home = TestAppHome::new();
+        let codex_auth = home.path().join("codex/auth.json");
+        let backup = home.path().join("auth.backup");
+        std::fs::create_dir_all(codex_auth.parent().unwrap()).unwrap();
+        // Default `fs::write` permissions (governed by umask) are not 0600,
+        // so this only passes if the backup path went through the private
+        // atomic writer rather than a permission-preserving copy.
+        std::fs::write(&codex_auth, b"live credentials").unwrap();
+
+        backup_launch_auth(&codex_auth, &backup).unwrap();
+
+        assert_eq!(std::fs::read(&backup).unwrap(), b"live credentials");
+        assert_eq!(mode(&backup), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_launch_auth_writes_target_with_private_permissions() {
+        let home = TestAppHome::new();
+        let codex_auth = home.path().join("codex/auth.json");
+        let backup = home.path().join("auth.backup");
+        std::fs::create_dir_all(codex_auth.parent().unwrap()).unwrap();
+        std::fs::write(&codex_auth, b"staged profile").unwrap();
+        std::fs::write(&backup, b"original auth").unwrap();
+
+        restore_launch_auth(&codex_auth, &backup, true, "work").unwrap();
+
+        assert_eq!(std::fs::read(&codex_auth).unwrap(), b"original auth");
+        assert_eq!(mode(&codex_auth), 0o600);
+    }
+
+    #[test]
+    fn restore_launch_auth_leaves_no_stray_files_when_target_already_existed() {
+        let home = TestAppHome::new();
+        let codex_dir = home.path().join("codex");
+        let codex_auth = codex_dir.join("auth.json");
+        let backup = home.path().join("auth.backup");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(&codex_auth, b"staged profile").unwrap();
+        std::fs::write(&backup, b"original auth").unwrap();
+
+        restore_launch_auth(&codex_auth, &backup, true, "work").unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(&codex_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("auth.json")],
+            "no leftover temp file should remain next to the restored auth.json"
+        );
     }
 
     // ── Codex-side refresh during the launch window ───────────────
