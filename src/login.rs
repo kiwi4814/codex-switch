@@ -379,8 +379,13 @@ async fn exchange_code(code: &str, code_verifier: &str, redirect_uri: &str) -> R
 /// browser login. 5xx is treated like a transport hiccup since the server didn't reach a verdict.
 const TOKEN_EXCHANGE_MAX_ATTEMPTS: u32 = 3;
 
+/// True when no HTTP response came back at all. reqwest reports both a refused
+/// connection and a TLS handshake that died mid-negotiation as `is_request()`
+/// rather than `is_connect()`, so keying on the latter alone never retries the
+/// very failures this exists for. Without a response the server never ruled on
+/// the code, and the worst case of retrying is a definitive `invalid_grant`.
 fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
-    err.is_connect() || err.is_timeout()
+    err.is_connect() || err.is_timeout() || err.is_request()
 }
 
 fn token_exchange_retry_backoff(attempt: u32) -> Duration {
@@ -1247,31 +1252,45 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn token_exchange_recovers_after_two_transient_connection_failures() {
+        async fn token_exchange_retries_until_the_transient_failure_clears() {
             let _lock = TOKEN_URL_ENV_LOCK.lock().await;
-            let port = reserve_closed_port();
-            let _env = EnvVarGuard::set(&format!("http://127.0.0.1:{port}/oauth/token"));
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let counter = request_count.clone();
 
-            // Attempts fire at t=0 (fails, nothing listening) and t=150ms (fails, still
-            // not up) before the mock server binds at t=300ms; the 3rd attempt at
-            // t=450ms succeeds.
+            // Driven by the request counter, not by wall-clock: the server is up the
+            // whole time and decides per request whether this is still the outage.
+            // A version keyed on "mock binds at t=300ms" raced the retry schedule and
+            // could connect mid-bind, failing with SendRequest instead of Connect.
+            let app = Router::new().route(
+                "/oauth/token",
+                post(move || {
+                    let counter = counter.clone();
+                    async move {
+                        let seen = counter.fetch_add(1, Ordering::SeqCst);
+                        if seen < 2 {
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({"error": "temporarily unavailable"})),
+                            );
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "id_token": "id-1",
+                                "access_token": "access-1",
+                                "refresh_token": "refresh-1",
+                            })),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                let app = Router::new().route(
-                    "/oauth/token",
-                    post(|| async {
-                        Json(serde_json::json!({
-                            "id_token": "id-1",
-                            "access_token": "access-1",
-                            "refresh_token": "refresh-1",
-                        }))
-                    }),
-                );
-                let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-                    .await
-                    .unwrap();
                 axum::serve(listener, app).await.unwrap();
             });
+
+            let _env = EnvVarGuard::set(&format!("http://{addr}/oauth/token"));
 
             let tokens = exchange_code_with_redirect(
                 "code",
@@ -1279,11 +1298,62 @@ mod tests {
                 "http://localhost:1455/auth/callback",
             )
             .await
-            .expect("token exchange should succeed once the transient network blip clears");
+            .expect("token exchange should succeed once the transient outage clears");
 
+            assert_eq!(request_count.load(Ordering::SeqCst), 3);
             assert_eq!(tokens.id_token, "id-1");
             assert_eq!(tokens.access_token, "access-1");
             assert_eq!(tokens.refresh_token, "refresh-1");
+        }
+
+        #[tokio::test]
+        async fn a_refused_connection_is_classified_as_retryable() {
+            let port = reserve_closed_port();
+            let err = crate::auth::build_http_client()
+                .unwrap()
+                .post(format!("http://127.0.0.1:{port}/oauth/token"))
+                .send()
+                .await
+                .expect_err("nothing is listening on a reserved-then-dropped port");
+
+            assert!(
+                is_retryable_transport_error(&err),
+                "refused connection must be retryable, but was classified \
+                 connect={} timeout={} request={} body={}: {err}",
+                err.is_connect(),
+                err.is_timeout(),
+                err.is_request(),
+                err.is_body(),
+            );
+        }
+
+        #[tokio::test]
+        async fn token_exchange_retries_connection_failures_before_giving_up() {
+            let _lock = TOKEN_URL_ENV_LOCK.lock().await;
+            let port = reserve_closed_port();
+            let _env = EnvVarGuard::set(&format!("http://127.0.0.1:{port}/oauth/token"));
+
+            let started = std::time::Instant::now();
+            let err = exchange_code_with_redirect(
+                "code",
+                "verifier",
+                "http://localhost:1455/auth/callback",
+            )
+            .await
+            .expect_err("an endpoint that never answers must eventually fail");
+            let elapsed = started.elapsed();
+
+            // Lower bound only: the two backoffs (150ms + 300ms) must have elapsed, so
+            // connection failures really did go through the retry path rather than
+            // failing on the first attempt. A slow machine only makes this more true.
+            assert!(
+                elapsed >= Duration::from_millis(400),
+                "connect failures should have been retried with backoff, gave up after {elapsed:?}"
+            );
+            assert!(
+                err.to_string().contains("Token exchange request failed"),
+                "{err}"
+            );
         }
 
         #[tokio::test]
