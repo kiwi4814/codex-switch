@@ -1207,8 +1207,9 @@ mod tests {
     //
     // `exchange_code_with_redirect` is private (the `login` module is not part of the
     // public library API), so these live as unit tests here rather than as an external
-    // `tests/` integration file. CS_TOKEN_URL is process-global, so every test in this
-    // group takes `TOKEN_URL_ENV_LOCK` before touching it.
+    // `tests/` integration file. CS_TOKEN_URL is process-global and warmup's tests
+    // retarget it too, so every test here takes the crate-wide `auth::URL_ENV_LOCK`
+    // rather than a lock private to this module.
 
     mod token_exchange {
         use super::*;
@@ -1216,7 +1217,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        static TOKEN_URL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        use crate::auth::URL_ENV_LOCK as TOKEN_URL_ENV_LOCK;
 
         struct EnvVarGuard {
             previous: Option<String>,

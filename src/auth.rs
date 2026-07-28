@@ -29,6 +29,15 @@ pub(crate) fn token_url() -> String {
     std::env::var("CS_TOKEN_URL").unwrap_or_else(|_| DEFAULT_TOKEN_URL.to_string())
 }
 
+/// Serializes tests that redirect endpoint URLs (`CS_TOKEN_URL`, and the
+/// warmup equivalents) at a mock server. Environment variables are
+/// process-global, so a per-module lock only serializes that module and lets
+/// tests in a sibling module retarget the variable mid-request; both modules
+/// must take this one. Mirrors `profile::TEST_ENV_LOCK`, which does the same
+/// for the `HOME` / `CODEX_HOME` group.
+#[cfg(test)]
+pub(crate) static URL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// ~/.codex/auth.json (or $CODEX_HOME/auth.json)
 pub fn codex_auth_path() -> Result<PathBuf> {
     let codex_home = codex_home_from_values(std::env::var_os("CODEX_HOME"), dirs::home_dir())?;
