@@ -15,6 +15,8 @@ Start with the complete error message, its file path, and the command that produ
 | macOS/Linux self-update reports that the install directory is not writable | Rerun the current installer once to migrate a legacy `/usr/local/bin` direct install to `$HOME/.local/bin`; see [Updating](Updating#legacy-direct-installs). Use `sudo codex-switch self-update` only for an intentional `--system` install. |
 | A dev build should return to stable | Run `codex-switch self-update --stable`. |
 | An installed daemon ignores `CODEX_SWITCH_HOME` | The generated service forwards only `HOME` and `CODEX_HOME`; add `CODEX_SWITCH_HOME` to the service definition manually. See [Configuration](Configuration#platform-integration). |
+| HTTPS fails with `invalid peer certificate: UnknownIssuer` | An intercepting proxy is re-signing traffic. See [HTTPS fails with an unknown issuer](#https-fails-with-invalid-peer-certificate-unknownissuer). |
+| An account reports `re-login required (refresh_token_reused)` | The stored refresh token was already spent and cannot be recovered. Run `codex-switch login <alias>` for that profile. |
 
 For network or API failures, rerun the smallest failing command with `--debug`:
 
@@ -24,6 +26,34 @@ codex-switch --debug self-update --check
 ```
 
 Debug output can contain account or infrastructure identifiers. Before opening an issue, remove tokens, email addresses, account IDs, workspace names, filesystem paths that reveal identity, and proxy credentials.
+
+## HTTPS fails with `invalid peer certificate: UnknownIssuer`
+
+An intercepting proxy — a debugging tool such as Proxyman or Charles, or a
+corporate MITM gateway — presents its own certificate instead of the real one.
+The browser and `curl` accept it because its CA is installed in the operating
+system, so only `codex-switch` appears to be broken.
+
+`codex-switch` reads the OS trust store, so installing the proxy's CA there is
+normally enough. Reaching this error means the CA is missing from that store, or
+is trusted only for the current user in a way the store does not expose. Point at
+the certificate explicitly:
+
+```bash
+# macOS: export the CA, substituting the name shown in Keychain Access
+security find-certificate -c "Proxyman CA" -p > ~/.codex-switch/proxy-ca.pem
+export CODEX_CA_CERTIFICATE=~/.codex-switch/proxy-ca.pem
+```
+
+Set the variable in the shell profile so the TUI and the daemon inherit it, not
+just the current shell. `SSL_CERT_FILE` works as a fallback in the same order
+Codex itself uses. Turning off interception is equally valid when a capture is
+not needed.
+
+The failure is intermittent when the proxy only intercepts part of the time, so
+the same command can succeed minutes later. Login is affected the same way: the
+browser step completes while the token exchange behind it fails, which looks like
+a rejected sign-in rather than a certificate problem.
 
 ## Recover a deleted profile
 
