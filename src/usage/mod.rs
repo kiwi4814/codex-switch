@@ -223,6 +223,50 @@ pub struct RefreshedTokens {
     pub refresh_token: String,
 }
 
+/// A refresh the auth server rejected outright (bad/consumed credential).
+///
+/// OpenAI rotates `refresh_token` on every use and answers replays with
+/// `refresh_token_reused`, so retrying such a failure can never succeed — it
+/// only burns round trips. Carried as a typed error so retry loops can
+/// recognise it via `anyhow::Error::downcast_ref`.
+#[derive(Debug, Clone)]
+pub struct TerminalAuthError {
+    /// Server-provided error code (or `http_<status>` when the body had none).
+    pub code: String,
+    /// Server-provided human-readable message, when present.
+    pub message: Option<String>,
+}
+
+impl TerminalAuthError {
+    /// Short, actionable line for list/TUI status columns.
+    pub fn summary(&self) -> String {
+        format!("re-login required ({})", self.code)
+    }
+}
+
+impl std::fmt::Display for TerminalAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "token refresh rejected, sign in again — {}", self.code)?;
+        if let Some(message) = &self.message {
+            write!(f, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for TerminalAuthError {}
+
+/// Outcome of one usage fetch attempt.
+///
+/// `refreshed` is populated whenever the auth server issued new tokens during
+/// the attempt — **including when `result` is an error**. The rotated
+/// `refresh_token` is the only one the server will still accept, so callers
+/// must persist it before propagating the failure.
+pub struct UsageFetchOutcome {
+    pub refreshed: Option<RefreshedTokens>,
+    pub result: anyhow::Result<UsageInfo>,
+}
+
 /// Structured error for usage fetch failures.
 #[derive(Debug, Clone)]
 pub struct UsageError {

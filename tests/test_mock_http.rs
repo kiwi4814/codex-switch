@@ -201,7 +201,7 @@ async fn usage_401_refreshes_json_token_and_retries_with_new_access_token() {
     let _token_url = EnvVarGuard::set("CS_TOKEN_URL", server.token_url());
     let _reset_url = EnvVarGuard::remove("CS_RESET_CREDITS_URL");
 
-    let (usage, refreshed) = usage::fetch_usage_with_refresh(
+    let outcome = usage::fetch_usage_with_refresh(
         "refresh_case",
         "old_access",
         Some("old_id"),
@@ -209,11 +209,14 @@ async fn usage_401_refreshes_json_token_and_retries_with_new_access_token() {
         None,
         false,
     )
-    .await
-    .unwrap();
+    .await;
+    let usage = outcome.result.unwrap();
 
     assert_eq!(usage.primary.unwrap().used_percent, Some(12.0));
-    assert_eq!(refreshed.unwrap().access_token, refreshed_access_token);
+    assert_eq!(
+        outcome.refreshed.unwrap().access_token,
+        refreshed_access_token
+    );
     assert_eq!(server.request_count("old_access"), 1);
     assert_eq!(server.request_count(refreshed_access_token), 1);
     server.shutdown();
@@ -235,8 +238,8 @@ async fn usage_5xx_returns_contextual_error() {
     let error =
         usage::fetch_usage_with_refresh("server_error", "server_error", None, None, None, false)
             .await
-            .err()
-            .expect("HTTP 500 must fail");
+            .result
+            .expect_err("HTTP 500 must fail");
 
     assert!(error.to_string().contains("HTTP 500"), "{error:#}");
     server.shutdown();
@@ -257,8 +260,8 @@ async fn usage_malformed_json_returns_parse_context() {
 
     let error = usage::fetch_usage_with_refresh("malformed", "malformed", None, None, None, false)
         .await
-        .err()
-        .expect("malformed JSON must fail");
+        .result
+        .expect_err("malformed JSON must fail");
 
     assert!(
         error

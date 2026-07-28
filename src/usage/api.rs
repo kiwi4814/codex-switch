@@ -9,7 +9,10 @@ use crate::auth::{self, CLIENT_ID, format_reqwest_error};
 
 use super::parse::parse_usage_checked;
 use super::reset_credits::enrich_reset_credits;
-use super::{MAX_RETRIES, RETRY_DELAY, RefreshedTokens, UsageError, UsageInfo};
+use super::{
+    MAX_RETRIES, RETRY_DELAY, RefreshedTokens, TerminalAuthError, UsageError, UsageFetchOutcome,
+    UsageInfo,
+};
 
 pub(crate) fn apply_account_routing_headers(
     mut builder: reqwest::RequestBuilder,
@@ -25,12 +28,78 @@ pub(crate) fn apply_account_routing_headers(
     builder
 }
 
+/// The auth server reports failures in two shapes: the OAuth 2.0 standard
+/// `{"error": "invalid_grant", "error_description": "..."}` and OpenAI's
+/// `{"error": {"code": ..., "message": ..., "type": ...}}`. Accept both, or the
+/// whole response fails to deserialize and the actionable server message is
+/// replaced by a serde type error.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RefreshError {
+    Code(String),
+    Detail {
+        code: Option<String>,
+        message: Option<String>,
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    },
+}
+
 #[derive(Debug, Deserialize)]
 struct RefreshResponse {
     id_token: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
-    error: Option<String>,
+    error: Option<RefreshError>,
+    error_description: Option<String>,
+}
+
+impl RefreshResponse {
+    /// Normalize both wire shapes to `(code, message)`.
+    fn error_parts(&self) -> Option<(String, Option<String>)> {
+        match self.error.as_ref()? {
+            RefreshError::Code(code) => Some((code.clone(), self.error_description.clone())),
+            RefreshError::Detail {
+                code,
+                message,
+                kind,
+            } => Some((
+                code.clone()
+                    .or_else(|| kind.clone())
+                    .unwrap_or_else(|| "unknown_error".to_string()),
+                message.clone().or_else(|| self.error_description.clone()),
+            )),
+        }
+    }
+}
+
+/// Auth-server verdicts no retry can change, independent of HTTP status.
+const TERMINAL_AUTH_CODES: &[&str] = &[
+    "refresh_token_reused",
+    "invalid_grant",
+    "invalid_client",
+    "unauthorized_client",
+    "access_denied",
+];
+
+/// A 4xx from the token endpoint means the credential itself was rejected, so
+/// replaying it only re-triggers reuse detection. 429/408 are load/timing
+/// signals and stay retryable.
+fn is_terminal_auth_failure(code: &str, status: reqwest::StatusCode) -> bool {
+    if matches!(
+        status,
+        reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::REQUEST_TIMEOUT
+    ) {
+        return false;
+    }
+    TERMINAL_AUTH_CODES.contains(&code) || status.is_client_error()
+}
+
+fn format_refresh_error(code: &str, message: Option<&str>) -> String {
+    match message {
+        Some(message) => format!("{code}: {message}"),
+        None => code.to_string(),
+    }
 }
 
 fn usage_url() -> String {
@@ -101,12 +170,33 @@ fn persist_refreshed_tokens(alias: &str, profile_path: &Path, new_tokens: &Refre
 
 fn resolve_refreshed_tokens(
     response: RefreshResponse,
+    status: reqwest::StatusCode,
     current_id_token: Option<&str>,
     current_access_token: Option<&str>,
     current_refresh_token: &str,
 ) -> Result<RefreshedTokens> {
-    if let Some(err) = response.error {
-        anyhow::bail!("token refresh failed: {err}");
+    if let Some((code, message)) = response.error_parts() {
+        if is_terminal_auth_failure(&code, status) {
+            return Err(TerminalAuthError { code, message }.into());
+        }
+        anyhow::bail!(
+            "token refresh failed: {}",
+            format_refresh_error(&code, message.as_deref())
+        );
+    }
+
+    // A non-2xx without a recognizable error body still means no tokens were
+    // issued; falling through would "succeed" by echoing the current tokens.
+    if !status.is_success() {
+        let code = format!("http_{}", status.as_u16());
+        if is_terminal_auth_failure(&code, status) {
+            return Err(TerminalAuthError {
+                code,
+                message: None,
+            }
+            .into());
+        }
+        anyhow::bail!("token refresh failed: HTTP {status}");
     }
 
     let id_token = response
@@ -158,10 +248,11 @@ async fn fetch_usage_retried_inner(
     let account_info = crate::jwt::parse_account_info(&val);
     let account_id = account_info.account_id;
     let is_fedramp = account_info.is_fedramp;
-    let id_token = auth::extract_id_token(&val);
+    let mut id_token = auth::extract_id_token(&val);
     let (access_token, refresh_token) = auth::extract_tokens(&val);
+    let mut refresh_token = refresh_token;
 
-    let at = match access_token {
+    let mut at = match access_token {
         Some(t) => t,
         None => {
             return Err(UsageError {
@@ -178,7 +269,7 @@ async fn fetch_usage_retried_inner(
             debug!("[{alias}] retry attempt {}/{MAX_RETRIES}", attempt + 1);
             tokio::time::sleep(RETRY_DELAY).await;
         }
-        match fetch_usage_with_refresh(
+        let outcome = fetch_usage_with_refresh(
             alias,
             &at,
             id_token.as_deref(),
@@ -186,21 +277,36 @@ async fn fetch_usage_retried_inner(
             account_id.as_deref(),
             is_fedramp,
         )
-        .await
-        {
-            Ok((usage, refreshed)) => {
-                if let Some(new_tokens) = refreshed {
-                    persist_refreshed_tokens(alias, profile_path, &new_tokens);
-                }
+        .await;
+
+        // The auth server rotates `refresh_token` on every use and rejects the
+        // previous one as reused. Persist and adopt the new credentials before
+        // looking at the result, or the next attempt would replay a dead token
+        // and turn a transient failure into a permanent lockout.
+        if let Some(new_tokens) = &outcome.refreshed {
+            persist_refreshed_tokens(alias, profile_path, new_tokens);
+            at = new_tokens.access_token.clone();
+            id_token = Some(new_tokens.id_token.clone());
+            refresh_token = Some(new_tokens.refresh_token.clone());
+        }
+
+        match outcome.result {
+            Ok(usage) => {
                 crate::cache::put_async(alias, &usage).await;
                 return Ok(usage);
             }
             Err(e) => {
-                let msg = e.to_string();
+                let msg = format!("{e:#}");
                 warn!(
                     "[{alias}] attempt {}/{MAX_RETRIES} failed: {msg}",
                     attempt + 1
                 );
+                if let Some(terminal) = e.downcast_ref::<TerminalAuthError>() {
+                    return Err(UsageError {
+                        summary: terminal.summary(),
+                        detail: msg,
+                    });
+                }
                 last_summary = extract_error_summary(&msg);
                 last_err = msg;
             }
@@ -213,6 +319,10 @@ async fn fetch_usage_retried_inner(
 }
 
 /// Fetch usage; on 401/403 automatically refresh the token and retry once.
+///
+/// Returns tokens and result separately: a rotated `refresh_token` is the only
+/// credential the auth server will still accept, so it is reported even when
+/// the usage call afterwards failed.
 pub async fn fetch_usage_with_refresh(
     alias: &str,
     access_token: &str,
@@ -220,9 +330,37 @@ pub async fn fetch_usage_with_refresh(
     refresh_token: Option<&str>,
     account_id: Option<&str>,
     is_fedramp: bool,
-) -> Result<(UsageInfo, Option<RefreshedTokens>)> {
+) -> UsageFetchOutcome {
+    let mut refreshed = None;
+    let result = fetch_usage_capturing_refresh(
+        alias,
+        access_token,
+        id_token,
+        refresh_token,
+        account_id,
+        is_fedramp,
+        &mut refreshed,
+    )
+    .await;
+    UsageFetchOutcome { refreshed, result }
+}
+
+/// Inner body of [`fetch_usage_with_refresh`]. Every successful refresh is
+/// written into `refreshed` *before* any further fallible step, so `?`/`bail!`
+/// can never discard a rotated token.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_usage_capturing_refresh(
+    alias: &str,
+    access_token: &str,
+    id_token: Option<&str>,
+    refresh_token: Option<&str>,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+    refreshed: &mut Option<RefreshedTokens>,
+) -> Result<UsageInfo> {
     let client = auth::build_http_client()?;
     let usage_url = usage_url();
+    let mut rejected_refresh: Option<anyhow::Error> = None;
 
     // Refresh when either JWT is near expiry so account identity metadata does
     // not remain stale while the access token is still usable.
@@ -233,11 +371,13 @@ pub async fn fetch_usage_with_refresh(
 
         match do_refresh_token(alias, &client, id_token, Some(access_token), rt).await {
             Ok(new_tokens) => {
+                let bearer = new_tokens.access_token.clone();
+                *refreshed = Some(new_tokens);
+
                 let resp = apply_account_routing_headers(
-                    client.get(&usage_url).header(
-                        "Authorization",
-                        format!("Bearer {}", new_tokens.access_token),
-                    ),
+                    client
+                        .get(&usage_url)
+                        .header("Authorization", format!("Bearer {bearer}")),
                     account_id,
                     is_fedramp,
                 )
@@ -256,20 +396,20 @@ pub async fn fetch_usage_with_refresh(
                         crate::auth::redact_sensitive_log_body(&body)
                     );
                     let mut usage = parse_usage_checked(&body)?;
-                    enrich_reset_credits(
-                        alias,
-                        &client,
-                        &new_tokens.access_token,
-                        account_id,
-                        &mut usage,
-                    )
-                    .await;
-                    return Ok((usage, Some(new_tokens)));
+                    enrich_reset_credits(alias, &client, &bearer, account_id, &mut usage).await;
+                    return Ok(usage);
                 }
                 anyhow::bail!("Usage API failed (HTTP {status}) after proactive token refresh");
             }
             Err(e) => {
-                info!("[{alias}] proactive token refresh failed, trying with existing token: {e}");
+                if e.downcast_ref::<TerminalAuthError>().is_some() {
+                    info!("[{alias}] proactive token refresh rejected permanently: {e:#}");
+                    rejected_refresh = Some(e);
+                } else {
+                    info!(
+                        "[{alias}] proactive token refresh failed, trying with existing token: {e:#}"
+                    );
+                }
             }
         }
     }
@@ -298,7 +438,13 @@ pub async fn fetch_usage_with_refresh(
         );
         let mut usage = parse_usage_checked(&body)?;
         enrich_reset_credits(alias, &client, access_token, account_id, &mut usage).await;
-        return Ok((usage, None));
+        return Ok(usage);
+    }
+
+    // The auth server already rejected this refresh token moments ago; asking
+    // again can only re-trigger reuse detection and add a round trip.
+    if let Some(e) = rejected_refresh {
+        return Err(e.context(format!("Usage API failed (HTTP {status})")));
     }
 
     // If 401/403 and we have a refresh_token, try to refresh
@@ -309,11 +455,13 @@ pub async fn fetch_usage_with_refresh(
 
         match do_refresh_token(alias, &client, id_token, Some(access_token), rt).await {
             Ok(new_tokens) => {
+                let bearer = new_tokens.access_token.clone();
+                *refreshed = Some(new_tokens);
+
                 let resp2 = apply_account_routing_headers(
-                    client.get(&usage_url).header(
-                        "Authorization",
-                        format!("Bearer {}", new_tokens.access_token),
-                    ),
+                    client
+                        .get(&usage_url)
+                        .header("Authorization", format!("Bearer {bearer}")),
                     account_id,
                     is_fedramp,
                 )
@@ -330,21 +478,18 @@ pub async fn fetch_usage_with_refresh(
                         )
                     })?;
                     let mut usage = parse_usage_checked(&body)?;
-                    enrich_reset_credits(
-                        alias,
-                        &client,
-                        &new_tokens.access_token,
-                        account_id,
-                        &mut usage,
-                    )
-                    .await;
-                    return Ok((usage, Some(new_tokens)));
+                    enrich_reset_credits(alias, &client, &bearer, account_id, &mut usage).await;
+                    return Ok(usage);
                 }
                 anyhow::bail!("Usage API still failed (HTTP {status2}) after token refresh");
             }
             Err(e) => {
-                info!("[{alias}] token refresh failed: {e}");
-                anyhow::bail!("Usage API failed (HTTP {status}), token refresh also failed: {e}");
+                info!("[{alias}] token refresh failed: {e:#}");
+                // `.context` (not `bail!`) so the typed terminal-auth error
+                // stays downcastable by the retry loop.
+                return Err(e.context(format!(
+                    "Usage API failed (HTTP {status}), token refresh also failed"
+                )));
             }
         }
     }
@@ -372,7 +517,7 @@ pub async fn validate_import_auth(
     let alias = "import";
     match (access_token, refresh_token) {
         (Some(at), rt) => {
-            let (usage, refreshed) = fetch_usage_with_refresh(
+            let outcome = fetch_usage_with_refresh(
                 alias,
                 &at,
                 id_token.as_deref(),
@@ -380,7 +525,10 @@ pub async fn validate_import_auth(
                 account_id.as_deref(),
                 is_fedramp,
             )
-            .await?;
+            .await;
+            let refreshed = outcome.refreshed;
+            // Apply before propagating: a rotated refresh_token is single-use,
+            // so dropping it on the error path would brick the imported auth.
             if let Some(tokens) = &refreshed {
                 auth::apply_tokens(
                     val,
@@ -389,6 +537,7 @@ pub async fn validate_import_auth(
                     &tokens.refresh_token,
                 )?;
             }
+            let usage = outcome.result?;
             if let Err(err) = crate::workspace::refresh_for_auth(val).await {
                 debug!("workspace metadata unavailable while importing: {err}");
             }
@@ -405,7 +554,7 @@ pub async fn validate_import_auth(
                 &refreshed.refresh_token,
             )?;
             let account_id = crate::jwt::parse_account_info(val).account_id;
-            let (usage, refreshed_again) = fetch_usage_with_refresh(
+            let outcome = fetch_usage_with_refresh(
                 alias,
                 &refreshed.access_token,
                 Some(&refreshed.id_token),
@@ -413,7 +562,8 @@ pub async fn validate_import_auth(
                 account_id.as_deref(),
                 is_fedramp,
             )
-            .await?;
+            .await;
+            let refreshed_again = outcome.refreshed;
             if let Some(tokens) = &refreshed_again {
                 auth::apply_tokens(
                     val,
@@ -422,6 +572,7 @@ pub async fn validate_import_auth(
                     &tokens.refresh_token,
                 )?;
             }
+            let usage = outcome.result?;
             if let Err(err) = crate::workspace::refresh_for_auth(val).await {
                 debug!("workspace metadata unavailable while importing: {err}");
             }
@@ -479,9 +630,14 @@ pub(crate) async fn do_refresh_token(
         anyhow::anyhow!("Failed to parse token refresh response (HTTP {status}): {e}")
     })?;
 
-    let refreshed =
-        resolve_refreshed_tokens(r, current_id_token, current_access_token, refresh_token)
-            .with_context(|| format!("[{alias}] token refresh HTTP {status}"))?;
+    let refreshed = resolve_refreshed_tokens(
+        r,
+        status,
+        current_id_token,
+        current_access_token,
+        refresh_token,
+    )
+    .with_context(|| format!("[{alias}] token refresh HTTP {status}"))?;
     info!("[{alias}] token refresh succeeded");
     Ok(refreshed)
 }
@@ -681,7 +837,9 @@ mod tests {
                 access_token: Some("new-access".to_string()),
                 refresh_token: None,
                 error: None,
+                error_description: None,
             },
+            reqwest::StatusCode::OK,
             Some("existing-id"),
             Some("existing-access"),
             "existing-refresh",

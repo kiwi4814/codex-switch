@@ -29,6 +29,7 @@ const REDIRECT_HOST: &str = "localhost";
 
 // ── Types ─────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct LoginTokens {
     pub id_token: String,
     pub access_token: String,
@@ -43,8 +44,40 @@ struct TokenResponse {
     id_token: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
-    error: Option<String>,
+    error: Option<TokenErrorField>,
     error_description: Option<String>,
+}
+
+/// `error` on OpenAI's `/oauth/token` responses is either the OAuth-standard string
+/// (`{"error":"invalid_grant"}`, paired with a top-level `error_description`) or, on some
+/// 401s, a nested object (`{"error":{"code":...,"message":...}}`). Both must deserialize,
+/// or an object-shaped error breaks parsing of the whole response.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TokenErrorField {
+    Code(String),
+    Detail {
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+    },
+}
+
+impl TokenErrorField {
+    /// Returns `(code, detail_message)` regardless of which shape the server used.
+    fn describe(&self, top_level_description: Option<&str>) -> (String, String) {
+        match self {
+            TokenErrorField::Code(code) => (
+                code.clone(),
+                top_level_description.unwrap_or_default().to_string(),
+            ),
+            TokenErrorField::Detail { code, message } => (
+                code.clone().unwrap_or_default(),
+                message.clone().unwrap_or_default(),
+            ),
+        }
+    }
 }
 
 // ── PKCE helpers ──────────────────────────────────────────
@@ -339,12 +372,28 @@ async fn exchange_code(code: &str, code_verifier: &str, redirect_uri: &str) -> R
     exchange_code_with_redirect(code, code_verifier, redirect_uri).await
 }
 
+/// Transport-level failures (connect/timeout) mean the request never reached the server, so
+/// nothing about the one-shot authorization code has been evaluated yet and a retry is safe.
+/// HTTP 4xx (bad/reused code, PKCE mismatch, etc.) is the server's deterministic verdict on
+/// that code — retrying it can't succeed and only burns the timeout the user has to redo the
+/// browser login. 5xx is treated like a transport hiccup since the server didn't reach a verdict.
+const TOKEN_EXCHANGE_MAX_ATTEMPTS: u32 = 3;
+
+fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout()
+}
+
+fn token_exchange_retry_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(150 * u64::from(attempt))
+}
+
 async fn exchange_code_with_redirect(
     code: &str,
     code_verifier: &str,
     redirect_uri: &str,
 ) -> Result<LoginTokens> {
     let client = crate::auth::build_http_client()?;
+    let token_url = crate::auth::token_url();
 
     let body = format!(
         "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
@@ -354,15 +403,43 @@ async fn exchange_code_with_redirect(
         urlencoding::encode(code_verifier),
     );
 
-    debug!("Token exchange: POST {ISSUER}/oauth/token redirect_uri={redirect_uri}");
+    debug!("Token exchange: POST {token_url} redirect_uri={redirect_uri}");
 
-    let resp = client
-        .post(format!("{ISSUER}/oauth/token"))
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| crate::auth::format_reqwest_error("Token exchange request failed", &e))?;
+    let mut attempt: u32 = 0;
+    let resp = loop {
+        attempt += 1;
+        match client
+            .post(&token_url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body.clone())
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_server_error() && attempt < TOKEN_EXCHANGE_MAX_ATTEMPTS {
+                    debug!(
+                        "Token exchange got HTTP {} (attempt {attempt}/{TOKEN_EXCHANGE_MAX_ATTEMPTS}), retrying",
+                        resp.status()
+                    );
+                    tokio::time::sleep(token_exchange_retry_backoff(attempt)).await;
+                    continue;
+                }
+                break resp;
+            }
+            Err(e) if is_retryable_transport_error(&e) && attempt < TOKEN_EXCHANGE_MAX_ATTEMPTS => {
+                debug!(
+                    "Token exchange transport error (attempt {attempt}/{TOKEN_EXCHANGE_MAX_ATTEMPTS}): {e}"
+                );
+                tokio::time::sleep(token_exchange_retry_backoff(attempt)).await;
+            }
+            Err(e) => {
+                return Err(crate::auth::format_reqwest_error(
+                    "Token exchange request failed",
+                    &e,
+                ));
+            }
+        }
+    };
 
     let status = resp.status();
     debug!("Token exchange: HTTP {status}");
@@ -371,9 +448,9 @@ async fn exchange_code_with_redirect(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to parse token response (HTTP {status}): {e}"))?;
 
-    if let Some(e) = token_resp.error {
-        let desc = token_resp.error_description.as_deref().unwrap_or("");
-        bail!("Token exchange failed (HTTP {status}): {e} -- {desc}");
+    if let Some(err) = token_resp.error {
+        let (code, detail) = err.describe(token_resp.error_description.as_deref());
+        bail!("Token exchange failed (HTTP {status}): {code} -- {detail}");
     }
 
     match (
@@ -1119,5 +1196,184 @@ mod tests {
         failures.reset();
         assert!(failures.record("network error").is_ok());
         assert!(failures.record("parse error").is_ok());
+    }
+
+    // ── Token exchange retry / error-shape tests ──────────────
+    //
+    // `exchange_code_with_redirect` is private (the `login` module is not part of the
+    // public library API), so these live as unit tests here rather than as an external
+    // `tests/` integration file. CS_TOKEN_URL is process-global, so every test in this
+    // group takes `TOKEN_URL_ENV_LOCK` before touching it.
+
+    mod token_exchange {
+        use super::*;
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static TOKEN_URL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        struct EnvVarGuard {
+            previous: Option<String>,
+        }
+
+        impl EnvVarGuard {
+            fn set(value: &str) -> Self {
+                let previous = std::env::var("CS_TOKEN_URL").ok();
+                unsafe {
+                    std::env::set_var("CS_TOKEN_URL", value);
+                }
+                Self { previous }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.previous {
+                        Some(value) => std::env::set_var("CS_TOKEN_URL", value),
+                        None => std::env::remove_var("CS_TOKEN_URL"),
+                    }
+                }
+            }
+        }
+
+        /// Bind then immediately drop: the OS gives back a port nothing is listening on
+        /// yet, so a connection attempt to it fails fast with "connection refused" — a
+        /// genuine transport error, not a timeout.
+        fn reserve_closed_port() -> u16 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        }
+
+        #[tokio::test]
+        async fn token_exchange_recovers_after_two_transient_connection_failures() {
+            let _lock = TOKEN_URL_ENV_LOCK.lock().await;
+            let port = reserve_closed_port();
+            let _env = EnvVarGuard::set(&format!("http://127.0.0.1:{port}/oauth/token"));
+
+            // Attempts fire at t=0 (fails, nothing listening) and t=150ms (fails, still
+            // not up) before the mock server binds at t=300ms; the 3rd attempt at
+            // t=450ms succeeds.
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let app = Router::new().route(
+                    "/oauth/token",
+                    post(|| async {
+                        Json(serde_json::json!({
+                            "id_token": "id-1",
+                            "access_token": "access-1",
+                            "refresh_token": "refresh-1",
+                        }))
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+                    .await
+                    .unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let tokens = exchange_code_with_redirect(
+                "code",
+                "verifier",
+                "http://localhost:1455/auth/callback",
+            )
+            .await
+            .expect("token exchange should succeed once the transient network blip clears");
+
+            assert_eq!(tokens.id_token, "id-1");
+            assert_eq!(tokens.access_token, "access-1");
+            assert_eq!(tokens.refresh_token, "refresh-1");
+        }
+
+        #[tokio::test]
+        async fn token_exchange_fails_immediately_on_deterministic_bad_request() {
+            let _lock = TOKEN_URL_ENV_LOCK.lock().await;
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let counter = request_count.clone();
+
+            let app = Router::new().route(
+                "/oauth/token",
+                post(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "invalid_grant",
+                                "error_description": "authorization code already used",
+                            })),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let _env = EnvVarGuard::set(&format!("http://{addr}/oauth/token"));
+
+            let err = exchange_code_with_redirect(
+                "code",
+                "verifier",
+                "http://localhost:1455/auth/callback",
+            )
+            .await
+            .expect_err("a deterministic 400 must not be swallowed into success");
+
+            assert_eq!(
+                request_count.load(Ordering::SeqCst),
+                1,
+                "a deterministic 4xx must not be retried — it would burn the one-shot code for nothing"
+            );
+            assert!(err.to_string().contains("invalid_grant"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn token_exchange_surfaces_object_shaped_error_code_and_message() {
+            let _lock = TOKEN_URL_ENV_LOCK.lock().await;
+
+            let app = Router::new().route(
+                "/oauth/token",
+                post(|| async {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "refresh_token_reused",
+                                "message": "This refresh token has already been used.",
+                                "param": null,
+                                "type": "invalid_request_error"
+                            }
+                        })),
+                    )
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let _env = EnvVarGuard::set(&format!("http://{addr}/oauth/token"));
+
+            let err = exchange_code_with_redirect(
+                "code",
+                "verifier",
+                "http://localhost:1455/auth/callback",
+            )
+            .await
+            .expect_err("object-shaped error body must still fail with a helpful message");
+
+            let msg = err.to_string();
+            assert!(msg.contains("refresh_token_reused"), "{msg}");
+            assert!(
+                msg.contains("This refresh token has already been used."),
+                "{msg}"
+            );
+        }
     }
 }
