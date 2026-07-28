@@ -364,7 +364,11 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::MutexGuard;
 
-    use super::{backup_launch_auth, restore_launch_auth};
+    use super::restore_launch_auth;
+    // Only the permission assertions call this, and those are unix-only, so an
+    // unconditional import is dead on Windows and fails `-D warnings` there.
+    #[cfg(unix)]
+    use super::backup_launch_auth;
 
     struct TestAppHome {
         _lock: MutexGuard<'static, ()>,
