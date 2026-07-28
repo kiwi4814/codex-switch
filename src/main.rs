@@ -38,6 +38,39 @@ fn should_report_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<OutputAlreadyReported>().is_none()
 }
 
+/// The post-command profile re-sync (see `dispatch`) is best-effort: most failures
+/// (profile deleted mid-command, unreadable auth.json, IO errors) are expected and stay
+/// silent, same as before. The one case that must not be silent is
+/// `ensure_live_not_older` refusing to overwrite a profile with older/unstamped live
+/// credentials — that guard is protecting a single-use refresh token from being
+/// destroyed, and its own error message already carries both timestamps and the
+/// actionable next step, so surfacing it is just choosing to show information already
+/// computed.
+fn is_resync_freshness_guard_rejection(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<profile::StaleLiveAuth>().is_some()
+}
+
+/// Build the confirmation prompt for syncing live `auth.json` credentials back into a
+/// profile, showing both timestamps so the user can tell a normal "codex just logged in"
+/// sync from a direction that looks wrong before hitting enter (default remains Yes).
+fn format_resync_confirm_prompt(
+    alias: &str,
+    live_last_refresh: Option<&str>,
+    profile_last_refresh: Option<&str>,
+) -> String {
+    let live_ts = live_last_refresh.unwrap_or("unknown");
+    let profile_ts = profile_last_refresh.unwrap_or("unknown");
+    format!(
+        "Update profile '{alias}' with live credentials? (live last_refresh={live_ts} -> profile last_refresh={profile_ts}) [Y/n] "
+    )
+}
+
+/// Best-effort read of the `last_refresh` field from an auth.json at `path`.
+fn read_last_refresh(path: Result<std::path::PathBuf>) -> Option<String> {
+    let val = auth::read_auth(&path.ok()?).ok()?;
+    val.get("last_refresh")?.as_str().map(str::to_string)
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -129,6 +162,73 @@ mod error_reporting_tests {
     }
 }
 
+#[cfg(test)]
+mod resync_reporting_tests {
+    use super::{format_resync_confirm_prompt, is_resync_freshness_guard_rejection};
+
+    #[test]
+    fn freshness_guard_rejection_for_older_live_is_reported() {
+        let error = anyhow::Error::from(crate::profile::StaleLiveAuth {
+            alias: "acme".to_string(),
+            live: "2026-01-01T00:00:00Z".to_string(),
+            profile: "2026-02-01T00:00:00Z".to_string(),
+        });
+        assert!(is_resync_freshness_guard_rejection(&error));
+    }
+
+    #[test]
+    fn freshness_guard_rejection_survives_added_context() {
+        // The re-sync path may wrap the refusal before it reaches the reporter;
+        // downcast has to see through that, which a message-prefix match would not.
+        let error = anyhow::Error::from(crate::profile::StaleLiveAuth {
+            alias: "acme".to_string(),
+            live: "no last_refresh".to_string(),
+            profile: "2026-02-01T00:00:00Z".to_string(),
+        })
+        .context("syncing profile 'acme' after the command");
+        assert!(is_resync_freshness_guard_rejection(&error));
+    }
+
+    #[test]
+    fn a_message_that_merely_looks_like_the_guard_is_not_treated_as_one() {
+        // Before this was typed, any error whose text began with "live auth.json"
+        // was reported as the guard firing.
+        let lookalike = anyhow::anyhow!("live auth.json could not be read: permission denied");
+        assert!(!is_resync_freshness_guard_rejection(&lookalike));
+    }
+
+    #[test]
+    fn unrelated_resync_errors_stay_silent() {
+        let identity_mismatch =
+            anyhow::anyhow!("authenticated account does not match profile 'acme'");
+        assert!(!is_resync_freshness_guard_rejection(&identity_mismatch));
+
+        let missing_profile = anyhow::anyhow!("profile 'acme' does not exist");
+        assert!(!is_resync_freshness_guard_rejection(&missing_profile));
+    }
+
+    #[test]
+    fn confirm_prompt_shows_direction_and_both_timestamps() {
+        let prompt = format_resync_confirm_prompt(
+            "acme",
+            Some("2026-07-20T00:00:00Z"),
+            Some("2026-07-10T00:00:00Z"),
+        );
+        assert!(prompt.contains("acme"));
+        assert!(prompt.contains("live"));
+        assert!(prompt.contains("2026-07-20T00:00:00Z"));
+        assert!(prompt.contains("profile"));
+        assert!(prompt.contains("2026-07-10T00:00:00Z"));
+        assert!(prompt.contains("[Y/n]"));
+    }
+
+    #[test]
+    fn confirm_prompt_falls_back_to_unknown_when_timestamp_missing() {
+        let prompt = format_resync_confirm_prompt("acme", None, None);
+        assert!(prompt.contains("unknown"));
+    }
+}
+
 async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
     // Startup auth change detection — skip for commands that manage auth themselves
     let auth_check = if !json {
@@ -192,8 +292,13 @@ async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
                 .as_ref()
                 .and_then(|p| profile::find_matching_profile(p))
                 .is_none()
+            && let Err(e) = profile::update_profile_from_live(&current)
+            && is_resync_freshness_guard_rejection(&e)
         {
-            let _ = profile::update_profile_from_live(&current);
+            eprintln!(
+                "{}",
+                color::warn(&format!("Warning: post-command profile sync skipped: {e}"))
+            );
         }
     }
 
@@ -268,7 +373,11 @@ fn check_auth_change() -> AuthCheckResult {
             user_println(&format!(
                 "auth.json credentials changed for account '{alias}' ({label})."
             ));
-            if commands::confirm(&format!("Update profile '{alias}'? [Y/n] ")) {
+            let live_ts = read_last_refresh(auth::codex_auth_path());
+            let profile_ts = read_last_refresh(profile::profile_auth_path(&alias));
+            let prompt =
+                format_resync_confirm_prompt(&alias, live_ts.as_deref(), profile_ts.as_deref());
+            if commands::confirm(&prompt) {
                 match profile::update_profile_from_live(&alias) {
                     Ok(()) => {
                         user_println(&format!("Profile '{alias}' updated."));

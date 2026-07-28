@@ -598,6 +598,34 @@ fn parse_last_refresh(val: &serde_json::Value) -> Option<chrono::DateTime<chrono
 /// The profile's stamp is the evidence worth protecting: without it there is
 /// nothing to prove the profile is the newer copy, so the read-back proceeds.
 /// With it, live must prove it is at least as fresh.
+/// The live `auth.json` carries older credentials than the profile, so copying
+/// it over would destroy a working refresh token.
+///
+/// Typed rather than a bare message: callers decide whether to surface this to
+/// the user, and matching on error text couples them to this wording — a
+/// rewording would silently turn the check off instead of failing to compile.
+#[derive(Debug)]
+pub struct StaleLiveAuth {
+    pub alias: String,
+    pub live: String,
+    pub profile: String,
+}
+
+impl std::fmt::Display for StaleLiveAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "live auth.json is older than profile '{}' (live {}, profile {}); \
+             refusing to overwrite the profile because refresh tokens are single-use and the older \
+             copy is already revoked. This is a reverse sync — run `codex-switch use {}` to \
+             push the profile's credentials back into ~/.codex/auth.json.",
+            self.alias, self.live, self.profile, self.alias
+        )
+    }
+}
+
+impl std::error::Error for StaleLiveAuth {}
+
 fn ensure_live_not_older(
     alias: &str,
     profile: &serde_json::Value,
@@ -608,18 +636,20 @@ fn ensure_live_not_older(
     };
     match parse_last_refresh(live) {
         Some(live_ts) if live_ts >= profile_ts => Ok(()),
-        Some(live_ts) => anyhow::bail!(
-            "live auth.json is older than profile '{alias}' (live {live_ts}, profile {profile_ts}); \
-             refusing to overwrite the profile because refresh tokens are single-use and the older \
-             copy is already revoked. This is a reverse sync — run `codex-switch use {alias}` to \
-             push the profile's credentials back into ~/.codex/auth.json."
-        ),
-        None => anyhow::bail!(
-            "live auth.json has no usable last_refresh timestamp while profile '{alias}' records \
-             one ({profile_ts}), so live cannot be shown to be newer and may be older; refusing to \
-             overwrite the profile. Run `codex-switch use {alias}` to push the profile's \
-             credentials back into ~/.codex/auth.json."
-        ),
+        Some(live_ts) => Err(StaleLiveAuth {
+            alias: alias.to_string(),
+            live: live_ts.to_string(),
+            profile: profile_ts.to_string(),
+        }
+        .into()),
+        // No stamp on live is the signature of a half-written sync: the profile
+        // got the new credentials and stamped them, the live write then failed.
+        None => Err(StaleLiveAuth {
+            alias: alias.to_string(),
+            live: "no last_refresh".to_string(),
+            profile: profile_ts.to_string(),
+        }
+        .into()),
     }
 }
 
@@ -1721,11 +1751,15 @@ mod tests {
             Some("2026-07-20T00:00:00Z"),
         ));
 
-        let err = super::update_profile_from_live("alice")
-            .unwrap_err()
-            .to_string();
+        let err = super::update_profile_from_live("alice").unwrap_err();
+        // Typed, so a caller deciding whether to show this to the user does not
+        // have to match on the wording.
+        let stale = err
+            .downcast_ref::<super::StaleLiveAuth>()
+            .unwrap_or_else(|| panic!("the refusal must stay downcastable, got: {err:#}"));
+        assert_eq!(stale.alias, "alice");
         assert!(
-            err.contains("older"),
+            err.to_string().contains("older"),
             "error must explain the inverted direction, got: {err}"
         );
         assert_eq!(profile_refresh_token("alice"), "ref_new");
