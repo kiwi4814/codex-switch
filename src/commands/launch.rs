@@ -99,8 +99,9 @@ pub(crate) async fn launch_cmd(
         if backup.exists() || !had_original {
             let codex_auth2 = codex_auth.clone();
             let backup2 = backup.clone();
+            let alias2 = target_alias.clone();
             tokio::task::spawn_blocking(move || {
-                restore_launch_auth(&codex_auth2, &backup2, had_original)
+                restore_launch_auth(&codex_auth2, &backup2, had_original, &alias2)
             })
             .await
             .context("restore task panicked after launch staging failure")??;
@@ -127,8 +128,9 @@ pub(crate) async fn launch_cmd(
         Err(spawn_err) => {
             let codex_auth2 = codex_auth.clone();
             let backup2 = backup.clone();
+            let alias2 = target_alias.clone();
             tokio::task::spawn_blocking(move || {
-                restore_launch_auth(&codex_auth2, &backup2, had_original)
+                restore_launch_auth(&codex_auth2, &backup2, had_original, &alias2)
             })
             .await
             .context("restore task panicked after Codex spawn failure")??;
@@ -156,8 +158,9 @@ pub(crate) async fn launch_cmd(
     {
         let codex_auth2 = codex_auth.clone();
         let backup2 = backup.clone();
+        let alias2 = target_alias.clone();
         tokio::task::spawn_blocking(move || {
-            restore_launch_auth(&codex_auth2, &backup2, had_original)
+            restore_launch_auth(&codex_auth2, &backup2, had_original, &alias2)
         })
         .await
         .context("lock task panicked")??;
@@ -199,12 +202,32 @@ pub(crate) async fn launch_cmd(
     Ok(())
 }
 
+/// Roll the staged profile back out of the live auth.json, keeping anything
+/// Codex refreshed while it was staged.
+///
+/// `alias` is the profile that was staged, i.e. the owner of whatever Codex may
+/// have rewritten in place.
 fn restore_launch_auth(
     codex_auth: &std::path::Path,
     backup: &std::path::Path,
     had_original: bool,
+    alias: &str,
 ) -> Result<()> {
     let _lock = profile::lock_live_auth().context("acquiring auth lock for restore")?;
+    // Saving the refreshed copy must never block the rollback: leaving another
+    // account's credentials live is worse than failing to archive a refresh.
+    match preserve_refreshed_launch_auth(codex_auth, alias) {
+        Ok(true) => user_println(&format!(
+            "Codex refreshed the credentials of profile '{alias}'; saved them before restoring."
+        )),
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!("launch restore could not save refreshed credentials: {err:#}");
+            user_println(&format!(
+                "Warning: could not preserve credentials Codex may have refreshed for profile '{alias}': {err:#}"
+            ));
+        }
+    }
     if had_original {
         std::fs::copy(backup, codex_auth).with_context(|| {
             format!(
@@ -220,6 +243,88 @@ fn restore_launch_auth(
             .with_context(|| format!("removing staged launch auth {}", codex_auth.display()))?;
     }
     Ok(())
+}
+
+/// Fold credentials Codex refreshed in place back into the staged profile.
+///
+/// Codex CLI refreshes on startup when the staged `last_refresh` is old enough,
+/// and OpenAI rotates `refresh_token` on every use: the moment Codex refreshes,
+/// the copy still stored in the profile is revoked. Restoring the backup over
+/// that write would leave the profile holding a dead token — unrecoverable
+/// without a full re-login, and undetectable until the profile is next used.
+///
+/// Returns whether the profile was updated. Nothing is written unless the live
+/// file proves it is both newer than the profile and the same account, so a
+/// stale or foreign live copy can never overwrite good credentials.
+///
+/// Caller MUST hold the lock from `lock_live_auth()`.
+fn preserve_refreshed_launch_auth(codex_auth: &std::path::Path, alias: &str) -> Result<bool> {
+    if !codex_auth.exists() {
+        return Ok(false);
+    }
+    let profile_path = profile::profile_auth_path(alias)?;
+    if !profile_path.exists() {
+        return Ok(false);
+    }
+    let saved = auth::read_auth(&profile_path)
+        .with_context(|| format!("reading profile '{alias}' auth.json"))?;
+    let live = auth::read_auth(codex_auth).with_context(|| {
+        format!(
+            "reading live auth.json {} before launch restore",
+            codex_auth.display()
+        )
+    })?;
+    if !live_is_newer(&saved, &live) {
+        return Ok(false);
+    }
+    ensure_same_account(alias, &saved, &live)?;
+    auth::write_auth(&profile_path, &live)
+        .with_context(|| format!("saving refreshed credentials into profile '{alias}'"))?;
+    Ok(true)
+}
+
+/// `last_refresh` is the same RFC3339 stamp Codex and codex-switch both write,
+/// so a strictly later value is the evidence that Codex rotated the tokens.
+/// A profile without a stamp loses to any live file that has one, because the
+/// staged copy came from that profile and therefore had no stamp either.
+fn live_is_newer(saved: &serde_json::Value, live: &serde_json::Value) -> bool {
+    let Some(live_ts) = last_refresh(live) else {
+        return false;
+    };
+    match last_refresh(saved) {
+        Some(saved_ts) => live_ts > saved_ts,
+        None => true,
+    }
+}
+
+fn last_refresh(val: &serde_json::Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(val.get("last_refresh")?.as_str()?).ok()
+}
+
+/// Same rule as `profile::update_profile_from_live`: the email must be present
+/// on both sides and equal, and account ids must agree when both are known.
+fn ensure_same_account(
+    alias: &str,
+    saved: &serde_json::Value,
+    live: &serde_json::Value,
+) -> Result<()> {
+    let saved = profile::extract_identity(saved);
+    let live = profile::extract_identity(live);
+    let email_matches = matches!(
+        (&saved.email, &live.email),
+        (Some(saved), Some(live)) if saved == live
+    );
+    let account_matches = match (&saved.account_id, &live.account_id) {
+        (Some(saved), Some(live)) => saved == live,
+        _ => true,
+    };
+    if email_matches && account_matches {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "live auth.json was refreshed into a different account than profile '{alias}'; \
+         leaving the profile untouched"
+    )
 }
 
 #[cfg(test)]
@@ -277,7 +382,7 @@ mod tests {
         std::fs::write(&codex_auth, b"staged profile").unwrap();
         std::fs::write(&backup, b"original auth").unwrap();
 
-        restore_launch_auth(&codex_auth, &backup, true).unwrap();
+        restore_launch_auth(&codex_auth, &backup, true, "work").unwrap();
 
         assert_eq!(std::fs::read(&codex_auth).unwrap(), b"original auth");
         assert!(!backup.exists());
@@ -292,7 +397,7 @@ mod tests {
         std::fs::create_dir_all(codex_auth.parent().unwrap()).unwrap();
         std::fs::write(&codex_auth, b"staged profile").unwrap();
 
-        restore_launch_auth(&codex_auth, &backup, false).unwrap();
+        restore_launch_auth(&codex_auth, &backup, false, "work").unwrap();
 
         assert!(!codex_auth.exists());
         assert!(!backup.exists());
@@ -304,9 +409,172 @@ mod tests {
         let codex_auth = home.path().join("codex/auth.json");
         let backup = home.path().join("auth.backup");
 
-        restore_launch_auth(&codex_auth, &backup, false).unwrap();
+        restore_launch_auth(&codex_auth, &backup, false, "work").unwrap();
 
         assert!(!codex_auth.exists());
         assert!(!backup.exists());
+    }
+
+    // ── Codex-side refresh during the launch window ───────────────
+    //
+    // Codex CLI refreshes a staged auth.json whose `last_refresh` is old
+    // enough, and OpenAI revokes the old refresh_token the moment it is used.
+    // The restore must therefore fold a newer live copy back into the profile
+    // instead of rolling the backup over it.
+
+    fn jwt(payload: &serde_json::Value) -> String {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        format!(
+            "x.{}.y",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap())
+        )
+    }
+
+    /// `account` seeds both the email and the account id, so two calls with the
+    /// same `account` describe the same ChatGPT account.
+    fn auth_value(account: &str, refresh_token: &str, last_refresh: &str) -> serde_json::Value {
+        let email = format!("{account}@example.com");
+        let account_id = format!("acct-{account}");
+        let claims = serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "plus",
+                "chatgpt_account_id": account_id,
+                "chatgpt_user_id": format!("user_{account_id}"),
+            }
+        });
+        serde_json::json!({
+            "tokens": {
+                "id_token": jwt(&claims),
+                "access_token": format!("access-{refresh_token}"),
+                "refresh_token": refresh_token,
+                "account_id": account_id,
+            },
+            "last_refresh": last_refresh,
+        })
+    }
+
+    /// Profile "work" plus a staged live file holding the same credentials,
+    /// mirroring the state `stage_profile_auth` leaves behind.
+    fn staged_launch(
+        home: &TestAppHome,
+        profile_value: &serde_json::Value,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let profile_path = crate::profile::profile_auth_path("work").unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        crate::auth::write_auth(&profile_path, profile_value).unwrap();
+
+        let codex_auth = home.path().join("codex/auth.json");
+        std::fs::create_dir_all(codex_auth.parent().unwrap()).unwrap();
+        crate::auth::write_auth(&codex_auth, profile_value).unwrap();
+
+        let backup = home.path().join("auth.backup");
+        crate::auth::write_auth(
+            &backup,
+            &auth_value("other", "other-refresh", "2026-07-01T00:00:00Z"),
+        )
+        .unwrap();
+
+        (profile_path, codex_auth, backup)
+    }
+
+    fn read_json(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn restore_saves_credentials_codex_refreshed_during_launch() {
+        let home = TestAppHome::new();
+        let staged = auth_value("a", "refresh-old", "2026-07-01T00:00:00Z");
+        let (profile_path, codex_auth, backup) = staged_launch(&home, &staged);
+
+        // Codex rotated the token in place while it was staged.
+        let refreshed = auth_value("a", "refresh-new", "2026-07-20T10:00:00Z");
+        crate::auth::write_auth(&codex_auth, &refreshed).unwrap();
+
+        restore_launch_auth(&codex_auth, &backup, true, "work").unwrap();
+
+        assert_eq!(
+            read_json(&profile_path),
+            refreshed,
+            "the rotated refresh_token must survive the restore"
+        );
+        assert_eq!(
+            read_json(&codex_auth)["tokens"]["refresh_token"],
+            "other-refresh",
+            "the original live credentials must still be restored"
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn restore_saves_refreshed_credentials_when_there_was_no_original() {
+        let home = TestAppHome::new();
+        let staged = auth_value("a", "refresh-old", "2026-07-01T00:00:00Z");
+        let (profile_path, codex_auth, backup) = staged_launch(&home, &staged);
+        std::fs::remove_file(&backup).unwrap();
+
+        let refreshed = auth_value("a", "refresh-new", "2026-07-20T10:00:00Z");
+        crate::auth::write_auth(&codex_auth, &refreshed).unwrap();
+
+        restore_launch_auth(&codex_auth, &backup, false, "work").unwrap();
+
+        assert_eq!(read_json(&profile_path), refreshed);
+        assert!(!codex_auth.exists());
+    }
+
+    #[test]
+    fn restore_leaves_profile_untouched_when_codex_did_not_refresh() {
+        let home = TestAppHome::new();
+        let staged = auth_value("a", "refresh-old", "2026-07-01T00:00:00Z");
+        let (profile_path, codex_auth, backup) = staged_launch(&home, &staged);
+
+        restore_launch_auth(&codex_auth, &backup, true, "work").unwrap();
+
+        assert_eq!(read_json(&profile_path), staged);
+        assert_eq!(
+            read_json(&codex_auth)["tokens"]["refresh_token"],
+            "other-refresh"
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn restore_ignores_live_credentials_older_than_the_profile() {
+        let home = TestAppHome::new();
+        let staged = auth_value("a", "refresh-new", "2026-07-20T10:00:00Z");
+        let (profile_path, codex_auth, backup) = staged_launch(&home, &staged);
+
+        // A stale copy of the same account must never be written back.
+        crate::auth::write_auth(
+            &codex_auth,
+            &auth_value("a", "refresh-dead", "2026-07-01T00:00:00Z"),
+        )
+        .unwrap();
+
+        restore_launch_auth(&codex_auth, &backup, true, "work").unwrap();
+
+        assert_eq!(read_json(&profile_path), staged);
+    }
+
+    #[test]
+    fn restore_ignores_live_credentials_from_another_account() {
+        let home = TestAppHome::new();
+        let staged = auth_value("a", "refresh-old", "2026-07-01T00:00:00Z");
+        let (profile_path, codex_auth, backup) = staged_launch(&home, &staged);
+
+        crate::auth::write_auth(
+            &codex_auth,
+            &auth_value("b", "refresh-b", "2026-07-20T10:00:00Z"),
+        )
+        .unwrap();
+
+        restore_launch_auth(&codex_auth, &backup, true, "work").unwrap();
+
+        assert_eq!(
+            read_json(&profile_path),
+            staged,
+            "another account's credentials must not pollute this profile"
+        );
     }
 }
