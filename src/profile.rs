@@ -393,10 +393,21 @@ pub fn find_profile_by_identity_exact(identity: &AccountIdentity) -> Option<Stri
     None
 }
 
-/// Find an existing profile matching the given identity (account_id+email > email-only).
-pub fn find_profile_by_identity(identity: &AccountIdentity) -> Option<String> {
-    let profiles = list_profiles().ok()?;
-    let mut email_match: Option<String> = None;
+/// Profiles matching an identity, split by match strength so callers can tell
+/// an unambiguous hit from "several workspaces share this email".
+#[derive(Default)]
+struct IdentityMatches {
+    /// account_id AND email both equal — unambiguous by construction.
+    exact: Option<String>,
+    /// email equal while one side carries no account_id — possibly several.
+    email_only: Vec<String>,
+}
+
+fn scan_profiles_by_identity(identity: &AccountIdentity) -> IdentityMatches {
+    let mut matches = IdentityMatches::default();
+    let Ok(profiles) = list_profiles() else {
+        return matches;
+    };
 
     for alias in profiles {
         let path = match profile_auth_path(&alias) {
@@ -415,20 +426,26 @@ pub fn find_profile_by_identity(identity: &AccountIdentity) -> Option<String> {
             && let (Some(e1), Some(e2)) = (&identity.email, &existing.email)
             && e1 == e2
         {
-            return Some(alias);
+            matches.exact = Some(alias);
+            return matches;
         }
 
         // Fallback: email-only match (when account_id is missing on either side)
-        if email_match.is_none()
-            && let (Some(a), Some(b)) = (&identity.email, &existing.email)
+        if let (Some(a), Some(b)) = (&identity.email, &existing.email)
             && a == b
             && (identity.account_id.is_none() || existing.account_id.is_none())
         {
-            email_match = Some(alias);
+            matches.email_only.push(alias);
         }
     }
 
-    email_match
+    matches
+}
+
+/// Find an existing profile matching the given identity (account_id+email > email-only).
+pub fn find_profile_by_identity(identity: &AccountIdentity) -> Option<String> {
+    let IdentityMatches { exact, email_only } = scan_profiles_by_identity(identity);
+    exact.or_else(|| email_only.into_iter().next())
 }
 
 pub fn alias_from_email(email: &str) -> String {
@@ -513,6 +530,7 @@ pub enum AuthChange {
 /// Compare live auth.json against all saved profiles.
 /// - Exact SHA256 match → NoChange
 /// - Identity match (email + account_id) but different content → TokensUpdated
+/// - Email matches several profiles and no account_id to disambiguate → NoChange (warned)
 /// - No identity match → NewAccount
 pub fn detect_auth_change() -> AuthChange {
     let auth_path = match codex_auth_path() {
@@ -537,9 +555,70 @@ pub fn detect_auth_change() -> AuthChange {
         return AuthChange::NoChange;
     }
 
-    match find_profile_by_identity(&identity) {
-        Some(alias) => AuthChange::TokensUpdated { alias },
-        None => AuthChange::NewAccount,
+    // The read-back path writes live credentials into a profile, so an
+    // email-only guess across workspaces would clobber the wrong account.
+    let IdentityMatches { exact, email_only } = scan_profiles_by_identity(&identity);
+    if let Some(alias) = exact {
+        return AuthChange::TokensUpdated { alias };
+    }
+    match email_only.as_slice() {
+        [] => AuthChange::NewAccount,
+        [only] => AuthChange::TokensUpdated {
+            alias: only.clone(),
+        },
+        ambiguous => {
+            user_println(&format!(
+                "auth.json carries no account id and its email matches {} profiles ({}) — \
+                 refusing to guess which one to update. \
+                 Run `codex-switch use <alias>` to restore a known profile, \
+                 or `codex-switch save <alias>` to store these credentials explicitly.",
+                ambiguous.len(),
+                ambiguous.join(", ")
+            ));
+            AuthChange::NoChange
+        }
+    }
+}
+
+/// `last_refresh` as written by `auth::apply_tokens` and `login`: an RFC3339
+/// string at the auth.json root. Absent or malformed values yield `None`.
+fn parse_last_refresh(val: &serde_json::Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let raw = val.get("last_refresh")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(raw).ok()
+}
+
+/// Refuse to copy live credentials over a profile that was refreshed later.
+///
+/// OpenAI rotates `refresh_token` on every use: once the profile holds the
+/// rotated token, the copy still sitting in ~/.codex/auth.json is already dead.
+/// Writing it back would destroy the only usable credential for that account,
+/// which is unrecoverable without a full re-login.
+///
+/// The profile's stamp is the evidence worth protecting: without it there is
+/// nothing to prove the profile is the newer copy, so the read-back proceeds.
+/// With it, live must prove it is at least as fresh.
+fn ensure_live_not_older(
+    alias: &str,
+    profile: &serde_json::Value,
+    live: &serde_json::Value,
+) -> Result<()> {
+    let Some(profile_ts) = parse_last_refresh(profile) else {
+        return Ok(());
+    };
+    match parse_last_refresh(live) {
+        Some(live_ts) if live_ts >= profile_ts => Ok(()),
+        Some(live_ts) => anyhow::bail!(
+            "live auth.json is older than profile '{alias}' (live {live_ts}, profile {profile_ts}); \
+             refusing to overwrite the profile because refresh tokens are single-use and the older \
+             copy is already revoked. This is a reverse sync — run `codex-switch use {alias}` to \
+             push the profile's credentials back into ~/.codex/auth.json."
+        ),
+        None => anyhow::bail!(
+            "live auth.json has no usable last_refresh timestamp while profile '{alias}' records \
+             one ({profile_ts}), so live cannot be shown to be newer and may be older; refusing to \
+             overwrite the profile. Run `codex-switch use {alias}` to push the profile's \
+             credentials back into ~/.codex/auth.json."
+        ),
     }
 }
 
@@ -552,7 +631,9 @@ pub fn update_profile_from_live(alias: &str) -> Result<()> {
     let src = codex_auth_path()?;
     let val = read_auth(&src)?;
     let dst = profile_auth_path(alias)?;
-    ensure_same_account_identity(alias, &read_auth(&dst)?, &val)?;
+    let existing = read_auth(&dst)?;
+    ensure_same_account_identity(alias, &existing, &val)?;
+    ensure_live_not_older(alias, &existing, &val)?;
     ensure_profile_parent(&dst)?;
     write_auth(&dst, &val)?;
     // Best-effort: normalize live file to match profile (same key ordering)
@@ -1549,6 +1630,266 @@ mod tests {
         // No live auth.json exists
         let result = super::update_profile_from_live("nonexistent");
         assert!(result.is_err());
+    }
+
+    // ── Rollback protection (one-time-rotation refresh tokens) ──
+
+    /// `realistic_auth_json` with an explicit (or absent) `last_refresh` stamp.
+    fn stamped_auth_json(
+        email: &str,
+        account_id: &str,
+        access_token: &str,
+        refresh_token: &str,
+        last_refresh: Option<&str>,
+    ) -> serde_json::Value {
+        let mut val = realistic_auth_json(email, account_id, access_token, refresh_token);
+        match last_refresh {
+            Some(ts) => val["last_refresh"] = serde_json::json!(ts),
+            None => {
+                val.as_object_mut().unwrap().remove("last_refresh");
+            }
+        }
+        val
+    }
+
+    fn seed_profile(alias: &str, val: &serde_json::Value) {
+        let path = super::profile_auth_path(alias).unwrap();
+        super::ensure_profile_parent(&path).unwrap();
+        crate::auth::write_auth(&path, val).unwrap();
+    }
+
+    fn write_live(val: &serde_json::Value) {
+        crate::auth::write_auth(&crate::auth::codex_auth_path().unwrap(), val).unwrap();
+    }
+
+    fn profile_refresh_token(alias: &str) -> String {
+        crate::auth::read_auth(&super::profile_auth_path(alias).unwrap()).unwrap()["tokens"]
+            ["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn update_profile_from_live_rejects_live_older_than_profile() {
+        let _env = TestEnv::new();
+        // The profile already holds a rotated refresh token; live still holds the
+        // dead predecessor. Copying live over the profile would destroy the only
+        // usable credential for this account.
+        seed_profile(
+            "alice",
+            &stamped_auth_json(
+                "alice@example.com",
+                "acct_a",
+                "acc_new",
+                "ref_new",
+                Some("2026-07-28T04:51:15Z"),
+            ),
+        );
+        super::write_current("bob").unwrap();
+        write_live(&stamped_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "acc_dead",
+            "ref_dead",
+            Some("2026-07-20T00:00:00Z"),
+        ));
+
+        let err = super::update_profile_from_live("alice")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("older"),
+            "error must explain the inverted direction, got: {err}"
+        );
+        assert_eq!(profile_refresh_token("alice"), "ref_new");
+        assert_eq!(
+            super::read_current(),
+            "bob",
+            "a rejected read-back must not repoint the current profile"
+        );
+    }
+
+    #[test]
+    fn update_profile_from_live_accepts_live_newer_than_profile() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "alice",
+            &stamped_auth_json(
+                "alice@example.com",
+                "acct_a",
+                "acc_old",
+                "ref_old",
+                Some("2026-07-20T00:00:00Z"),
+            ),
+        );
+        write_live(&stamped_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "acc_new",
+            "ref_new",
+            Some("2026-07-28T04:51:15Z"),
+        ));
+
+        super::update_profile_from_live("alice").unwrap();
+        assert_eq!(profile_refresh_token("alice"), "ref_new");
+        assert_eq!(super::read_current(), "alice");
+    }
+
+    #[test]
+    fn update_profile_from_live_allows_when_profile_has_no_refresh_timestamp() {
+        let _env = TestEnv::new();
+        // Legacy profile without a stamp: there is no evidence it is newer,
+        // so the normal read-back must keep working.
+        seed_profile(
+            "alice",
+            &stamped_auth_json("alice@example.com", "acct_a", "acc_old", "ref_old", None),
+        );
+        write_live(&stamped_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "acc_new",
+            "ref_new",
+            Some("2026-07-20T00:00:00Z"),
+        ));
+
+        super::update_profile_from_live("alice").unwrap();
+        assert_eq!(profile_refresh_token("alice"), "ref_new");
+    }
+
+    #[test]
+    fn update_profile_from_live_allows_when_profile_timestamp_is_unparseable() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "alice",
+            &stamped_auth_json(
+                "alice@example.com",
+                "acct_a",
+                "acc_old",
+                "ref_old",
+                Some("not-a-timestamp"),
+            ),
+        );
+        write_live(&stamped_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "acc_new",
+            "ref_new",
+            Some("2026-07-20T00:00:00Z"),
+        ));
+
+        super::update_profile_from_live("alice").unwrap();
+        assert_eq!(profile_refresh_token("alice"), "ref_new");
+    }
+
+    #[test]
+    fn update_profile_from_live_rejects_unstamped_live_against_stamped_profile() {
+        let _env = TestEnv::new();
+        // A stamped profile records a known refresh time; an unstamped live file
+        // cannot prove it is at least as fresh, so the copy is refused.
+        seed_profile(
+            "alice",
+            &stamped_auth_json(
+                "alice@example.com",
+                "acct_a",
+                "acc_new",
+                "ref_new",
+                Some("2026-07-28T04:51:15Z"),
+            ),
+        );
+        write_live(&stamped_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "acc_dead",
+            "ref_dead",
+            None,
+        ));
+
+        assert!(super::update_profile_from_live("alice").is_err());
+        assert_eq!(profile_refresh_token("alice"), "ref_new");
+    }
+
+    // ── Read-back identity ambiguity (same email, several workspaces) ──
+
+    fn jwt_without_account_id(email: &str) -> String {
+        let claims = serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "plus",
+                "organizations": [],
+            }
+        });
+        let json = serde_json::to_vec(&claims).unwrap();
+        let encoded = {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            URL_SAFE_NO_PAD.encode(json)
+        };
+        format!("x.{encoded}.y")
+    }
+
+    fn auth_json_without_account_id(
+        email: &str,
+        access_token: &str,
+        refresh_token: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": jwt_without_account_id(email),
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "account_id": "",
+            },
+            "last_refresh": "2026-07-20T00:00:00Z"
+        })
+    }
+
+    #[test]
+    fn detect_auth_change_refuses_to_guess_between_same_email_workspaces() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "oai001",
+            &realistic_auth_json("oai001@ozi.xyz", "acct_team", "acc_t", "ref_t"),
+        );
+        seed_profile(
+            "oai001_20x",
+            &realistic_auth_json("oai001@ozi.xyz", "acct_personal", "acc_p", "ref_p"),
+        );
+        // Live file carries no account_id — the email alone matches both profiles.
+        write_live(&auth_json_without_account_id(
+            "oai001@ozi.xyz",
+            "acc_live",
+            "ref_live",
+        ));
+
+        match super::detect_auth_change() {
+            super::AuthChange::NoChange => {}
+            other => panic!("ambiguous email match must not select a profile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_auth_change_picks_workspace_profile_by_account_id() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "oai001",
+            &realistic_auth_json("oai001@ozi.xyz", "acct_team", "acc_t", "ref_t"),
+        );
+        seed_profile(
+            "oai001_20x",
+            &realistic_auth_json("oai001@ozi.xyz", "acct_personal", "acc_p", "ref_p"),
+        );
+        write_live(&realistic_auth_json(
+            "oai001@ozi.xyz",
+            "acct_personal",
+            "acc_p2",
+            "ref_p2",
+        ));
+
+        match super::detect_auth_change() {
+            super::AuthChange::TokensUpdated { alias } => assert_eq!(alias, "oai001_20x"),
+            other => panic!("expected TokensUpdated for oai001_20x, got {other:?}"),
+        }
     }
 
     #[test]

@@ -816,3 +816,60 @@ async fn opportunistic_refresh_keeps_going_after_one_profile_fails_to_save() {
     );
     server.shutdown();
 }
+
+/// D8: `import` refreshes the credential *before* it validates usage, and the
+/// auth value it mutates is a local of the caller. If the rotated tokens are
+/// not handed back alongside the failure, the only credential the auth server
+/// still accepts dies with that local — the imported account is unrecoverable.
+#[tokio::test]
+async fn import_validation_hands_back_rotated_tokens_when_usage_fails() {
+    let _lock = ENV_LOCK.lock().await;
+    let server = MockServer::start(
+        vec![(
+            "access_1".to_string(),
+            vec![reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"detail": "upstream exploded"}),
+            )],
+        )],
+        vec![rotation(1)],
+    )
+    .await;
+    let home = tempfile::tempdir().unwrap();
+    let _guards = env_guards(&server, home.path());
+
+    let mut val = json!({
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": "old_id",
+            "access_token": expired_jwt(),
+            "refresh_token": "refresh_old",
+        },
+    });
+
+    let outcome = codex_switch::usage::validate_import_auth(&mut val).await;
+
+    assert!(
+        outcome.result.is_err(),
+        "the usage call must fail in this scenario"
+    );
+    let refreshed = outcome
+        .refreshed
+        .expect("rotated credentials must survive the failed validation");
+    assert_eq!(
+        refreshed.refresh_token, "refresh_1",
+        "the caller needs the token the auth server just issued"
+    );
+    assert_eq!(
+        val.pointer("/tokens/refresh_token")
+            .and_then(|v| v.as_str()),
+        Some("refresh_1"),
+        "the auth value handed back to the caller must carry the rotated token"
+    );
+    assert_eq!(
+        server.token_calls(),
+        vec!["refresh_old".to_string()],
+        "the consumed refresh token must never be replayed"
+    );
+    server.shutdown();
+}

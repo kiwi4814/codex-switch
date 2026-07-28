@@ -10,8 +10,8 @@ use crate::auth::{self, CLIENT_ID, format_reqwest_error};
 use super::parse::parse_usage_checked;
 use super::reset_credits::enrich_reset_credits;
 use super::{
-    MAX_RETRIES, RETRY_DELAY, RefreshedTokens, TerminalAuthError, TokenPersistFailure, UsageError,
-    UsageFetchOutcome, UsageInfo,
+    ImportValidation, MAX_RETRIES, RETRY_DELAY, RefreshedTokens, TerminalAuthError,
+    TokenPersistFailure, UsageError, UsageFetchOutcome, UsageInfo,
 };
 
 pub(crate) fn apply_account_routing_headers(
@@ -507,15 +507,48 @@ async fn fetch_usage_capturing_refresh(
     anyhow::bail!("Usage API failed (HTTP {status}), no refresh_token available");
 }
 
-pub async fn validate_import_auth(
+/// Validate an auth.json being imported, refreshing its credentials if needed.
+///
+/// Returns the rotation and the validation result as separate fields: the
+/// caller's `val` is a local copy, so a rotated `refresh_token` reported only
+/// through `Ok(..)` would be dropped by the caller's `?` on the very failures
+/// that make it matter. See [`ImportValidation`].
+pub async fn validate_import_auth(val: &mut serde_json::Value) -> ImportValidation {
+    let mut refreshed = None;
+    let result = validate_import_auth_capturing_refresh(val, &mut refreshed).await;
+    ImportValidation { refreshed, result }
+}
+
+/// Record a rotation and write it into the auth value being validated.
+///
+/// `refreshed` is assigned *before* the fallible write so that a failure to
+/// update the value still leaves the caller holding the live credentials.
+fn adopt_refreshed_tokens(
     val: &mut serde_json::Value,
-) -> Result<(UsageInfo, Option<RefreshedTokens>)> {
+    tokens: RefreshedTokens,
+    refreshed: &mut Option<RefreshedTokens>,
+) -> Result<()> {
+    let tokens = refreshed.insert(tokens);
+    auth::apply_tokens(
+        val,
+        &tokens.id_token,
+        &tokens.access_token,
+        &tokens.refresh_token,
+    )
+}
+
+/// Inner body of [`validate_import_auth`]. Every rotation reaches `refreshed`
+/// before any further fallible step, so `?`/`bail!` can never discard one.
+async fn validate_import_auth_capturing_refresh(
+    val: &mut serde_json::Value,
+    refreshed: &mut Option<RefreshedTokens>,
+) -> Result<UsageInfo> {
     if std::env::var("CS_IMPORT_SKIP_USAGE_VALIDATION")
         .ok()
         .as_deref()
         == Some("1")
     {
-        return Ok((UsageInfo::default(), None));
+        return Ok(UsageInfo::default());
     }
 
     let (access_token, refresh_token) = auth::extract_tokens(val);
@@ -536,57 +569,43 @@ pub async fn validate_import_auth(
                 is_fedramp,
             )
             .await;
-            let refreshed = outcome.refreshed;
-            // Apply before propagating: a rotated refresh_token is single-use,
-            // so dropping it on the error path would brick the imported auth.
-            if let Some(tokens) = &refreshed {
-                auth::apply_tokens(
-                    val,
-                    &tokens.id_token,
-                    &tokens.access_token,
-                    &tokens.refresh_token,
-                )?;
+            if let Some(tokens) = outcome.refreshed {
+                adopt_refreshed_tokens(val, tokens, refreshed)?;
             }
             let usage = outcome.result?;
             if let Err(err) = crate::workspace::refresh_for_auth(val).await {
                 debug!("workspace metadata unavailable while importing: {err}");
             }
-            Ok((usage, refreshed))
+            Ok(usage)
         }
         (None, Some(rt)) => {
             let client = auth::build_http_client()?;
-            let refreshed =
-                do_refresh_token(alias, &client, id_token.as_deref(), None, &rt).await?;
-            auth::apply_tokens(
-                val,
-                &refreshed.id_token,
-                &refreshed.access_token,
-                &refreshed.refresh_token,
-            )?;
+            let first = do_refresh_token(alias, &client, id_token.as_deref(), None, &rt).await?;
+            let (access_token, id_token, refresh_token) = (
+                first.access_token.clone(),
+                first.id_token.clone(),
+                first.refresh_token.clone(),
+            );
+            adopt_refreshed_tokens(val, first, refreshed)?;
+
             let account_id = crate::jwt::parse_account_info(val).account_id;
             let outcome = fetch_usage_with_refresh(
                 alias,
-                &refreshed.access_token,
-                Some(&refreshed.id_token),
-                Some(&refreshed.refresh_token),
+                &access_token,
+                Some(&id_token),
+                Some(&refresh_token),
                 account_id.as_deref(),
                 is_fedramp,
             )
             .await;
-            let refreshed_again = outcome.refreshed;
-            if let Some(tokens) = &refreshed_again {
-                auth::apply_tokens(
-                    val,
-                    &tokens.id_token,
-                    &tokens.access_token,
-                    &tokens.refresh_token,
-                )?;
+            if let Some(tokens) = outcome.refreshed {
+                adopt_refreshed_tokens(val, tokens, refreshed)?;
             }
             let usage = outcome.result?;
             if let Err(err) = crate::workspace::refresh_for_auth(val).await {
                 debug!("workspace metadata unavailable while importing: {err}");
             }
-            Ok((usage, refreshed_again.or(Some(refreshed))))
+            Ok(usage)
         }
         (None, None) => anyhow::bail!("auth.json missing access_token and refresh_token"),
     }

@@ -267,6 +267,18 @@ pub struct UsageFetchOutcome {
     pub result: anyhow::Result<UsageInfo>,
 }
 
+/// Outcome of validating an auth.json on the `import` path.
+///
+/// Same split as [`UsageFetchOutcome`], and for the same reason: validation
+/// refreshes the credential before it calls the usage API, so `refreshed` is
+/// populated **even when `result` is an error**. `import` owns a local copy of
+/// the auth value, so returning only the error would drop the single credential
+/// the auth server still accepts and brick the account being imported.
+pub struct ImportValidation {
+    pub refreshed: Option<RefreshedTokens>,
+    pub result: anyhow::Result<UsageInfo>,
+}
+
 /// Structured error for usage fetch failures.
 #[derive(Debug, Clone)]
 pub struct UsageError {
