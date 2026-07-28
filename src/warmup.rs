@@ -468,6 +468,37 @@ async fn warmup_additional_models(
     Ok(())
 }
 
+/// Write credentials the auth server just rotated back to the profile.
+///
+/// OpenAI's `refresh_token` is single-use: the previous one is already dead
+/// server-side the moment these arrive, so a failed write leaves the only
+/// credential the server still accepts in this process's memory. Finishing the
+/// warmup (or the `/models` fetch) with it would exit successfully and hand the
+/// user a profile that silently stops working at the next start, which makes
+/// this a reportable failure rather than something to warn about and walk past.
+///
+/// The wording is shared with the usage path's [`crate::usage::UsageError::token_persist_failed`]
+/// so the report stays distinguishable from a *rejected* refresh: here the
+/// tokens are valid and the local write needs fixing, there the profile needs a
+/// new sign-in.
+///
+/// Each caller owns a single account, so propagating this aborts that account
+/// only — batch drivers keep processing the rest.
+fn persist_refreshed_tokens(alias: &str, refreshed: &crate::usage::RefreshedTokens) -> Result<()> {
+    crate::profile::update_profile_tokens_and_live_if_current(
+        alias,
+        &refreshed.id_token,
+        &refreshed.access_token,
+        &refreshed.refresh_token,
+    )
+    .map_err(|err| {
+        anyhow::anyhow!(
+            "{}",
+            crate::usage::UsageError::token_persist_failed(alias, &err).detail
+        )
+    })
+}
+
 /// Send a minimal completion request to trigger the quota window countdown for a profile.
 ///
 /// The 5-hour and 7-day windows only start after the first real API call.
@@ -530,14 +561,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
         .await
         {
             Ok(refreshed) => {
-                if let Err(e) = crate::profile::update_profile_tokens_and_live_if_current(
-                    alias,
-                    &refreshed.id_token,
-                    &refreshed.access_token,
-                    &refreshed.refresh_token,
-                ) {
-                    warn!("[{alias}] failed to atomically persist refreshed tokens: {e}");
-                }
+                persist_refreshed_tokens(alias, &refreshed)?;
                 access_token = refreshed.access_token;
                 id_token = Some(refreshed.id_token);
                 refresh_token = Some(refreshed.refresh_token);
@@ -671,14 +695,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                 .await
                 {
                     Ok(refreshed) => {
-                        if let Err(e) = crate::profile::update_profile_tokens_and_live_if_current(
-                            alias,
-                            &refreshed.id_token,
-                            &refreshed.access_token,
-                            &refreshed.refresh_token,
-                        ) {
-                            warn!("[{alias}] failed to atomically persist refreshed tokens: {e}");
-                        }
+                        persist_refreshed_tokens(alias, &refreshed)?;
                         let mut retry_resp = make_request(
                             &client,
                             &refreshed.access_token,
@@ -758,14 +775,9 @@ pub(crate) async fn fetch_models_for_profile(
         .await
         {
             Ok(refreshed) => {
-                if let Err(e) = crate::profile::update_profile_tokens_and_live_if_current(
-                    alias,
-                    &refreshed.id_token,
-                    &refreshed.access_token,
-                    &refreshed.refresh_token,
-                ) {
-                    warn!("[{alias}] failed to persist refreshed tokens: {e}");
-                }
+                // No degrade here: the refresh *worked*, so the old token this
+                // would fall back to has already been invalidated server-side.
+                persist_refreshed_tokens(alias, &refreshed)?;
                 access_token = refreshed.access_token;
             }
             // Deliberate degrade: fall through and try /models with the
@@ -1467,6 +1479,283 @@ mod tests {
                 logs.contains("refresh_token_reused"),
                 "the real rejection reason must be traceable in the logs, not silently \
                  dropped — captured log output was: {logs:?}"
+            );
+        }
+
+        // ── rotated tokens that never reach disk must abort the account ──
+        //
+        // OpenAI's refresh_token is single-use: the moment the auth server hands
+        // back a rotated one, the previous token is dead. If the write back to
+        // the profile then fails, the only credential the server still accepts
+        // lives in this process's memory. Finishing the request with it and
+        // exiting zero leaves a bricked profile and no signal, so every one of
+        // these paths has to report instead.
+
+        /// Substring every persist-failure report must carry, so the message
+        /// can never be mistaken for the auth server rejecting the refresh.
+        const PERSIST_FAILURE_MARKER: &str =
+            "token refresh succeeded but the rotated credentials could not be saved";
+
+        /// An access_token JWT far from expiry, so the pre-warmup proactive
+        /// refresh stays out of the way and the 401 retry path can be exercised
+        /// on its own.
+        fn live_access_token() -> String {
+            make_jwt(&serde_json::json!({ "exp": crate::auth::now_unix_secs() + 3600 }))
+        }
+
+        /// Stage a profile that reads fine but can never be written back: the
+        /// alias-derived `profiles/<alias>/auth.json` is occupied by a
+        /// *directory*, which fails the write on unix and Windows alike (no
+        /// permission-bit semantics involved). The tokens the run starts from
+        /// live in a separate readable file, so the refresh itself succeeds and
+        /// only the persist step fails — exactly the production window.
+        fn stage_unwritable_profile(
+            home: &std::path::Path,
+            alias: &str,
+            access_token: &str,
+        ) -> std::path::PathBuf {
+            let readable = home.join("staged").join(alias).join("auth.json");
+            write_test_auth(&readable, access_token, "refresh-token-live");
+            std::fs::create_dir_all(home.join("profiles").join(alias).join("auth.json")).unwrap();
+            readable
+        }
+
+        /// Stage a normal profile whose rotated tokens can be written back.
+        fn stage_writable_profile(
+            home: &std::path::Path,
+            alias: &str,
+            access_token: &str,
+        ) -> std::path::PathBuf {
+            let path = home.join("profiles").join(alias).join("auth.json");
+            write_test_auth(&path, access_token, "refresh-token-live");
+            path
+        }
+
+        /// Mock server whose `/oauth/token` always rotates successfully, so the
+        /// only thing that can go wrong is the write back. `/codex/responses`
+        /// walks `responses_statuses` one entry per request and repeats the last
+        /// entry once exhausted — a request counter, never a timer, decides what
+        /// comes back.
+        async fn start_rotating_mock_server(
+            responses_statuses: Vec<StatusCode>,
+        ) -> (Arc<AtomicUsize>, Vec<EnvVarGuard>) {
+            let token_calls = Arc::new(AtomicUsize::new(0));
+            let counter = token_calls.clone();
+            let responses_calls = Arc::new(AtomicUsize::new(0));
+
+            let app = Router::new()
+                .route(
+                    "/oauth/token",
+                    post(move || {
+                        let counter = counter.clone();
+                        async move {
+                            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "id_token": make_jwt(&serde_json::json!({})),
+                                    "access_token": live_access_token(),
+                                    "refresh_token": format!("rotated-refresh-{n}"),
+                                })),
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/codex/models",
+                    get(|| async {
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "models": [{"slug": "gpt-5-mini", "supported_in_api": true}]
+                            })),
+                        )
+                    }),
+                )
+                .route(
+                    "/codex/responses",
+                    post(move || {
+                        let calls = responses_calls.clone();
+                        let statuses = responses_statuses.clone();
+                        async move {
+                            let index = calls.fetch_add(1, Ordering::SeqCst);
+                            let status = statuses
+                                .get(index)
+                                .copied()
+                                .or_else(|| statuses.last().copied())
+                                .unwrap_or(StatusCode::OK);
+                            (status, "")
+                        }
+                    }),
+                );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let guards = vec![
+                EnvVarGuard::set("CS_TOKEN_URL", &format!("http://{addr}/oauth/token")),
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models")),
+                EnvVarGuard::set(
+                    "CS_RESPONSES_URL",
+                    &format!("http://{addr}/codex/responses"),
+                ),
+            ];
+            (token_calls, guards)
+        }
+
+        fn assert_reports_persist_failure(detail: &str) {
+            assert!(
+                detail.contains(PERSIST_FAILURE_MARKER),
+                "a rotated credential that never reached disk must be reported as a local \
+                 write failure, got: {detail}"
+            );
+            assert!(
+                !detail.contains("token refresh failed"),
+                "the report must stay distinguishable from the auth server rejecting the \
+                 refresh — that one needs a re-login, this one needs the write fixed. \
+                 Got: {detail}"
+            );
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn warmup_aborts_when_pre_warmup_rotated_tokens_cannot_be_saved() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = tempfile::tempdir().unwrap();
+            let _codex_switch_home =
+                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+
+            let alias = "persist-fail-pre-warmup";
+            // Keep the (independent) usage-fetch refresh path out of this test.
+            crate::cache::put(alias, &crate::usage::UsageInfo::default());
+            let profile_path =
+                stage_unwritable_profile(home.path(), alias, &expired_access_token());
+
+            let (_token_calls, _guards) = start_rotating_mock_server(vec![StatusCode::OK]).await;
+
+            let result = warmup_account(alias, &profile_path).await;
+
+            let error = result.expect_err(
+                "the pre-warmup refresh rotated the credential and the write back failed, so \
+                 the warmup must not report success with a token that only exists in memory",
+            );
+            assert_reports_persist_failure(&format!("{error:#}"));
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn warmup_aborts_when_the_401_retry_rotated_tokens_cannot_be_saved() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = tempfile::tempdir().unwrap();
+            let _codex_switch_home =
+                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+
+            let alias = "persist-fail-401-retry";
+            crate::cache::put(alias, &crate::usage::UsageInfo::default());
+            // Not expiring, so only the 401 handler triggers a refresh.
+            let profile_path = stage_unwritable_profile(home.path(), alias, &live_access_token());
+
+            // First warmup POST is unauthorized (drives the refresh), the retry
+            // would have succeeded — which is precisely how the failure used to
+            // exit zero.
+            let (_token_calls, _guards) =
+                start_rotating_mock_server(vec![StatusCode::UNAUTHORIZED, StatusCode::OK]).await;
+
+            let result = warmup_account(alias, &profile_path).await;
+
+            let error = result.expect_err(
+                "the 401 retry refreshed and rotated the credential; a failed write back must \
+                 abort rather than let the retry succeed on an unsaved token",
+            );
+            assert_reports_persist_failure(&format!("{error:#}"));
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn fetch_models_for_profile_aborts_when_rotated_tokens_cannot_be_saved() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = tempfile::tempdir().unwrap();
+            let _codex_switch_home =
+                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+
+            let alias = "persist-fail-fetch-models";
+            let profile_path =
+                stage_unwritable_profile(home.path(), alias, &expired_access_token());
+
+            let (_token_calls, _guards) = start_rotating_mock_server(vec![StatusCode::OK]).await;
+
+            let result = fetch_models_for_profile(alias, &profile_path).await;
+
+            let error = result.map(|models| format!("{models:?}")).expect_err(
+                "degrading to the old token is only correct when the refresh was refused; a \
+                 refresh that succeeded and then failed to save must abort instead",
+            );
+            assert_reports_persist_failure(&format!("{error:#}"));
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn one_unsaveable_profile_does_not_abort_the_rest_of_the_warmup_batch() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = tempfile::tempdir().unwrap();
+            let _codex_switch_home =
+                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+
+            let broken = "batch-persist-broken";
+            let healthy = "batch-persist-healthy";
+            crate::cache::put(broken, &crate::usage::UsageInfo::default());
+            crate::cache::put(healthy, &crate::usage::UsageInfo::default());
+            let broken_path =
+                stage_unwritable_profile(home.path(), broken, &expired_access_token());
+            let healthy_path =
+                stage_writable_profile(home.path(), healthy, &expired_access_token());
+
+            let (_token_calls, _guards) = start_rotating_mock_server(vec![StatusCode::OK]).await;
+
+            // Mirrors the batch driver in `commands::misc`: one task per alias,
+            // outcomes collected independently.
+            let mut tasks = tokio::task::JoinSet::new();
+            for (alias, path) in [(broken, broken_path), (healthy, healthy_path)] {
+                let alias = alias.to_string();
+                tasks.spawn(async move {
+                    let result = warmup_account(&alias, &path).await;
+                    (alias, result)
+                });
+            }
+            let mut outcomes: HashMap<String, Result<()>> = HashMap::new();
+            while let Some(joined) = tasks.join_next().await {
+                let (alias, result) = joined.unwrap();
+                outcomes.insert(alias, result);
+            }
+
+            let broken_error = outcomes
+                .remove(broken)
+                .expect("the broken profile must produce an outcome")
+                .expect_err("the profile whose rotated tokens could not be saved must report");
+            assert_reports_persist_failure(&format!("{broken_error:#}"));
+
+            let healthy_result = outcomes
+                .remove(healthy)
+                .expect("the healthy profile must produce an outcome");
+            assert!(
+                healthy_result.is_ok(),
+                "one account's persist failure must not take down the others in the batch: \
+                 {healthy_result:?}"
             );
         }
     }
