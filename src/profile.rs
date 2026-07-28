@@ -1075,8 +1075,21 @@ pub fn save_auth_value(val: serde_json::Value, hint_alias: Option<&str>) -> Resu
     let _transaction = lock_auth_transaction()?;
     let identity = extract_identity(&val);
 
-    if let Some(existing) = find_profile_by_identity(&identity) {
+    let existing = match hint_alias {
+        Some(alias) => resolve_named_target(alias, &identity)?,
+        None => resolve_identity_target(&identity)?,
+    };
+
+    if let Some(existing) = existing {
         let dst = profile_auth_path(&existing)?;
+        // These credentials were just minted, so the freshness gate does not
+        // apply: a legacy profile carries no stamp to order against, and
+        // re-login is precisely how such a profile is recovered. Identity is
+        // still checked — without it, `login <alias>` naming a profile that
+        // holds a different workspace would overwrite that account's token.
+        if dst.exists() {
+            ensure_same_account_identity(&existing, &read_auth(&dst)?, &val)?;
+        }
         ensure_profile_parent(&dst)?;
         write_auth(&dst, &val)?;
         write_current(&existing)?;
@@ -2426,5 +2439,59 @@ mod tests {
             super::detect_auth_change(),
             super::AuthChange::NoChange
         ));
+    }
+
+    #[test]
+    fn login_with_an_explicit_alias_never_writes_to_its_email_twin() {
+        let _env = TestEnv::new();
+        seed_email_twins();
+        // Freshly minted credentials for the personal workspace. Resolving by
+        // identity would land on `oai001_20x` and silently replace the working
+        // token of a profile the user did not name.
+        let minted = realistic_auth_json("oai001@ozi.xyz", "acct_personal", "acc_new", "ref_new");
+
+        let err = super::save_auth_value(minted, Some("oai001"))
+            .expect_err("a named profile holding another workspace must not be reassigned");
+        assert!(
+            format!("{err:#}").contains("oai001"),
+            "the refusal must name the profile that was asked for: {err:#}"
+        );
+        assert_eq!(
+            profile_refresh_token("oai001_20x"),
+            "ref_p",
+            "the twin the user did not name must keep its credentials"
+        );
+    }
+
+    #[test]
+    fn login_without_an_alias_refuses_to_pick_between_email_twins() {
+        let _env = TestEnv::new();
+        seed_email_twins();
+        let minted = auth_json_without_account_id("oai001@ozi.xyz", "acc_new", "ref_new");
+
+        let err = super::save_auth_value(minted, None)
+            .expect_err("an ambiguous email must not resolve to the first candidate");
+        assert!(format!("{err:#}").contains("oai001"), "{err:#}");
+        assert_eq!(profile_refresh_token("oai001"), "ref_t");
+        assert_eq!(profile_refresh_token("oai001_20x"), "ref_p");
+    }
+
+    #[test]
+    fn login_replaces_an_unstamped_profile_because_the_credentials_are_new() {
+        let _env = TestEnv::new();
+        // A legacy profile with no last_refresh. The freshness gate would call
+        // this unorderable and refuse — but re-login is exactly how a user
+        // recovers such a profile, so it must not be blocked here.
+        seed_profile(
+            "legacy",
+            &stamped_auth_json("legacy@example.com", "acct_l", "acc_old", "ref_old", None),
+        );
+        let minted = realistic_auth_json("legacy@example.com", "acct_l", "acc_fresh", "ref_fresh");
+
+        match super::save_auth_value(minted, Some("legacy")) {
+            Ok(super::SaveAction::Updated(alias)) => assert_eq!(alias, "legacy"),
+            other => panic!("re-login must be able to replace a legacy profile, got {other:?}"),
+        }
+        assert_eq!(profile_refresh_token("legacy"), "ref_fresh");
     }
 }
