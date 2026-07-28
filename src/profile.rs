@@ -473,6 +473,7 @@ pub fn alias_from_email(email: &str) -> String {
 
 // ── Return types ──────────────────────────────────────────
 
+#[derive(Debug)]
 pub enum SaveAction {
     Created(String),
     Updated(String),
@@ -701,19 +702,44 @@ pub fn cmd_save(alias: Option<&str>) -> Result<SaveAction> {
     let resolved_alias = match alias {
         Some(a) => a.to_string(),
         None => {
-            if let Some(ref existing_alias) = existing {
-                let dst = profile_auth_path(existing_alias)?;
-                ensure_profile_parent(&dst)?;
-                write_auth(&dst, &val)?;
-                write_current(existing_alias)?;
-                user_println(&format!("Updated profile: {existing_alias}"));
-                return Ok(SaveAction::Updated(existing_alias.clone()));
+            // Unlike `existing` above (which falls back to the first email-only
+            // match), a bare `save` with no alias must never guess between
+            // several workspaces that merely share an email — that has already
+            // overwritten the wrong account's one-time-rotation refresh_token
+            // in the wild. Resolve via the same exact/email-only split used by
+            // `detect_auth_change` and refuse when it's still ambiguous.
+            let id_matches = scan_profiles_by_identity(&identity);
+            let target = id_matches
+                .exact
+                .or_else(|| match id_matches.email_only[..] {
+                    [ref only] => Some(only.clone()),
+                    _ => None,
+                });
+            match target {
+                Some(existing_alias) => {
+                    let dst = profile_auth_path(&existing_alias)?;
+                    ensure_profile_parent(&dst)?;
+                    write_auth(&dst, &val)?;
+                    write_current(&existing_alias)?;
+                    user_println(&format!("Updated profile: {existing_alias}"));
+                    return Ok(SaveAction::Updated(existing_alias));
+                }
+                None if id_matches.email_only.len() >= 2 => {
+                    let mut candidates = id_matches.email_only;
+                    candidates.sort();
+                    anyhow::bail!(
+                        "Ambiguous account: {} profiles share email '{}' with different workspaces ({}) -- refusing to guess which one to update.\nRun `codex-switch save <alias>` with one of the profiles above, or a new alias, to choose explicitly.",
+                        candidates.len(),
+                        identity.email.as_deref().unwrap_or("unknown"),
+                        candidates.join(", ")
+                    );
+                }
+                None => identity
+                    .email
+                    .as_deref()
+                    .map(alias_from_email)
+                    .unwrap_or_else(|| "account".to_string()),
             }
-            identity
-                .email
-                .as_deref()
-                .map(alias_from_email)
-                .unwrap_or_else(|| "account".to_string())
         }
     };
 
@@ -1004,7 +1030,7 @@ mod tests {
     use anyhow::Result;
     use fs4::FileExt;
 
-    use super::{cmd_delete, cmd_use, rename_profile, switch_profile, validate_alias};
+    use super::{cmd_delete, cmd_save, cmd_use, rename_profile, switch_profile, validate_alias};
 
     struct TestEnv {
         _lock: MutexGuard<'static, ()>,
@@ -1890,6 +1916,88 @@ mod tests {
             super::AuthChange::TokensUpdated { alias } => assert_eq!(alias, "oai001_20x"),
             other => panic!("expected TokensUpdated for oai001_20x, got {other:?}"),
         }
+    }
+
+    // ── cmd_save identity ambiguity (same email, several workspaces) ──
+
+    #[test]
+    fn cmd_save_ambiguous_email_refuses_to_guess_between_profiles() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "oai001",
+            &realistic_auth_json("oai001@ozi.xyz", "acct_team", "acc_t", "ref_t"),
+        );
+        seed_profile(
+            "oai001_20x",
+            &realistic_auth_json("oai001@ozi.xyz", "acct_personal", "acc_p", "ref_p"),
+        );
+        // Live file carries no account_id — the email alone matches both profiles.
+        write_live(&auth_json_without_account_id(
+            "oai001@ozi.xyz",
+            "acc_live",
+            "ref_live",
+        ));
+
+        let err = cmd_save(None).expect_err("ambiguous email match must not silently save");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("oai001"),
+            "message should list candidate: {msg}"
+        );
+        assert!(
+            msg.contains("oai001_20x"),
+            "message should list candidate: {msg}"
+        );
+
+        // Neither existing profile was silently overwritten.
+        assert_eq!(profile_refresh_token("oai001"), "ref_t");
+        assert_eq!(profile_refresh_token("oai001_20x"), "ref_p");
+    }
+
+    #[test]
+    fn cmd_save_exact_match_updates_the_right_profile() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "oai001",
+            &realistic_auth_json("oai001@ozi.xyz", "acct_team", "acc_t", "ref_t"),
+        );
+        seed_profile(
+            "oai001_20x",
+            &realistic_auth_json("oai001@ozi.xyz", "acct_personal", "acc_p", "ref_p"),
+        );
+        write_live(&realistic_auth_json(
+            "oai001@ozi.xyz",
+            "acct_personal",
+            "acc_p2",
+            "ref_p2",
+        ));
+
+        match cmd_save(None) {
+            Ok(super::SaveAction::Updated(alias)) => assert_eq!(alias, "oai001_20x"),
+            other => panic!("expected exact match to update oai001_20x, got {other:?}"),
+        }
+        assert_eq!(profile_refresh_token("oai001_20x"), "ref_p2");
+        assert_eq!(profile_refresh_token("oai001"), "ref_t");
+    }
+
+    #[test]
+    fn cmd_save_single_email_only_candidate_updates_it() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "fallback",
+            &auth_json_without_account_id("fallback@example.com", "acc_old", "ref_old"),
+        );
+        write_live(&auth_json_without_account_id(
+            "fallback@example.com",
+            "acc_new",
+            "ref_new",
+        ));
+
+        match cmd_save(None) {
+            Ok(super::SaveAction::Updated(alias)) => assert_eq!(alias, "fallback"),
+            other => panic!("expected single email-only candidate to update, got {other:?}"),
+        }
+        assert_eq!(profile_refresh_token("fallback"), "ref_new");
     }
 
     #[test]

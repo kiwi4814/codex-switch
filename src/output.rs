@@ -132,6 +132,14 @@ pub struct JsonImportFailure {
 #[derive(Serialize)]
 pub struct JsonImportReport {
     pub ok: bool,
+    /// True when at least one skipped file had already had its one-time-use
+    /// `refresh_token` rotated by the auth server and it could not be saved
+    /// anywhere (`token_rotation_lost`). That account needs a fresh login.
+    /// Kept as its own top-level field (rather than folded into `ok`) so a
+    /// consumer checking only `ok`/`imported`/`skipped` for shape keeps
+    /// working, while one that also checks this field can't miss the loss
+    /// behind an otherwise-successful `ok: true` directory import.
+    pub credentials_lost: bool,
     pub imported: Vec<JsonImportEntry>,
     pub skipped: Vec<JsonImportFailure>,
 }

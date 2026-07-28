@@ -152,9 +152,14 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
     }
 
     let all_skipped = report.imported.is_empty();
+    let credentials_lost = report
+        .skipped
+        .iter()
+        .any(|item| item.stage == STAGE_TOKEN_ROTATION_LOST);
     if json {
         print_json(&output::JsonImportReport {
             ok: !all_skipped,
+            credentials_lost,
             imported: report
                 .imported
                 .iter()

@@ -734,12 +734,23 @@ struct MockState {
     /// Whether the usage endpoint answers the rotated access token or fails it.
     usage_ok: bool,
     token_calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Access tokens the usage endpoint fails regardless of `usage_ok` --
+    /// lets one file in a directory import fail its usage check without
+    /// forcing every other file in the same run to fail too.
+    fail_access_tokens: std::collections::HashSet<String>,
 }
 
 async fn mock_usage_handler(
     axum::extract::State(state): axum::extract::State<MockState>,
+    headers: axum::http::HeaderMap,
 ) -> impl axum::response::IntoResponse {
-    if state.usage_ok {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let ok = state.usage_ok && !state.fail_access_tokens.contains(bearer);
+    if ok {
         return (
             axum::http::StatusCode::OK,
             axum::Json(serde_json::json!({
@@ -792,11 +803,24 @@ async fn mock_token_handler(
 /// validation failed afterwards"; with it true the failure has to come from a
 /// later step instead.
 fn start_rotating_mock(rotated_id_token: String, usage_ok: bool) -> MockServer {
+    start_rotating_mock_with_failures(rotated_id_token, usage_ok, &[])
+}
+
+/// Same as `start_rotating_mock`, but the usage endpoint also fails for any
+/// bearer token listed in `fail_access_tokens`, independent of `usage_ok`.
+/// Used to make exactly one file in a directory import fail its usage check
+/// while a sibling file in the same run still succeeds normally.
+fn start_rotating_mock_with_failures(
+    rotated_id_token: String,
+    usage_ok: bool,
+    fail_access_tokens: &[&str],
+) -> MockServer {
     let token_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let state = MockState {
         rotated_id_token,
         usage_ok,
         token_calls: token_calls.clone(),
+        fail_access_tokens: fail_access_tokens.iter().map(|s| s.to_string()).collect(),
     };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1091,6 +1115,66 @@ fn import_reports_the_rotation_when_the_profile_write_fails_after_validation() {
     assert!(
         error.contains("sign in again"),
         "the user must learn the account needs a new login: {error}"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A `--json` directory import that imports one file fine but loses another
+/// account's rotated credentials (`token_rotation_lost`) must not read as an
+/// overall success: a script that only checks a top-level discovery field,
+/// without walking `skipped[]`, still has to learn an account needs a fresh
+/// login.
+#[test]
+fn json_directory_import_surfaces_lost_credentials_at_top_level() {
+    let home = temp_home("import-json-lost-visible");
+    let root = home.join("to-import");
+
+    let lost_sample = auth_json_needing_refresh("lost@example.com", "acct_lost");
+    let rotated_id_token = lost_sample["tokens"]["id_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    write_json(root.join("lost-auth.json"), &lost_sample);
+    write_json(
+        root.join("ok-auth.json"),
+        &auth_json_with_access("healthy@example.com", "acct_healthy"),
+    );
+
+    // The alias the "lost" identity would rescue into ("lost", derived from
+    // its email) already exists as a plain file instead of a directory, so
+    // creating its profile subdirectory fails -- unlike a permission bit,
+    // this can't be silently repaired by `ensure_private_dir`'s chmod. The
+    // rest of the profile store stays untouched and writable for
+    // "ok-auth.json".
+    fs::create_dir_all(home.join(".codex-switch/profiles")).unwrap();
+    fs::write(home.join(".codex-switch/profiles/lost"), "not a directory").unwrap();
+
+    let server = start_rotating_mock_with_failures(rotated_id_token, true, &["access_1"]);
+    let output = run_import(
+        &home,
+        &["--json", "import", root.to_str().unwrap()],
+        &server,
+    );
+
+    let report = parse_stdout_json(&output);
+    assert_eq!(
+        report["imported"].as_array().unwrap().len(),
+        1,
+        "the healthy file must still import normally: {report}"
+    );
+    let skipped = report["skipped"].as_array().unwrap();
+    assert!(
+        skipped
+            .iter()
+            .any(|item| item["stage"] == "token_rotation_lost"),
+        "expected a token_rotation_lost entry in skipped[]: {report}"
+    );
+    assert_eq!(
+        report["credentials_lost"],
+        serde_json::json!(true),
+        "a lost account must be discoverable from a top-level field alone, without walking \
+         skipped[]: {report}"
     );
 
     let _ = fs::remove_dir_all(home);
