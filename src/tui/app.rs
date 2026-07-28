@@ -50,6 +50,23 @@ fn map_reset_card_failure(message: String, invalidate_cache: bool) -> ResetCardF
     }
 }
 
+/// The actual `outcome_unknown_after_request` -> `invalidate_cache` routing decision,
+/// isolated from `ConsumeResetCreditError` so it can be unit-tested directly instead of
+/// only through a literal struct construction (a reset card is a non-renewable resource:
+/// routing an unknown outcome to "definite failure" would let the UI offer to burn a
+/// second card after the first attempt may have already consumed one).
+fn reset_card_failure_from_outcome(
+    unknown: bool,
+    unknown_message: String,
+    definite_message: String,
+) -> ResetCardFailure {
+    if unknown {
+        map_reset_card_failure(unknown_message, true)
+    } else {
+        map_reset_card_failure(definite_message, false)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ModelStatus {
     Loading,
@@ -1190,12 +1207,11 @@ impl App {
                 .await
                 .map_err(|error| {
                     let unknown = error.outcome_unknown_after_request();
-                    let message = if unknown {
-                        error.user_facing_unknown_message(&alias_owned)
-                    } else {
-                        format!("Reset card failed ({alias_owned}): {error}")
-                    };
-                    map_reset_card_failure(message, unknown)
+                    reset_card_failure_from_outcome(
+                        unknown,
+                        error.user_facing_unknown_message(&alias_owned),
+                        format!("Reset card failed ({alias_owned}): {error}"),
+                    )
                 });
             let _ = tx.send((alias_owned, result)).await;
         });
@@ -1973,7 +1989,7 @@ fn char_to_byte(s: &str, char_pos: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountEntry, App, ModelStatus, UsageStatus, map_reset_card_failure};
+    use super::{AccountEntry, App, ModelStatus, UsageStatus, reset_card_failure_from_outcome};
     use crate::{
         jwt::{AccountInfo, OrgInfo},
         usage::{ResetCredit, UsageInfo},
@@ -2094,23 +2110,34 @@ mod tests {
     }
 
     #[test]
-    fn unknown_reset_card_failure_uses_safe_message_and_invalidates_cache() {
-        let failure = map_reset_card_failure(
-            "account: reset-card consumption may have occurred; verify before retry".to_string(),
+    fn unknown_reset_card_outcome_invalidates_cache_and_uses_safe_message() {
+        let failure = reset_card_failure_from_outcome(
             true,
+            "account: reset-card consumption may have occurred; verify before retry".to_string(),
+            "Reset card failed (account): HTTP 400".to_string(),
         );
 
+        // Unknown outcome must invalidate the cache: the card may have been consumed,
+        // so a stale "still available" cache entry could let the UI burn a second one.
         assert!(failure.invalidate_cache);
         assert!(failure.message.contains("account"));
         assert!(failure.message.contains("consumption may have occurred"));
         assert!(failure.message.contains("verify before retry"));
+        // Must route to the safe message, never the raw definite-failure text.
+        assert!(!failure.message.contains("HTTP 400"));
     }
 
     #[test]
-    fn definite_reset_card_failure_keeps_accurate_error_without_invalidation() {
-        let failure = map_reset_card_failure("HTTP 400".to_string(), false);
+    fn definite_reset_card_outcome_keeps_accurate_error_without_invalidation() {
+        let failure = reset_card_failure_from_outcome(
+            false,
+            "account: reset-card consumption may have occurred; verify before retry".to_string(),
+            "Reset card failed (account): HTTP 400".to_string(),
+        );
 
+        // Definite (unconsumed) outcome must NOT invalidate the cache, and must surface
+        // the accurate error rather than the unknown-outcome safe message.
         assert!(!failure.invalidate_cache);
-        assert_eq!(failure.message, "HTTP 400");
+        assert_eq!(failure.message, "Reset card failed (account): HTTP 400");
     }
 }
