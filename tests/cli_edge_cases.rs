@@ -169,6 +169,25 @@ fn parse_stdout_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn quarantined_path_from_error(error: &str) -> PathBuf {
+    let (_, after_path) = error
+        .split_once("credential copy was quarantined at ")
+        .expect("rotation rescue error must name its recovery path");
+    let (path, _) = after_path
+        .split_once(" and was not made into an activatable profile")
+        .expect("rotation rescue error must end its recovery path before the profile warning");
+    PathBuf::from(path)
+}
+
+fn assert_error_names_recovered_file(error: &str, recovered: &Path) {
+    let reported = quarantined_path_from_error(error);
+    assert_eq!(
+        fs::canonicalize(&reported).unwrap(),
+        fs::canonicalize(recovered).unwrap(),
+        "the report must name the durable recovery path: {error}"
+    );
+}
+
 #[test]
 fn json_use_keeps_stdout_machine_readable() {
     let home = temp_home("json-use");
@@ -1100,7 +1119,7 @@ fn import_quarantines_rotated_credentials_when_refresh_loses_account_identity() 
     let report = parse_stdout_json(&output);
     let error = report["error"].as_str().unwrap_or_default();
     assert!(error.contains("token_rotated"));
-    assert!(error.contains(&recovered[0].display().to_string()));
+    assert_error_names_recovered_file(error, &recovered[0]);
 
     let _ = fs::remove_dir_all(home);
 }
@@ -1277,10 +1296,7 @@ fn import_quarantines_the_rotation_when_the_profile_write_fails_after_validation
         .collect();
     assert_eq!(recovered.len(), 1);
     assert_eq!(stored_refresh_token(&recovered[0]), "refresh_1");
-    assert!(
-        error.contains(&recovered[0].display().to_string()),
-        "the report must name the durable recovery path: {error}"
-    );
+    assert_error_names_recovered_file(error, &recovered[0]);
 
     let _ = fs::remove_dir_all(home);
 }
