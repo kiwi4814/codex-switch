@@ -27,8 +27,7 @@ fn uninstall() -> Result<()> {
         // `daemon stop` before removing the task.
         let pid = pidfile::read_pidfile();
         let alive = pid.is_some_and(pidfile::process_alive);
-        if let WindowsStopGate::Graceful =
-            windows_stop_gate(pid, alive, || pidfile::cleanup_pidfile())?
+        if let WindowsStopGate::Graceful = windows_stop_gate(pid, alive, pidfile::cleanup_pidfile)?
         {
             stop_detached()?;
         }
@@ -198,7 +197,7 @@ fn stop() -> Result<()> {
             let _ = pidfile::cleanup_pidfile();
             return Ok(());
         }
-        return stop_detached();
+        stop_detached()
     }
 
     #[cfg(not(target_os = "windows"))]
