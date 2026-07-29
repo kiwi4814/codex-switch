@@ -63,6 +63,14 @@ tar = "0.4"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 axum = "0.8"
 

@@ -1,8 +1,6 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -266,62 +264,208 @@ pub(crate) fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 #[cfg(any(windows, test))]
-fn windows_private_acl_script() -> &'static str {
-    r#"
-$ErrorActionPreference = 'Stop'
-$LiteralPath = $env:CS_ACL_PATH
-$Directory = $env:CS_ACL_KIND -eq 'directory'
-$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-if ($null -eq $currentSid) { throw 'current Windows identity has no SID' }
-$identities = @(
-    $currentSid,
-    [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
-    [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
-)
-if ($Directory) {
-    $acl = [Security.AccessControl.DirectorySecurity]::new()
-    $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit `
-        -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
-} else {
-    $acl = [Security.AccessControl.FileSecurity]::new()
-    $inheritance = [Security.AccessControl.InheritanceFlags]::None
-}
-$acl.SetAccessRuleProtection($true, $false)
-foreach ($identity in $identities) {
-    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
-        $identity,
-        [Security.AccessControl.FileSystemRights]::FullControl,
-        $inheritance,
-        [Security.AccessControl.PropagationFlags]::None,
-        [Security.AccessControl.AccessControlType]::Allow
+fn windows_private_acl_sddl(current_user_sid: &str, directory: bool) -> String {
+    let inheritance = if directory { "OICI" } else { "" };
+    format!(
+        "D:P(A;{inheritance};FA;;;{current_user_sid})\
+         (A;{inheritance};FA;;;S-1-5-18)\
+         (A;{inheritance};FA;;;S-1-5-32-544)"
     )
-    [void]$acl.AddAccessRule($rule)
-}
-if ($Directory) {
-    [IO.Directory]::SetAccessControl($LiteralPath, $acl)
-} else {
-    [IO.File]::SetAccessControl($LiteralPath, $acl)
-}
-"#
 }
 
 #[cfg(windows)]
 fn harden_windows_acl(path: &Path, directory: bool) -> Result<()> {
-    let status = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            windows_private_acl_script(),
-        ])
-        .env("CS_ACL_PATH", path.as_os_str())
-        .env("CS_ACL_KIND", if directory { "directory" } else { "file" })
-        .status()
-        .with_context(|| format!("starting PowerShell ACL hardening for {}", path.display()))?;
-    if !status.success() {
-        anyhow::bail!("PowerShell ACL hardening failed for {}", path.display());
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: this wrapper is only constructed from a successful
+            // OpenProcessToken call and owns that handle exactly once.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
     }
+
+    struct LocalAllocation(*mut core::ffi::c_void);
+
+    impl Drop for LocalAllocation {
+        fn drop(&mut self) {
+            // SAFETY: both wrapped pointers come from Win32 APIs documented to
+            // allocate with LocalAlloc and are released exactly once here.
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+
+    fn last_error(path: &Path, api: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "{api} failed for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )
+    }
+
+    let mut token = null_mut();
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle, and `token`
+    // points to writable storage for the owned token handle.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(last_error(path, "OpenProcessToken"));
+    }
+    let _token = OwnedHandle(token);
+
+    let mut token_user_bytes = 0;
+    // SAFETY: the null-buffer probe is the documented way to obtain the
+    // TOKEN_USER size; no output buffer is dereferenced.
+    let probe_ok =
+        unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut token_user_bytes) };
+    let probe_error = std::io::Error::last_os_error();
+    if probe_ok != 0
+        || token_user_bytes == 0
+        || probe_error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+    {
+        return Err(anyhow::anyhow!(
+            "GetTokenInformation(TokenUser size) failed for {}: {probe_error}",
+            path.display()
+        ));
+    }
+
+    let words = (token_user_bytes as usize).div_ceil(std::mem::size_of::<usize>());
+    let mut token_user = vec![0usize; words];
+    // SAFETY: the usize-backed buffer is suitably aligned for TOKEN_USER and
+    // has the exact byte capacity requested by the preceding size probe.
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            token_user.as_mut_ptr().cast(),
+            token_user_bytes,
+            &mut token_user_bytes,
+        )
+    } == 0
+    {
+        return Err(last_error(path, "GetTokenInformation(TokenUser)"));
+    }
+    // SAFETY: GetTokenInformation initialized the aligned buffer as TOKEN_USER,
+    // and the SID remains valid while `token_user` is alive.
+    let user_sid = unsafe { (*(token_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+
+    let mut string_sid = null_mut();
+    // SAFETY: `user_sid` comes from the live TOKEN_USER buffer and the API
+    // writes one LocalAlloc-owned, NUL-terminated UTF-16 pointer.
+    if unsafe { ConvertSidToStringSidW(user_sid, &mut string_sid) } == 0 {
+        return Err(last_error(path, "ConvertSidToStringSidW"));
+    }
+    let _string_sid = LocalAllocation(string_sid.cast());
+    let mut sid_len = 0;
+    // SAFETY: ConvertSidToStringSidW guarantees a NUL-terminated UTF-16
+    // string, and `_string_sid` keeps that allocation alive for this scan.
+    while unsafe { *string_sid.add(sid_len) } != 0 {
+        sid_len += 1;
+    }
+    // SAFETY: `sid_len` was found within the API-provided NUL-terminated
+    // allocation and excludes the terminator.
+    let current_user_sid =
+        String::from_utf16(unsafe { std::slice::from_raw_parts(string_sid, sid_len) })
+            .with_context(|| {
+                format!(
+                    "decoding ConvertSidToStringSidW output for {}",
+                    path.display()
+                )
+            })?;
+
+    let sddl = windows_private_acl_sddl(&current_user_sid, directory);
+    let sddl_wide: Vec<u16> = std::ffi::OsStr::new(&sddl)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: `sddl_wide` is NUL-terminated and the output pointer is writable;
+    // the returned descriptor is owned by LocalFree.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut security_descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(last_error(
+            path,
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+        ));
+    }
+    let _security_descriptor = LocalAllocation(security_descriptor);
+
+    let mut dacl_present = 0;
+    let mut dacl: *mut ACL = null_mut();
+    let mut dacl_defaulted = 0;
+    // SAFETY: `security_descriptor` is live and valid; all output pointers
+    // refer to initialized local variables.
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            security_descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    } == 0
+    {
+        return Err(last_error(path, "GetSecurityDescriptorDacl"));
+    }
+    if dacl_present == 0 || dacl.is_null() {
+        anyhow::bail!(
+            "GetSecurityDescriptorDacl returned no DACL for {}",
+            path.display()
+        );
+    }
+
+    let path_wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: the path is NUL-terminated, `dacl` points inside the live
+    // security descriptor, and null owner/group/SACL pointers are required
+    // because only the exact protected DACL is being replaced.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(anyhow::anyhow!(
+            "SetNamedSecurityInfoW failed for {}: {}",
+            path.display(),
+            std::io::Error::from_raw_os_error(status as i32)
+        ));
+    }
+
     Ok(())
 }
 
@@ -855,12 +999,12 @@ mod tests {
     }
 
     #[test]
-    fn windows_acl_script_replaces_the_dacl_instead_of_only_removing_inheritance() {
-        let script = windows_private_acl_script();
-        assert!(script.contains("SetAccessRuleProtection($true, $false)"));
-        assert!(script.contains("SetAccessControl"));
+    fn windows_acl_sddl_replaces_the_dacl_instead_of_only_removing_inheritance() {
+        let sddl = windows_private_acl_sddl("S-1-5-21-1-2-3-1001", true);
+        assert!(sddl.starts_with("D:P"));
+        assert_eq!(sddl.matches("(A;").count(), 3);
         assert!(
-            !script.contains("icacls"),
+            !sddl.contains("S-1-1-0"),
             "the exact DACL path must not preserve unknown explicit ACEs"
         );
     }
@@ -924,13 +1068,20 @@ mod tests {
     }
 
     #[test]
-    fn windows_private_acl_uses_language_neutral_trusted_sids() {
-        let script = super::windows_private_acl_script();
-        assert!(script.contains("WindowsIdentity]::GetCurrent().User"));
-        assert!(script.contains("S-1-5-18"));
-        assert!(script.contains("S-1-5-32-544"));
-        assert!(script.contains("InheritanceFlags]::ObjectInherit"));
-        assert!(script.contains("InheritanceFlags]::ContainerInherit"));
+    fn windows_private_acl_sddl_is_exact_and_language_neutral() {
+        let current_user = "S-1-5-21-1-2-3-1001";
+        assert_eq!(
+            super::windows_private_acl_sddl(current_user, false),
+            "D:P(A;;FA;;;S-1-5-21-1-2-3-1001)\
+             (A;;FA;;;S-1-5-18)\
+             (A;;FA;;;S-1-5-32-544)"
+        );
+        assert_eq!(
+            super::windows_private_acl_sddl(current_user, true),
+            "D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)\
+             (A;OICI;FA;;;S-1-5-18)\
+             (A;OICI;FA;;;S-1-5-32-544)"
+        );
     }
 
     #[cfg(windows)]

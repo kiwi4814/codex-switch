@@ -144,7 +144,6 @@ fn acquire_file_lock(path: &Path, timeout: Duration, label: &str) -> Result<File
     }
 
     let file = open_lock_file(path)?;
-
     let deadline = Instant::now() + timeout;
     loop {
         match FileExt::try_lock(&file) {
@@ -153,6 +152,8 @@ fn acquire_file_lock(path: &Path, timeout: Duration, label: &str) -> Result<File
                 return Ok(file);
             }
             Err(TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                notify_test_lock_attempt(label);
                 if Instant::now() >= deadline {
                     let holder =
                         read_lock_holder(path).unwrap_or_else(|| "unknown holder".to_string());
@@ -170,6 +171,33 @@ fn acquire_file_lock(path: &Path, timeout: Duration, label: &str) -> Result<File
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LOCK_ATTEMPT_NOTIFIER:
+        std::cell::RefCell<Option<(String, std::sync::mpsc::Sender<()>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn notify_on_test_lock_attempt(label: &str, sender: std::sync::mpsc::Sender<()>) {
+    TEST_LOCK_ATTEMPT_NOTIFIER.with(|notifier| {
+        *notifier.borrow_mut() = Some((label.to_string(), sender));
+    });
+}
+
+#[cfg(test)]
+fn notify_test_lock_attempt(label: &str) {
+    TEST_LOCK_ATTEMPT_NOTIFIER.with(|notifier| {
+        let should_notify = notifier
+            .borrow()
+            .as_ref()
+            .is_some_and(|(target, _)| target == label);
+        if should_notify && let Some((_, sender)) = notifier.borrow_mut().take() {
+            let _ = sender.send(());
+        }
+    });
 }
 
 /// Open a stable lock inode. Permission/ownership errors are reported rather
@@ -1222,6 +1250,7 @@ pub fn save_auth_value(val: serde_json::Value, hint_alias: Option<&str>) -> Resu
 mod tests {
     use std::ffi::OsString;
     use std::sync::MutexGuard;
+    use std::thread::JoinHandle;
     use std::time::Duration;
 
     use anyhow::Result;
@@ -1235,6 +1264,51 @@ mod tests {
         old_home: Option<OsString>,
         old_codex_home: Option<OsString>,
         old_app_home: Option<OsString>,
+    }
+
+    struct ThreadCleanup<G> {
+        blocker: Option<G>,
+        workers: Vec<JoinHandle<()>>,
+    }
+
+    impl<G> ThreadCleanup<G> {
+        fn new(blocker: G) -> Self {
+            Self {
+                blocker: Some(blocker),
+                workers: Vec::new(),
+            }
+        }
+
+        fn push(&mut self, worker: JoinHandle<()>) {
+            self.workers.push(worker);
+        }
+
+        fn release_blocker(&mut self) {
+            self.blocker.take();
+        }
+
+        fn join_all(&mut self) {
+            let mut first_panic = None;
+            for worker in self.workers.drain(..) {
+                if let Err(panic) = worker.join()
+                    && first_panic.is_none()
+                {
+                    first_panic = Some(panic);
+                }
+            }
+            if let Some(panic) = first_panic {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    impl<G> Drop for ThreadCleanup<G> {
+        fn drop(&mut self) {
+            self.blocker.take();
+            for worker in self.workers.drain(..) {
+                let _ = worker.join();
+            }
+        }
     }
 
     impl TestEnv {
@@ -1379,15 +1453,23 @@ mod tests {
             .unwrap();
         FileExt::lock(&lock_file).unwrap();
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            let ok = super::switch_profile("next-profile").is_ok();
-            tx.send(ok).unwrap();
+            super::notify_on_test_lock_attempt("auth", attempt_tx);
+            let _ = done_tx.send(super::switch_profile("next-profile"));
         });
+        let mut cleanup = ThreadCleanup::new(lock_file);
+        cleanup.push(handle);
 
-        std::thread::sleep(Duration::from_millis(100));
+        attempt_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("switch did not reach auth lock attempt");
         assert!(
-            rx.try_recv().is_err(),
+            matches!(
+                done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
             "switch should block while auth lock is held"
         );
         assert_eq!(
@@ -1398,10 +1480,13 @@ mod tests {
             Some("acc_old")
         );
 
-        drop(lock_file);
+        cleanup.release_blocker();
 
-        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
-        handle.join().unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("switch did not finish after auth lock release")
+            .unwrap();
+        cleanup.join_all();
         assert_eq!(
             crate::auth::read_auth(&live)
                 .unwrap()
@@ -1447,23 +1532,32 @@ mod tests {
         crate::auth::write_auth(&profile_path, &next).unwrap();
 
         let lease = super::lock_launch_session().unwrap();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            done_tx
-                .send(super::switch_profile("next-profile").is_ok())
-                .unwrap();
+            super::notify_on_test_lock_attempt("launch session", attempt_tx);
+            let _ = done_tx.send(super::switch_profile("next-profile"));
         });
-        started_rx.recv().unwrap();
+        let mut cleanup = ThreadCleanup::new(lease);
+        cleanup.push(handle);
+
+        attempt_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("switch did not reach launch session lock attempt");
         assert!(
-            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            matches!(
+                done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
             "switch must wait while the launch session lease is held"
         );
 
-        drop(lease);
-        assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
-        handle.join().unwrap();
+        cleanup.release_blocker();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("switch did not finish after launch session lease release")
+            .unwrap();
+        cleanup.join_all();
     }
 
     #[test]
@@ -1483,31 +1577,39 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let updater = std::thread::spawn(move || {
-            done_tx
-                .send(
-                    super::update_profile_tokens_if_refresh_matches_after_launch(
-                        "alice",
-                        "a-ref",
-                        "a-id-new",
-                        "a-new",
-                        "a-ref-new",
-                        || started_tx.send(()).unwrap(),
-                    ),
-                )
-                .unwrap();
+            let result = super::update_profile_tokens_if_refresh_matches_after_launch(
+                "alice",
+                "a-ref",
+                "a-id-new",
+                "a-new",
+                "a-ref-new",
+                || {
+                    let _ = started_tx.send(());
+                },
+            );
+            let _ = done_tx.send(result);
         });
+        let mut cleanup = ThreadCleanup::new(auth_gate);
+        cleanup.push(updater);
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        let switcher = std::thread::spawn(|| super::switch_profile("bob"));
-        drop(auth_gate);
+        let (switch_tx, switch_rx) = std::sync::mpsc::channel();
+        let switcher = std::thread::spawn(move || {
+            let _ = switch_tx.send(super::switch_profile("bob"));
+        });
+        cleanup.push(switcher);
+        cleanup.release_blocker();
         done_rx
             .recv_timeout(Duration::from_secs(1))
             .unwrap()
             .unwrap()
             .then_some(())
             .expect("refresh CAS should persist");
-        updater.join().unwrap();
-        switcher.join().unwrap().unwrap();
+        switch_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("profile switch did not finish after refresh transaction")
+            .unwrap();
+        cleanup.join_all();
 
         assert_eq!(super::read_current(), "bob");
         let live = crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap();
