@@ -285,6 +285,24 @@ fn credential_fingerprint(refresh_token: &str) -> String {
     hex::encode(Sha256::digest(refresh_token.as_bytes()))
 }
 
+/// Upper bound on server-supplied text kept in the cache file.
+const STORED_TEXT_MAX: usize = 512;
+
+/// Make server-supplied text safe to keep and to re-render.
+///
+/// The wording in a verdict comes from the auth server. It used to be shown
+/// once and dropped; recording it means it is written to disk and printed
+/// again on every later listing, so escape sequences would be replayed into
+/// the terminal each time and an oversized `error_description` would sit in
+/// the cache file forever. Control characters go, length is bounded, and
+/// everything readable — including non-ASCII — is preserved.
+fn sanitize_for_storage(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(STORED_TEXT_MAX)
+        .collect()
+}
+
 fn record_auth_failure(
     cache: &mut CacheFile,
     alias: &str,
@@ -297,10 +315,17 @@ fn record_auth_failure(
         AuthFailureEntry {
             ts: now_secs(),
             credential: credential_fingerprint(refresh_token),
-            summary: summary.to_string(),
-            detail: detail.to_string(),
+            summary: sanitize_for_storage(summary),
+            detail: sanitize_for_storage(detail),
         },
     );
+}
+
+/// Forget everything keyed by `alias`. Returns whether anything was removed.
+fn drop_alias(cache: &mut CacheFile, alias: &str) -> bool {
+    let dropped_usage = cache.entries.remove(alias).is_some();
+    let dropped_failure = cache.auth_failures.remove(alias).is_some();
+    dropped_usage || dropped_failure
 }
 
 fn auth_failure_for<'a>(
@@ -445,6 +470,36 @@ pub fn workspace_name_is_known(account_id: &str) -> bool {
     }
 }
 
+/// Both answers from one read: the outer `None` means "not resolved, look it
+/// up"; `Some(inner)` means resolved, where `inner` is the name if there is
+/// one.
+fn resolved_workspace_name(cache: &CacheFile, account_id: &str) -> Option<Option<String>> {
+    workspace_name_resolved(cache, account_id)
+        .then(|| cache.workspace_names.get(account_id).cloned())
+}
+
+/// Async form of [`resolved_workspace_name`], taking the lock once.
+///
+/// The lookup path runs inside up to `network.max_concurrent` tasks. Asking
+/// "is it resolved" and "what is it" separately would take a cross-process
+/// lock twice per task on a tokio worker — and leave a window between them in
+/// which another process can change the answer.
+pub async fn resolved_workspace_name_async(account_id: &str) -> Option<Option<String>> {
+    let account_id = account_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        match with_cache_lock(|| Ok(resolved_workspace_name(&load_cache(), &account_id))) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!("Failed to read cached workspace state: {err}");
+                None
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 pub fn apply_workspace_name(info: &mut crate::jwt::AccountInfo) {
     let Some(account_id) = info.account_id.as_deref() else {
         return;
@@ -462,9 +517,7 @@ pub fn apply_workspace_name(info: &mut crate::jwt::AccountInfo) {
 pub fn invalidate(alias: &str) -> Result<()> {
     with_cache_lock(|| {
         let mut cache = load_cache();
-        let dropped_usage = cache.entries.remove(alias).is_some();
-        let dropped_failure = cache.auth_failures.remove(alias).is_some();
-        if dropped_usage || dropped_failure {
+        if drop_alias(&mut cache, alias) {
             save_cache(&cache).context("writing usage cache invalidation")?;
         }
         Ok(())
@@ -648,6 +701,66 @@ mod tests {
             auth_failure_for(&cache, "new", "refresh_old").is_some(),
             "a rename must not resurrect network calls for a credential already known dead"
         );
+    }
+
+    #[test]
+    fn one_read_answers_both_questions_about_a_workspace_name() {
+        // The lookup path runs inside up to `network.max_concurrent` tasks, so
+        // "is it resolved" and "what is it" must not cost two separate
+        // acquisitions of a cross-process lock — nor leave a window between
+        // them in which another process changes the answer.
+        let mut cache = CacheFile::default();
+        assert_eq!(resolved_workspace_name(&cache, "acct"), None);
+
+        update_workspace_name(&mut cache, "acct", None);
+        assert_eq!(resolved_workspace_name(&cache, "acct"), Some(None));
+
+        update_workspace_name(&mut cache, "acct", Some("Platform"));
+        assert_eq!(
+            resolved_workspace_name(&cache, "acct"),
+            Some(Some("Platform".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_stored_verdict_keeps_no_control_characters_and_stays_bounded() {
+        // `summary`/`detail` are server-controlled. They used to be shown once
+        // and discarded; now they are persisted and re-rendered to the terminal
+        // on every later listing, which makes escape sequences and unbounded
+        // length worth stripping at the point they become durable.
+        let mut cache = CacheFile::default();
+        let hostile = format!("\u{1b}[31mred\u{1b}[0m\r\n{}", "x".repeat(4096));
+        record_auth_failure(&mut cache, "dead", "refresh_old", &hostile, &hostile);
+
+        let stored = auth_failure_for(&cache, "dead", "refresh_old").unwrap();
+        for field in [&stored.summary, &stored.detail] {
+            assert!(
+                !field.chars().any(char::is_control),
+                "control characters must not survive into the cache: {field:?}"
+            );
+            assert!(
+                field.chars().count() <= STORED_TEXT_MAX,
+                "stored text must be bounded, got {} chars",
+                field.chars().count()
+            );
+        }
+        assert!(
+            stored.summary.contains("red"),
+            "the readable part must survive: {:?}",
+            stored.summary
+        );
+    }
+
+    #[test]
+    fn invalidating_an_alias_also_drops_its_recorded_verdict() {
+        // `invalidate` is what makes the forced re-fetch after a reset-card
+        // consume actually reach the network.
+        let mut cache = CacheFile::default();
+        record_auth_failure(&mut cache, "dead", "refresh_old", "summary", "detail");
+
+        assert!(drop_alias(&mut cache, "dead"));
+
+        assert!(auth_failure_for(&cache, "dead", "refresh_old").is_none());
     }
 
     #[test]

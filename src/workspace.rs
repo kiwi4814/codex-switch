@@ -70,17 +70,43 @@ impl AccountsCheckResponse {
         }
     }
 
-    fn workspace_name_for(self, account_id: &str) -> Option<String> {
-        self.into_accounts()
+    fn workspace_name_for(self, account_id: &str) -> WorkspaceLookup {
+        let Some(account) = self
+            .into_accounts()
             .into_iter()
             .find(|account| account.id == account_id)
-            .and_then(|account| {
-                let _structure = account.structure;
-                account.name
-            })
+        else {
+            return WorkspaceLookup::Unlisted;
+        };
+        let _structure = account.structure;
+        match account
+            .name
             .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty())
+        {
+            Some(name) => WorkspaceLookup::Named(name),
+            None => WorkspaceLookup::Unnamed,
+        }
     }
+}
+
+/// What an accounts-check response says about one account.
+///
+/// The three cases used to collapse into `Option<String>`, which was harmless
+/// while a `None` only meant "do not cache". Once absence became something
+/// worth recording, conflating "the server did not list this account" with
+/// "the server listed it and it has no workspace name" would hide a real
+/// organisation name for as long as the record lasts. Only the second is an
+/// answer — and the first is reachable in practice, since `account_ordering`
+/// is optional and the map shape enumerates through it.
+#[derive(Debug)]
+pub(crate) enum WorkspaceLookup {
+    /// Not present in the response. No conclusion can be drawn.
+    Unlisted,
+    /// Present, with no workspace name — a personal plan.
+    Unnamed,
+    /// Present, under this workspace.
+    Named(String),
 }
 
 fn accounts_check_url() -> String {
@@ -111,9 +137,9 @@ pub(crate) async fn fetch_workspace_name(
     access_token: &str,
     account_id: &str,
     is_fedramp: bool,
-) -> Result<Option<String>> {
+) -> Result<WorkspaceLookup> {
     if account_id.trim().is_empty() {
-        return Ok(None);
+        return Ok(WorkspaceLookup::Unlisted);
     }
     let url = accounts_check_url();
     let response = build_accounts_check_request(client, &url, access_token, account_id, is_fedramp)
@@ -143,8 +169,9 @@ pub(crate) async fn refresh_for_auth_if_needed(
     let Some(account_id) = info.account_id.as_deref() else {
         return Ok(None);
     };
-    if !force && crate::cache::workspace_name_is_known(account_id) {
-        return Ok(crate::cache::get_workspace_name(account_id));
+    if !force && let Some(resolved) = crate::cache::resolved_workspace_name_async(account_id).await
+    {
+        return Ok(resolved);
     }
     let Some(access_token) = auth
         .pointer("/tokens/access_token")
@@ -166,7 +193,15 @@ pub(crate) async fn remember_workspace_name(
     let Some(account_id) = account_id.filter(|value| !value.trim().is_empty()) else {
         return Ok(None);
     };
-    let name = fetch_workspace_name(client, access_token, account_id, is_fedramp).await?;
+    let lookup = fetch_workspace_name(client, access_token, account_id, is_fedramp).await?;
+    // `Unlisted` is not an answer, so it is not recorded — the same reason a
+    // failed request is not. Recording it would hide a real workspace name
+    // until the record expired.
+    let name = match lookup {
+        WorkspaceLookup::Unlisted => return Ok(None),
+        WorkspaceLookup::Unnamed => None,
+        WorkspaceLookup::Named(name) => Some(name),
+    };
     let cache_account_id = account_id.to_string();
     let cache_name = name.clone();
     tokio::task::spawn_blocking(move || {
@@ -259,6 +294,72 @@ mod tests {
             .expect_err("force must bypass the record and fail on the unreachable endpoint");
     }
 
+    /// An account the response does not mention is not an account confirmed to
+    /// have no workspace name. Recording the first as if it were the second
+    /// hides a real organisation name until the record expires.
+    #[test]
+    fn an_account_missing_from_the_response_is_not_a_confirmed_absence() {
+        let response: AccountsCheckResponse = serde_json::from_value(serde_json::json!({
+            "accounts": [{"id": "acct-other", "name": "Someone Else", "structure": "workspace"}],
+            "account_ordering": ["acct-other"]
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            response.workspace_name_for("acct-mine"),
+            WorkspaceLookup::Unlisted
+        ));
+    }
+
+    /// The map shape enumerates through `account_ordering`, which is optional.
+    /// Without it nothing is listed at all — which must read as "no answer",
+    /// not as "every account confirmed to have no name".
+    #[test]
+    fn a_map_response_without_ordering_yields_no_answer_rather_than_an_absence() {
+        let response: AccountsCheckResponse = serde_json::from_value(serde_json::json!({
+            "accounts": {
+                "acct-team": {"account": {"account_id": "acct-team", "name": "Platform", "structure": "workspace"}}
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            response.workspace_name_for("acct-team"),
+            WorkspaceLookup::Unlisted
+        ));
+    }
+
+    /// The case that *is* an answer: listed, and genuinely has no name.
+    #[test]
+    fn a_listed_account_without_a_name_is_a_confirmed_absence() {
+        let response: AccountsCheckResponse = serde_json::from_value(serde_json::json!({
+            "accounts": [{"id": "acct-personal", "name": null, "structure": "personal"}],
+            "account_ordering": ["acct-personal"]
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            response.workspace_name_for("acct-personal"),
+            WorkspaceLookup::Unnamed
+        ));
+    }
+
+    /// A name that is only whitespace carries no more information than none at
+    /// all, and the display path would render it as an empty workspace.
+    #[test]
+    fn a_blank_name_counts_as_no_name_rather_than_a_workspace_called_nothing() {
+        let response: AccountsCheckResponse = serde_json::from_value(serde_json::json!({
+            "accounts": [{"id": "acct", "name": "   ", "structure": "workspace"}],
+            "account_ordering": ["acct"]
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            response.workspace_name_for("acct"),
+            WorkspaceLookup::Unnamed
+        ));
+    }
+
     #[test]
     fn parses_codex_api_list_shape() {
         let response: AccountsCheckResponse = serde_json::from_value(serde_json::json!({
@@ -300,10 +401,10 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(
-            response.workspace_name_for("acct-team").as_deref(),
-            Some("Platform Team")
-        );
+        assert!(matches!(
+            response.workspace_name_for("acct-team"),
+            WorkspaceLookup::Named(name) if name == "Platform Team"
+        ));
     }
 
     #[test]

@@ -1677,6 +1677,50 @@ async fn an_explicit_force_still_re_presents_a_rejected_credential() {
     server.shutdown();
 }
 
+/// The other half of the same split, and the half with no user watching it:
+/// an unattended refresh still has to ignore the usage TTL. The daemon decides
+/// whether to switch accounts on these numbers, so serving it a cached figure
+/// would have it act on quota that may be hours old.
+#[tokio::test]
+async fn an_unattended_refresh_still_ignores_a_fresh_usage_cache() {
+    let _lock = ENV_LOCK.lock().await;
+    let access = jwt_expiring_in(7_200);
+    let server =
+        MockServer::start(vec![(access.clone(), vec![usage_ok()])], vec![rotation(1)]).await;
+    let fx = fixture(&server, "warm", &access);
+
+    codex_switch::usage::fetch_usage_retried("warm", &fx.profile_path, "warm")
+        .await
+        .expect("the first read populates the cache");
+    assert_eq!(
+        server.usage_calls().len(),
+        1,
+        "the first read must reach the usage API, saw {:?}",
+        server.usage_calls()
+    );
+
+    codex_switch::usage::fetch_usage_retried("warm", &fx.profile_path, "warm")
+        .await
+        .expect("a cached read succeeds");
+    assert_eq!(
+        server.usage_calls().len(),
+        1,
+        "an ordinary read must be served from cache, saw {:?}",
+        server.usage_calls()
+    );
+
+    codex_switch::usage::fetch_usage_retried_unattended("warm", &fx.profile_path, "warm")
+        .await
+        .expect("an unattended refresh succeeds");
+    assert_eq!(
+        server.usage_calls().len(),
+        2,
+        "an unattended refresh must fetch current numbers, saw {:?}",
+        server.usage_calls()
+    );
+    server.shutdown();
+}
+
 /// `invalid_grant` is standard OAuth wording, emitted by assorted servers and
 /// intermediaries for conditions that are not "this token is spent" — clock
 /// skew among them. Stopping the retry loop on it is right; remembering it
