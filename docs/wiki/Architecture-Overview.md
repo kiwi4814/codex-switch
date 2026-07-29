@@ -53,7 +53,7 @@ The [`src/usage/`](https://github.com/xjoker/codex-switch/tree/dev/src/usage) mo
 | `scoring.rs` | Pure eligibility, pace, and candidate scoring functions |
 | `mod.rs` | Shared domain types and public module surface |
 
-[`src/cache.rs`](https://github.com/xjoker/codex-switch/blob/dev/src/cache.rs) persists usage and workspace-name data. Cache file updates use an in-process mutex and a cross-process file lock, then replace the file atomically.
+[`src/cache.rs`](https://github.com/xjoker/codex-switch/blob/dev/src/cache.rs) persists usage and workspace-name data. It also records two negative results, so a known answer is not requested again on every invocation: credentials the auth server has permanently refused, kept until the credential itself is replaced, and accounts confirmed to have no workspace name, kept for a day. `--force` bypasses both, and is the only thing that does: the daemon's periodic refresh takes current usage numbers but leaves a recorded refusal standing, since re-presenting a spent credential on a timer cannot produce a different answer. Cache file updates use an in-process mutex and a cross-process file lock, then replace the file atomically.
 
 Selection has two phases. Eligibility excludes candidates with missing authoritative quota data, exhausted windows, critical weekly state with a distant reset, or an unsafe Free-plan balance. Scoring then combines tier preference, pace-aware headroom, weekly sustainability, expiring quota value, and recency. The shared scoring path is used by both interactive commands and the daemon.
 
@@ -88,7 +88,7 @@ PID-file cleanup verifies lock ownership before removal. Removing a path while a
 | `$CODEX_SWITCH_HOME/profiles/<alias>/auth.json` | Saved account credentials |
 | `$CODEX_SWITCH_HOME/current` | Current alias marker |
 | `$CODEX_SWITCH_HOME/deleted-profiles/` | Recoverable profile archives |
-| `$CODEX_SWITCH_HOME/cache.json` | Usage and workspace metadata cache |
+| `$CODEX_SWITCH_HOME/cache.json` | Usage, workspace metadata, and rejected-credential cache |
 | `$CODEX_SWITCH_HOME/config.toml` | Application configuration |
 | `$CODEX_SWITCH_HOME/daemon-state.json` | Daemon status and pending-switch snapshot |
 | `$CODEX_SWITCH_HOME/logs/` | Rotated diagnostic logs |

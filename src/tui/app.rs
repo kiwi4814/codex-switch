@@ -1011,7 +1011,7 @@ impl App {
                 .info
                 .account_id
                 .as_deref()
-                .is_some_and(|id| crate::cache::get_workspace_name(id).is_none());
+                .is_some_and(|id| !crate::cache::workspace_name_is_known(id));
         if !needs_usage && !needs_workspace {
             return;
         }

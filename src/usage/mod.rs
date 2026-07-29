@@ -9,7 +9,8 @@ mod scoring;
 
 pub(crate) use api::{apply_account_routing_headers, do_refresh_token};
 pub use api::{
-    fetch_usage_retried, fetch_usage_retried_force, refresh_expiring_tokens, validate_import_auth,
+    fetch_usage_retried, fetch_usage_retried_force, fetch_usage_retried_unattended,
+    refresh_expiring_tokens, validate_import_auth,
 };
 // Re-exported for the lib target's public API (used by integration tests via
 // `codex_switch::usage::X`); the binary target doesn't call these through this
@@ -218,6 +219,35 @@ pub const MIN_WARMUP_ELAPSED_SECS: i64 = 5 * 60;
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// How much of the cache a usage fetch may skip.
+///
+/// One boolean used to cover two unrelated requests: wanting numbers that are
+/// not stale, and wanting a verdict the auth server has already given to be
+/// asked again. Only a person can mean the second — an unattended timer that
+/// re-presents a spent credential every polling interval learns nothing and
+/// pays for the rejection every time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    /// Serve a fresh cache entry as-is. Everyday reads.
+    Cached,
+    /// Ignore the usage TTL, but honour a recorded auth verdict. What a timer
+    /// with nobody watching wants.
+    Unattended,
+    /// Ignore both. Reserved for a person explicitly asking again, and the only
+    /// way back from a verdict recorded in error.
+    Forced,
+}
+
+impl Refresh {
+    pub(super) fn skips_usage_cache(self) -> bool {
+        !matches!(self, Refresh::Cached)
+    }
+
+    pub(super) fn may_re_present_a_rejected_credential(self) -> bool {
+        matches!(self, Refresh::Forced)
+    }
+}
 
 pub struct RefreshedTokens {
     pub id_token: String,

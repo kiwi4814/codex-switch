@@ -1365,3 +1365,343 @@ async fn concurrent_rotation_recovery_is_granted_at_most_once() {
     );
     server.shutdown();
 }
+
+// ── remembering a verdict the server already gave ────────────────────────
+//
+// Stopping the retry loop bounds the cost of a dead credential *within* one
+// invocation. It does nothing across invocations: `list` and every TUI refresh
+// re-present the same consumed token and wait for the same rejection, which on
+// a slow path to the auth server is where the wall clock actually goes.
+
+/// Drive one fetch against a token endpoint that answers `code`, then a second
+/// fetch with everything unchanged. Returns `(first error, second error)` and
+/// the mock, so callers can assert on what crossed the wire in between.
+async fn two_fetches_against_rejected_credential(
+    alias: &'static str,
+    status: StatusCode,
+    code: &str,
+) -> (
+    MockServer,
+    codex_switch::usage::UsageError,
+    codex_switch::usage::UsageError,
+    Fixture,
+) {
+    let stale_access = expired_jwt();
+    let server = MockServer::start(
+        vec![(
+            stale_access.clone(),
+            vec![reply(
+                StatusCode::UNAUTHORIZED,
+                json!({"detail": "expired"}),
+            )],
+        )],
+        vec![reply(
+            status,
+            json!({
+                "error": {
+                    "code": code,
+                    "message": "Please try signing in again.",
+                    "param": null,
+                    "type": "invalid_request_error",
+                }
+            }),
+        )],
+    )
+    .await;
+    let fx = fixture(&server, alias, &stale_access);
+
+    let first = codex_switch::usage::fetch_usage_retried(alias, &fx.profile_path, alias)
+        .await
+        .expect_err("the auth server rejected the credential");
+    let second = codex_switch::usage::fetch_usage_retried(alias, &fx.profile_path, alias)
+        .await
+        .expect_err("nothing changed, so the account is still unusable");
+
+    (server, first, second, fx)
+}
+
+/// `refresh_token_reused` is the auth server stating the credential is spent.
+/// That verdict cannot change while the profile still holds the same token, so
+/// asking again is pure latency — and on a slow network it is *most* of the
+/// latency a user experiences from `list`.
+#[tokio::test]
+async fn a_reused_verdict_is_not_re_presented_on_the_next_invocation() {
+    let _lock = ENV_LOCK.lock().await;
+    let (server, first, second, _fx) = two_fetches_against_rejected_credential(
+        "dead_reused",
+        StatusCode::UNAUTHORIZED,
+        "refresh_token_reused",
+    )
+    .await;
+
+    assert_eq!(
+        server.token_calls().len(),
+        1,
+        "the second invocation must reuse the recorded verdict, saw {:?}",
+        server.token_calls()
+    );
+    assert_eq!(
+        server.usage_calls().len(),
+        1,
+        "a credential the server already rejected must not reach the usage API again, saw {:?}",
+        server.usage_calls()
+    );
+    assert_eq!(
+        second.summary, first.summary,
+        "the cached verdict must render exactly like the live one"
+    );
+    assert!(
+        second.summary.contains("refresh_token_reused"),
+        "the cached verdict must still name the server's reason: {}",
+        second.summary
+    );
+    server.shutdown();
+}
+
+/// The other verdict seen in production. It is equally terminal, so it has to
+/// be recognised by code rather than inferred from the 4xx status alone —
+/// status-only classification cannot distinguish it from a proxy's 403.
+#[tokio::test]
+async fn a_session_ended_verdict_is_not_re_presented_on_the_next_invocation() {
+    let _lock = ENV_LOCK.lock().await;
+    let (server, _first, second, _fx) = two_fetches_against_rejected_credential(
+        "dead_invalidated",
+        StatusCode::UNAUTHORIZED,
+        "refresh_token_invalidated",
+    )
+    .await;
+
+    assert_eq!(
+        server.token_calls().len(),
+        1,
+        "`refresh_token_invalidated` is as final as a reuse verdict, saw {:?}",
+        server.token_calls()
+    );
+    assert!(
+        second.summary.contains("refresh_token_invalidated"),
+        "the cached verdict must still name the server's reason: {}",
+        second.summary
+    );
+    server.shutdown();
+}
+
+/// Guard on the opposite side: only a verdict the auth server *named* may be
+/// remembered. A bare 4xx can come from a corporate proxy, a WAF, or a captive
+/// portal sitting in front of the real endpoint; remembering one of those would
+/// mark a perfectly good account dead until the user found `--force`.
+#[tokio::test]
+async fn an_unnamed_client_error_is_still_re_presented_on_the_next_invocation() {
+    let _lock = ENV_LOCK.lock().await;
+    let (server, _first, _second, _fx) = two_fetches_against_rejected_credential(
+        "maybe_proxy",
+        StatusCode::FORBIDDEN,
+        "some_gateway_verdict",
+    )
+    .await;
+
+    assert_eq!(
+        server.token_calls().len(),
+        2,
+        "an unrecognised 4xx is not proof the credential is dead; it must be retried, saw {:?}",
+        server.token_calls()
+    );
+    server.shutdown();
+}
+
+/// The recorded verdict belongs to a *credential*, not to an alias. Signing in
+/// again replaces the refresh token, and that alone has to clear the record —
+/// binding it to the alias would need every write path (login, import, live
+/// re-sync, daemon) to remember to clear it, and the one that forgets leaves
+/// the user staring at "re-login required" after having just logged in.
+#[tokio::test]
+async fn signing_in_again_clears_the_recorded_verdict() {
+    let _lock = ENV_LOCK.lock().await;
+    let stale_access = expired_jwt();
+    let fresh_access = jwt_expiring_in(3_600);
+    let server = MockServer::start(
+        vec![
+            (
+                stale_access.clone(),
+                vec![reply(
+                    StatusCode::UNAUTHORIZED,
+                    json!({"detail": "expired"}),
+                )],
+            ),
+            (fresh_access.clone(), vec![usage_ok()]),
+        ],
+        vec![reused_refresh_reply()],
+    )
+    .await;
+    let fx = fixture(&server, "revived", &stale_access);
+
+    codex_switch::usage::fetch_usage_retried("revived", &fx.profile_path, "revived")
+        .await
+        .expect_err("the first credential is spent");
+
+    // What `login` / `import` leave behind: a different refresh token.
+    write_auth_file(&fx.profile_path, "new_id", &fresh_access, "refresh_new");
+
+    let usage = codex_switch::usage::fetch_usage_retried("revived", &fx.profile_path, "revived")
+        .await
+        .expect("a freshly signed-in profile must be fetched, not written off");
+
+    assert!(
+        usage.primary.is_some(),
+        "the revived profile must report real usage"
+    );
+    server.shutdown();
+}
+
+/// The tail the user actually sees: `list` prints its final screen and then
+/// blocks, because opportunistic refresh picks candidates purely by expiry and
+/// re-presents the very tokens the fetch above just had rejected.
+#[tokio::test]
+async fn opportunistic_refresh_skips_a_credential_the_server_already_rejected() {
+    let _lock = ENV_LOCK.lock().await;
+    let stale_access = expired_jwt();
+    let server = MockServer::start_with(
+        vec![(
+            stale_access.clone(),
+            vec![reply(
+                StatusCode::UNAUTHORIZED,
+                json!({"detail": "expired"}),
+            )],
+        )],
+        Vec::new(),
+        HashMap::from([("refresh_old".to_string(), reused_refresh_reply())]),
+    )
+    .await;
+    let fx = fixture(&server, "dead_tail", &stale_access);
+
+    codex_switch::usage::fetch_usage_retried("dead_tail", &fx.profile_path, "dead_tail")
+        .await
+        .expect_err("the credential is spent");
+    let after_fetch = server.token_calls().len();
+
+    let failures = codex_switch::usage::refresh_expiring_tokens().await;
+
+    assert!(
+        failures.is_empty(),
+        "skipping a dead credential is not a persist failure: {failures:?}"
+    );
+    assert_eq!(
+        server.token_calls().len(),
+        after_fetch,
+        "a credential the server already rejected must not be refreshed in the \
+         background either, saw {:?}",
+        server.token_calls()
+    );
+    server.shutdown();
+}
+
+// ── who is allowed to ask again ──────────────────────────────────────────
+//
+// "Ignore the cache" turned out to be two different requests wearing one
+// boolean: wanting numbers that are not stale, and wanting a verdict the auth
+// server already gave to be re-litigated. Only a person can mean the second.
+
+/// Set up a profile whose credential the server has already rejected, and
+/// return the mock plus the call count at that point.
+async fn profile_with_a_recorded_verdict(alias: &'static str) -> (MockServer, Fixture, usize) {
+    let stale_access = expired_jwt();
+    let server = MockServer::start(
+        vec![(
+            stale_access.clone(),
+            vec![reply(
+                StatusCode::UNAUTHORIZED,
+                json!({"detail": "expired"}),
+            )],
+        )],
+        vec![reused_refresh_reply()],
+    )
+    .await;
+    let fx = fixture(&server, alias, &stale_access);
+
+    codex_switch::usage::fetch_usage_retried(alias, &fx.profile_path, alias)
+        .await
+        .expect_err("the credential is spent");
+    let calls = server.token_calls().len();
+
+    (server, fx, calls)
+}
+
+/// The daemon polls on a timer and wants numbers that are not stale. It cannot
+/// want a spent credential re-presented: the answer is known, nobody is
+/// watching, and at a few seconds per rejection this runs every polling
+/// interval for as long as the daemon is up.
+#[tokio::test]
+async fn an_unattended_refresh_does_not_re_present_a_rejected_credential() {
+    let _lock = ENV_LOCK.lock().await;
+    let (server, fx, after_first) = profile_with_a_recorded_verdict("daemon_dead").await;
+
+    let err = codex_switch::usage::fetch_usage_retried_unattended(
+        "daemon_dead",
+        &fx.profile_path,
+        "daemon_dead",
+    )
+    .await
+    .expect_err("the account is still unusable");
+
+    assert_eq!(
+        server.token_calls().len(),
+        after_first,
+        "an unattended refresh must honour a verdict already on record, saw {:?}",
+        server.token_calls()
+    );
+    assert!(
+        err.summary.contains("re-login required"),
+        "it must still report why the account is unusable: {}",
+        err.summary
+    );
+    server.shutdown();
+}
+
+/// The other side of that split: `--force` is a person saying "ask anyway", and
+/// it has to keep reaching the server or there is no way back from a verdict
+/// recorded in error.
+#[tokio::test]
+async fn an_explicit_force_still_re_presents_a_rejected_credential() {
+    let _lock = ENV_LOCK.lock().await;
+    let (server, fx, after_first) = profile_with_a_recorded_verdict("forced_dead").await;
+
+    codex_switch::usage::fetch_usage_retried_force("forced_dead", &fx.profile_path, "forced_dead")
+        .await
+        .expect_err("the credential really is spent");
+
+    assert_eq!(
+        server.token_calls().len(),
+        after_first + 1,
+        "force is the escape hatch and must reach the server, saw {:?}",
+        server.token_calls()
+    );
+    server.shutdown();
+}
+
+/// `invalid_grant` is standard OAuth wording, emitted by assorted servers and
+/// intermediaries for conditions that are not "this token is spent" — clock
+/// skew among them. Stopping the retry loop on it is right; remembering it
+/// until the next sign-in is not, because a transient cause would strand a
+/// working account behind a message telling the user to log in again.
+#[tokio::test]
+async fn a_generic_oauth_rejection_is_not_remembered_across_invocations() {
+    let _lock = ENV_LOCK.lock().await;
+    let (server, first, _second, _fx) = two_fetches_against_rejected_credential(
+        "generic_reject",
+        StatusCode::UNAUTHORIZED,
+        "invalid_grant",
+    )
+    .await;
+
+    assert_eq!(
+        server.token_calls().len(),
+        2,
+        "only verdicts naming a spent credential may outlive the invocation, saw {:?}",
+        server.token_calls()
+    );
+    assert!(
+        first.summary.contains("re-login required"),
+        "it must still stop the retry loop and say so within the call: {}",
+        first.summary
+    );
+    server.shutdown();
+}

@@ -111,7 +111,7 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
                 .info
                 .account_id
                 .as_deref()
-                .is_some_and(|id| cache::get_workspace_name(id).is_none());
+                .is_some_and(|id| !cache::workspace_name_is_known(id));
         if !needs_usage && !needs_workspace {
             continue;
         }

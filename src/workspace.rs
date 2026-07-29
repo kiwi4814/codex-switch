@@ -143,8 +143,8 @@ pub(crate) async fn refresh_for_auth_if_needed(
     let Some(account_id) = info.account_id.as_deref() else {
         return Ok(None);
     };
-    if !force && let Some(name) = crate::cache::get_workspace_name(account_id) {
-        return Ok(Some(name));
+    if !force && crate::cache::workspace_name_is_known(account_id) {
+        return Ok(crate::cache::get_workspace_name(account_id));
     }
     let Some(access_token) = auth
         .pointer("/tokens/access_token")
@@ -180,6 +180,84 @@ pub(crate) async fn remember_workspace_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Nothing listens on this port, so any lookup that actually goes out fails
+    /// loudly. Reaching `Ok` is therefore proof the answer came from cache.
+    const UNREACHABLE_ACCOUNTS_CHECK: &str = "http://127.0.0.1:1/";
+
+    /// `CODEX_SWITCH_HOME` is process-global and mutated by other test modules
+    /// under `profile::TEST_ENV_LOCK`; take it for the whole body. Holding it
+    /// across `.await` is safe under `#[tokio::test]`'s current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_confirmed_absence_is_answered_without_another_request() {
+        let _env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+        let _url = EnvVarGuard::set("CS_ACCOUNTS_CHECK_URL", UNREACHABLE_ACCOUNTS_CHECK);
+
+        // Exactly what a successful lookup against a personal plan records.
+        crate::cache::set_workspace_name("acct-personal", None).unwrap();
+
+        let auth = serde_json::json!({
+            "tokens": {"account_id": "acct-personal", "access_token": "at", "id_token": ""}
+        });
+
+        let name = refresh_for_auth_if_needed(&auth, false)
+            .await
+            .expect("a recorded absence must be answered from cache, not re-requested");
+
+        assert!(name.is_none(), "the account still has no workspace name");
+    }
+
+    /// The other half of the contract: `--force` is the escape hatch, so it has
+    /// to reach the network even when an absence is on record.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn force_still_asks_the_server_despite_a_recorded_absence() {
+        let _env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+        let _url = EnvVarGuard::set("CS_ACCOUNTS_CHECK_URL", UNREACHABLE_ACCOUNTS_CHECK);
+
+        crate::cache::set_workspace_name("acct-personal", None).unwrap();
+
+        let auth = serde_json::json!({
+            "tokens": {"account_id": "acct-personal", "access_token": "at", "id_token": ""}
+        });
+
+        refresh_for_auth_if_needed(&auth, true)
+            .await
+            .expect_err("force must bypass the record and fail on the unreachable endpoint");
+    }
 
     #[test]
     fn parses_codex_api_list_shape() {

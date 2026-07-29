@@ -171,7 +171,7 @@ async fn check_and_switch() -> Result<PollOutcome> {
 
     // 1. Force-fetch current account's usage (bypass cache)
     let current_path = profile::profile_auth_path(&current)?;
-    let current_usage = usage::fetch_usage_retried_force(&current, &current_path, &current)
+    let current_usage = usage::fetch_usage_retried_unattended(&current, &current_path, &current)
         .await
         .map_err(|e| anyhow::anyhow!("{}", e.detail))?;
 
@@ -346,7 +346,7 @@ async fn refresh_profile_cache(auto_warmup: bool) -> Result<CacheRefreshSummary>
                 Err(e) => return (alias, false, false, Some(e.to_string())),
             };
 
-            let usage = match usage::fetch_usage_retried_force(&alias, &path, &current).await {
+            let usage = match usage::fetch_usage_retried_unattended(&alias, &path, &current).await {
                 Ok(usage) => usage,
                 Err(e) => return (alias, false, false, Some(e.summary)),
             };
@@ -359,7 +359,7 @@ async fn refresh_profile_cache(auto_warmup: bool) -> Result<CacheRefreshSummary>
                 return (alias, true, false, Some(format!("warmup failed: {e}")));
             }
 
-            if let Err(e) = usage::fetch_usage_retried_force(&alias, &path, &current).await {
+            if let Err(e) = usage::fetch_usage_retried_unattended(&alias, &path, &current).await {
                 tracing::warn!("[{alias}] post-warmup cache refresh failed: {}", e.summary);
             }
             (alias, true, true, None)

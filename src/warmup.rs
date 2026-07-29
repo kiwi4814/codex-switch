@@ -509,7 +509,8 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
         Some(usage) => Some(usage),
         None => {
             let current = crate::profile::read_current();
-            match crate::usage::fetch_usage_retried_force(alias, profile_path, &current).await {
+            match crate::usage::fetch_usage_retried_unattended(alias, profile_path, &current).await
+            {
                 Ok(usage) => Some(usage),
                 Err(error) => {
                     warn!(

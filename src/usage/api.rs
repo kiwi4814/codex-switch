@@ -10,7 +10,7 @@ use crate::auth::{self, CLIENT_ID, format_reqwest_error};
 use super::parse::parse_usage_checked;
 use super::reset_credits::enrich_reset_credits;
 use super::{
-    ImportValidation, MAX_RETRIES, RETRY_DELAY, RefreshedTokens, TerminalAuthError,
+    ImportValidation, MAX_RETRIES, RETRY_DELAY, Refresh, RefreshedTokens, TerminalAuthError,
     TokenPersistFailure, UsageError, UsageFetchOutcome, UsageInfo,
 };
 
@@ -76,11 +76,33 @@ impl RefreshResponse {
 /// Auth-server verdicts no retry can change, independent of HTTP status.
 const TERMINAL_AUTH_CODES: &[&str] = &[
     "refresh_token_reused",
+    "refresh_token_invalidated",
     "invalid_grant",
     "invalid_client",
     "unauthorized_client",
     "access_denied",
 ];
+
+/// The subset of [`TERMINAL_AUTH_CODES`] that may outlive the invocation.
+///
+/// Both are OpenAI-specific and say one unambiguous thing: *this* credential is
+/// gone, and only signing in again produces another. Everything else in
+/// `TERMINAL_AUTH_CODES` is standard OAuth wording that assorted servers and
+/// intermediaries also emit for transient conditions — `invalid_grant` for
+/// clock skew, `access_denied` from a gateway — and a bare 4xx can as easily be
+/// a proxy, a WAF, or a captive portal in front of the real endpoint.
+///
+/// Guessing wrong in this direction is expensive: a recorded verdict survives
+/// until the next sign-in, so a transient cause would leave a working account
+/// showing "re-login required" with nothing to suggest that `--force` clears
+/// it. Guessing wrong the other way costs one round trip. So only these two are
+/// remembered; every code in `TERMINAL_AUTH_CODES` still stops the retry loop
+/// within the call it happened in.
+const MEMORABLE_AUTH_CODES: &[&str] = &["refresh_token_reused", "refresh_token_invalidated"];
+
+fn is_memorable_auth_verdict(code: &str) -> bool {
+    MEMORABLE_AUTH_CODES.contains(&code)
+}
 
 /// A 4xx from the token endpoint means the credential itself was rejected, so
 /// replaying it only re-triggers reuse detection. 429/408 are load/timing
@@ -93,6 +115,25 @@ fn is_terminal_auth_failure(code: &str, status: reqwest::StatusCode) -> bool {
         return false;
     }
     TERMINAL_AUTH_CODES.contains(&code) || status.is_client_error()
+}
+
+/// Record a verdict against the credential that earned it.
+///
+/// Keyed by the token rather than the alias so that signing in again clears it
+/// without every credential-writing path having to remember to.
+async fn remember_terminal_verdict(
+    alias: &str,
+    code: &str,
+    refresh_token: Option<&str>,
+    error: &UsageError,
+) {
+    if !is_memorable_auth_verdict(code) {
+        return;
+    }
+    let Some(refresh_token) = refresh_token else {
+        return;
+    };
+    crate::cache::put_auth_failure_async(alias, refresh_token, error).await;
 }
 
 fn format_refresh_error(code: &str, message: Option<&str>) -> String {
@@ -136,22 +177,32 @@ pub(super) fn extract_error_summary(err: &str) -> String {
 }
 
 /// High-level: fetch usage with retry, token refresh, and disk cache.
-/// Set `force` to true to bypass cache (e.g., manual refresh).
 pub async fn fetch_usage_retried(
     alias: &str,
     profile_path: &Path,
     current_alias: &str,
 ) -> std::result::Result<UsageInfo, UsageError> {
-    fetch_usage_retried_inner(alias, profile_path, current_alias, false).await
+    fetch_usage_retried_inner(alias, profile_path, current_alias, Refresh::Cached).await
 }
 
-/// Same as `fetch_usage_retried` but with explicit force flag.
+/// Bypass the usage TTL for current numbers, but leave a recorded auth verdict
+/// standing. For callers running on a timer with nobody watching.
+pub async fn fetch_usage_retried_unattended(
+    alias: &str,
+    profile_path: &Path,
+    current_alias: &str,
+) -> std::result::Result<UsageInfo, UsageError> {
+    fetch_usage_retried_inner(alias, profile_path, current_alias, Refresh::Unattended).await
+}
+
+/// Bypass every cache, including a recorded auth verdict. Only for a person
+/// explicitly asking again — see [`Refresh::Forced`].
 pub async fn fetch_usage_retried_force(
     alias: &str,
     profile_path: &Path,
     current_alias: &str,
 ) -> std::result::Result<UsageInfo, UsageError> {
-    fetch_usage_retried_inner(alias, profile_path, current_alias, true).await
+    fetch_usage_retried_inner(alias, profile_path, current_alias, Refresh::Forced).await
 }
 
 /// Write credentials the auth server just rotated back to the profile.
@@ -266,16 +317,16 @@ async fn fetch_usage_retried_inner(
     alias: &str,
     profile_path: &Path,
     _current_alias: &str,
-    force: bool,
+    refresh: Refresh,
 ) -> std::result::Result<UsageInfo, UsageError> {
-    if !force {
+    if !refresh.skips_usage_cache() {
         if let Some(cached) = crate::cache::get_async(alias).await {
             debug!("{alias}: cache hit");
             return Ok(cached);
         }
         debug!("{alias}: cache miss, fetching from API");
     } else {
-        debug!("{alias}: force refresh, bypassing cache");
+        debug!("{alias}: {refresh:?} refresh, bypassing the usage cache");
     }
 
     let val = auth::read_auth(profile_path).map_err(|e| {
@@ -291,6 +342,17 @@ async fn fetch_usage_retried_inner(
     let mut id_token = auth::extract_id_token(&val);
     let (access_token, refresh_token) = auth::extract_tokens(&val);
     let mut refresh_token = refresh_token;
+
+    // A verdict the auth server already named stands until the credential is
+    // replaced, so re-presenting it buys nothing but the round trip. Only an
+    // explicit user force skips this — see [`Refresh`].
+    if !refresh.may_re_present_a_rejected_credential()
+        && let Some(rt) = refresh_token.as_deref()
+        && let Some(known) = crate::cache::get_auth_failure_async(alias, rt).await
+    {
+        debug!("{alias}: credential already rejected by the auth server, not retrying");
+        return Err(known);
+    }
 
     let mut at = match access_token {
         Some(t) => t,
@@ -310,7 +372,9 @@ async fn fetch_usage_retried_inner(
     // re-arming on the other's write would otherwise keep this loop alive
     // without either ever reporting a result.
     let mut recovery_round_used = false;
-    let mut pending_terminal: Option<UsageError> = None;
+    // Carries the server's error code alongside the error so the verdict can be
+    // recorded if the recovery round confirms it.
+    let mut pending_terminal: Option<(UsageError, String)> = None;
     let mut max_attempts = MAX_RETRIES;
     let mut attempt = 0;
     while attempt < max_attempts {
@@ -323,9 +387,12 @@ async fn fetch_usage_retried_inner(
         // only once the server has issued it, which is already when our replay
         // starts being refused — reading the profile the instant the rejection
         // arrives can still find the old token and mislabel a healthy account.
-        if let Some(terminal) = pending_terminal.take() {
+        if let Some((terminal, code)) = pending_terminal.take() {
             let Some(stored) = reload_rotated_credentials(profile_path, refresh_token.as_deref())
             else {
+                // Nothing else rotated the credential, so the rejection was
+                // about the token this profile still holds — final.
+                remember_terminal_verdict(alias, &code, refresh_token.as_deref(), &terminal).await;
                 return Err(terminal);
             };
             info!(
@@ -379,7 +446,10 @@ async fn fetch_usage_retried_inner(
                         summary: terminal.summary(),
                         detail: msg,
                     };
+                    let code = terminal.code.clone();
                     if recovery_round_used {
+                        remember_terminal_verdict(alias, &code, refresh_token.as_deref(), &error)
+                            .await;
                         return Err(error);
                     }
                     recovery_round_used = true;
@@ -387,7 +457,7 @@ async fn fetch_usage_retried_inner(
                     // so a rejection arriving on the final attempt is still
                     // checked against the profile before the account is failed.
                     max_attempts += 1;
-                    pending_terminal = Some(error);
+                    pending_terminal = Some((error, code));
                     attempt += 1;
                     continue;
                 }
@@ -823,6 +893,14 @@ pub async fn refresh_expiring_tokens_within(
         let id_token = auth::extract_id_token(&val);
         let Some(at) = access_token else { continue };
         let Some(rt) = refresh_token else { continue };
+        // Expiry alone says nothing about whether the credential can still be
+        // rotated. Without this, every dead profile is refreshed again here —
+        // after `list` has already printed its final screen, so the user waits
+        // on a request whose answer is known and not even displayed.
+        if crate::cache::get_auth_failure(alias, &rt).is_some() {
+            debug!("[{alias}] skipping opportunistic refresh: credential already rejected");
+            continue;
+        }
         let expiry = [
             crate::jwt::token_expires_at(&at),
             id_token.as_deref().and_then(crate::jwt::token_expires_at),

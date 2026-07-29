@@ -16,7 +16,7 @@ Start with the complete error message, its file path, and the command that produ
 | A dev build should return to stable | Run `codex-switch self-update --stable`. |
 | An installed daemon ignores `CODEX_SWITCH_HOME` | The generated service forwards only `HOME` and `CODEX_HOME`; add `CODEX_SWITCH_HOME` to the service definition manually. See [Configuration](Configuration#platform-integration). |
 | HTTPS fails with `invalid peer certificate: UnknownIssuer` | An intercepting proxy is re-signing traffic. See [HTTPS fails with an unknown issuer](#https-fails-with-invalid-peer-certificate-unknownissuer). |
-| An account reports `re-login required (refresh_token_reused)` | The stored refresh token was already spent and cannot be recovered. Run `codex-switch login <alias>` for that profile. |
+| An account reports `re-login required (refresh_token_reused)` | The stored refresh token was already spent and cannot be recovered. Run `codex-switch login <alias>` for that profile. The verdict is remembered, so the account costs no further requests until you sign in again; `codex-switch list -f` asks the server anyway. |
 
 For network or API failures, rerun the smallest failing command with `--debug`:
 

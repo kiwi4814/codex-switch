@@ -8,7 +8,15 @@ use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
-use crate::usage::{ResetCredit, UsageInfo};
+use crate::usage::{ResetCredit, UsageError, UsageInfo};
+
+/// How long a confirmed "this account has no workspace name" is trusted.
+///
+/// Bounded rather than permanent because, unlike a spent credential, this can
+/// change without us: an account added to an organisation gains a name and
+/// nothing announces it. A day removes the per-invocation request while keeping
+/// the new name at most a day away — `--force` shows it immediately.
+const WORKSPACE_ABSENCE_TTL: u64 = 24 * 60 * 60;
 
 static CACHE_LOCK: Mutex<()> = Mutex::new(());
 const CACHE_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -47,6 +55,25 @@ struct CacheEntry {
     additional_limits: Vec<crate::usage::AdditionalRateLimit>,
 }
 
+/// A refusal the auth server will repeat for as long as the profile keeps the
+/// credential it refused.
+///
+/// Unlike [`CacheEntry`] this carries no TTL. It is not a stale-data trade-off:
+/// the server named a specific credential as spent, and that verdict can only
+/// be undone by replacing the credential — which `credential` detects on its
+/// own. Expiring the record on a timer would buy nothing but a periodic round
+/// trip whose answer is already known.
+#[derive(Serialize, Deserialize)]
+struct AuthFailureEntry {
+    ts: u64,
+    /// Hex SHA-256 of the rejected `refresh_token`. The token itself is never
+    /// stored: this file is not the credential store, and a fingerprint answers
+    /// the only question asked of it — is this still the same credential?
+    credential: String,
+    summary: String,
+    detail: String,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct CacheFile {
     entries: HashMap<String, CacheEntry>,
@@ -56,6 +83,14 @@ struct CacheFile {
     /// Workspace display names keyed by the stable ChatGPT account id.
     #[serde(default)]
     workspace_names: HashMap<String, String>,
+    /// Accounts the server confirmed have no workspace name, and when it said
+    /// so. Absence is an answer — without recording it, every personal plan is
+    /// looked up again on every invocation, forever.
+    #[serde(default)]
+    workspace_names_absent: HashMap<String, u64>,
+    /// Profiles whose credential the auth server has permanently refused.
+    #[serde(default)]
+    auth_failures: HashMap<String, AuthFailureEntry>,
 }
 
 fn cache_path() -> Result<PathBuf> {
@@ -245,6 +280,94 @@ pub fn put(alias: &str, usage: &UsageInfo) {
     }
 }
 
+fn credential_fingerprint(refresh_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(refresh_token.as_bytes()))
+}
+
+fn record_auth_failure(
+    cache: &mut CacheFile,
+    alias: &str,
+    refresh_token: &str,
+    summary: &str,
+    detail: &str,
+) {
+    cache.auth_failures.insert(
+        alias.to_string(),
+        AuthFailureEntry {
+            ts: now_secs(),
+            credential: credential_fingerprint(refresh_token),
+            summary: summary.to_string(),
+            detail: detail.to_string(),
+        },
+    );
+}
+
+fn auth_failure_for<'a>(
+    cache: &'a CacheFile,
+    alias: &str,
+    refresh_token: &str,
+) -> Option<&'a AuthFailureEntry> {
+    let entry = cache.auth_failures.get(alias)?;
+    (entry.credential == credential_fingerprint(refresh_token)).then_some(entry)
+}
+
+/// Move every record keyed by `old` over to `new`. Returns whether anything moved.
+fn migrate_alias(cache: &mut CacheFile, old: &str, new: &str) -> bool {
+    // Each map may hold `old` without the others — a profile can have been used
+    // but never fetched, or refused before it was ever selected.
+    let mut changed = false;
+    if let Some(entry) = cache.entries.remove(old) {
+        cache.entries.insert(new.to_string(), entry);
+        changed = true;
+    }
+    if let Some(ts) = cache.last_used.remove(old) {
+        cache.last_used.insert(new.to_string(), ts);
+        changed = true;
+    }
+    if let Some(failure) = cache.auth_failures.remove(old) {
+        cache.auth_failures.insert(new.to_string(), failure);
+        changed = true;
+    }
+    changed
+}
+
+/// The auth server's standing refusal for `alias`, if it still concerns the
+/// credential the profile currently holds.
+pub fn get_auth_failure(alias: &str, refresh_token: &str) -> Option<UsageError> {
+    match with_cache_lock(|| {
+        Ok(
+            auth_failure_for(&load_cache(), alias, refresh_token).map(|entry| UsageError {
+                summary: entry.summary.clone(),
+                detail: entry.detail.clone(),
+            }),
+        )
+    }) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("Failed to read auth failure for {alias}: {err}");
+            None
+        }
+    }
+}
+
+/// Remember that the auth server refused `refresh_token` for good.
+pub fn put_auth_failure(alias: &str, refresh_token: &str, error: &UsageError) {
+    if let Err(err) = with_cache_lock(|| {
+        let mut cache = load_cache();
+        record_auth_failure(
+            &mut cache,
+            alias,
+            refresh_token,
+            &error.summary,
+            &error.detail,
+        );
+        save_cache(&cache)
+    }) {
+        tracing::warn!("Failed to record auth failure for {alias}: {err}");
+    }
+}
+
 pub fn get_workspace_name(account_id: &str) -> Option<String> {
     match with_cache_lock(|| Ok(load_cache().workspace_names.get(account_id).cloned())) {
         Ok(value) => value,
@@ -273,14 +396,52 @@ pub fn set_workspace_name(account_id: &str, name: Option<&str>) -> Result<()> {
 
 fn update_workspace_name(cache: &mut CacheFile, account_id: &str, name: Option<&str>) -> bool {
     match name {
-        Some(name) if cache.workspace_names.get(account_id).map(String::as_str) != Some(name) => {
+        Some(name) => {
+            // A name that arrived retires any record saying there was none.
+            let cleared = cache.workspace_names_absent.remove(account_id).is_some();
+            if cache.workspace_names.get(account_id).map(String::as_str) == Some(name) {
+                return cleared;
+            }
             cache
                 .workspace_names
                 .insert(account_id.to_string(), name.to_string());
             true
         }
-        None => cache.workspace_names.remove(account_id).is_some(),
-        Some(_) => false,
+        None => {
+            cache.workspace_names.remove(account_id);
+            cache
+                .workspace_names_absent
+                .insert(account_id.to_string(), now_secs());
+            true
+        }
+    }
+}
+
+/// Whether the workspace name for `account_id` has been resolved — to a name,
+/// or to an absence still inside [`WORKSPACE_ABSENCE_TTL`].
+///
+/// This is the question callers must ask before looking one up. Asking
+/// `get_workspace_name(..).is_none()` instead cannot tell "never looked up"
+/// apart from "looked up, and there is none", so every personal plan answered
+/// the second as if it were the first.
+fn workspace_name_resolved(cache: &CacheFile, account_id: &str) -> bool {
+    if cache.workspace_names.contains_key(account_id) {
+        return true;
+    }
+    cache
+        .workspace_names_absent
+        .get(account_id)
+        .is_some_and(|recorded| now_secs().saturating_sub(*recorded) <= WORKSPACE_ABSENCE_TTL)
+}
+
+/// Public form of [`workspace_name_resolved`].
+pub fn workspace_name_is_known(account_id: &str) -> bool {
+    match with_cache_lock(|| Ok(workspace_name_resolved(&load_cache(), account_id))) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("Failed to read cached workspace state: {err}");
+            false
+        }
     }
 }
 
@@ -294,10 +455,16 @@ pub fn apply_workspace_name(info: &mut crate::jwt::AccountInfo) {
 }
 
 /// Remove cached usage for an alias while preserving last-used metadata.
+///
+/// Also drops any standing auth refusal: callers use this to force the next
+/// read back onto the network, and leaving the refusal behind would answer
+/// that read from cache anyway.
 pub fn invalidate(alias: &str) -> Result<()> {
     with_cache_lock(|| {
         let mut cache = load_cache();
-        if cache.entries.remove(alias).is_some() {
+        let dropped_usage = cache.entries.remove(alias).is_some();
+        let dropped_failure = cache.auth_failures.remove(alias).is_some();
+        if dropped_usage || dropped_failure {
             save_cache(&cache).context("writing usage cache invalidation")?;
         }
         Ok(())
@@ -321,6 +488,25 @@ pub async fn put_async(alias: &str, usage: &UsageInfo) {
     let alias = alias.to_string();
     let usage = usage.clone();
     let _ = tokio::task::spawn_blocking(move || put(&alias, &usage)).await;
+}
+
+/// Async wrapper around [`get_auth_failure`]; see [`get_async`] for rationale.
+pub async fn get_auth_failure_async(alias: &str, refresh_token: &str) -> Option<UsageError> {
+    let alias = alias.to_string();
+    let refresh_token = refresh_token.to_string();
+    tokio::task::spawn_blocking(move || get_auth_failure(&alias, &refresh_token))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Async wrapper around [`put_auth_failure`]; see [`get_async`] for rationale.
+pub async fn put_auth_failure_async(alias: &str, refresh_token: &str, error: &UsageError) {
+    let alias = alias.to_string();
+    let refresh_token = refresh_token.to_string();
+    let error = error.clone();
+    let _ =
+        tokio::task::spawn_blocking(move || put_auth_failure(&alias, &refresh_token, &error)).await;
 }
 
 /// Get the last-used timestamp for an alias (0 if never used).
@@ -348,17 +534,7 @@ pub fn set_last_used(alias: &str) -> Result<()> {
 pub fn rename(old: &str, new: &str) -> Result<()> {
     with_cache_lock(|| {
         let mut cache = load_cache();
-        // Migrate entries and last_used independently — either may exist without the other.
-        let mut changed = false;
-        if let Some(entry) = cache.entries.remove(old) {
-            cache.entries.insert(new.to_string(), entry);
-            changed = true;
-        }
-        if let Some(ts) = cache.last_used.remove(old) {
-            cache.last_used.insert(new.to_string(), ts);
-            changed = true;
-        }
-        if changed {
+        if migrate_alias(&mut cache, old, new) {
             save_cache(&cache)?;
         }
         Ok(())
@@ -427,6 +603,103 @@ mod tests {
             restored.additional_limits[0].metered_feature.as_deref(),
             Some("codex_bengalfox")
         );
+    }
+
+    #[test]
+    fn a_recorded_verdict_is_readable_while_the_credential_is_unchanged() {
+        let mut cache = CacheFile::default();
+        record_auth_failure(
+            &mut cache,
+            "dead",
+            "refresh_old",
+            "re-login required (refresh_token_reused)",
+            "detail",
+        );
+
+        let found = auth_failure_for(&cache, "dead", "refresh_old")
+            .expect("the same credential must still be considered rejected");
+        assert_eq!(found.summary, "re-login required (refresh_token_reused)");
+    }
+
+    #[test]
+    fn a_recorded_verdict_does_not_apply_to_a_replacement_credential() {
+        // Signing in again is the only cure for a terminal verdict, and it is
+        // visible here as a different refresh token. Keying the record on the
+        // alias instead would survive the re-login and keep a working account
+        // marked dead.
+        let mut cache = CacheFile::default();
+        record_auth_failure(&mut cache, "dead", "refresh_old", "summary", "detail");
+
+        assert!(
+            auth_failure_for(&cache, "dead", "refresh_new").is_none(),
+            "a verdict about a spent credential says nothing about its replacement"
+        );
+    }
+
+    #[test]
+    fn renaming_a_profile_carries_its_recorded_verdict() {
+        let mut cache = CacheFile::default();
+        record_auth_failure(&mut cache, "old", "refresh_old", "summary", "detail");
+
+        migrate_alias(&mut cache, "old", "new");
+
+        assert!(auth_failure_for(&cache, "old", "refresh_old").is_none());
+        assert!(
+            auth_failure_for(&cache, "new", "refresh_old").is_some(),
+            "a rename must not resurrect network calls for a credential already known dead"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_absence_is_remembered_so_the_account_is_not_looked_up_again() {
+        // Personal plans have no workspace name. The server saying so is an
+        // answer; not storing it made every invocation ask the same question.
+        let mut cache = CacheFile::default();
+        assert!(!workspace_name_resolved(&cache, "acct-personal"));
+
+        assert!(update_workspace_name(&mut cache, "acct-personal", None));
+
+        assert!(workspace_name_resolved(&cache, "acct-personal"));
+        assert!(
+            !cache.workspace_names.contains_key("acct-personal"),
+            "a confirmed absence must not masquerade as a name"
+        );
+    }
+
+    #[test]
+    fn a_workspace_name_that_appears_later_supersedes_a_recorded_absence() {
+        let mut cache = CacheFile::default();
+        update_workspace_name(&mut cache, "acct", None);
+
+        assert!(update_workspace_name(
+            &mut cache,
+            "acct",
+            Some("Night City")
+        ));
+
+        assert_eq!(
+            cache.workspace_names.get("acct").map(String::as_str),
+            Some("Night City")
+        );
+        assert!(
+            !cache.workspace_names_absent.contains_key("acct"),
+            "a name that arrived must clear the record saying there was none"
+        );
+    }
+
+    #[test]
+    fn a_recorded_absence_expires_so_joining_an_organisation_is_noticed() {
+        // Unlike a spent credential, this verdict can change on its own: an
+        // account with no workspace today can be added to one tomorrow, and
+        // nothing tells us. Bounding the record is what lets the new name
+        // appear without the user knowing to reach for `--force`.
+        let mut cache = CacheFile::default();
+        update_workspace_name(&mut cache, "acct", None);
+        cache
+            .workspace_names_absent
+            .insert("acct".to_string(), now_secs() - WORKSPACE_ABSENCE_TTL - 1);
+
+        assert!(!workspace_name_resolved(&cache, "acct"));
     }
 
     #[test]
