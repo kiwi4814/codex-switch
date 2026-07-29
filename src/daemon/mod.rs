@@ -62,11 +62,36 @@ fn start_detached() -> Result<()> {
         .stderr(std::process::Stdio::null())
         .spawn()?;
 
+    let pid = await_daemon_ready(&mut child, STARTUP_TIMEOUT)?;
+    user_println(&format!("Daemon started (PID {pid})"));
+    Ok(())
+}
+
+/// How long a freshly spawned daemon gets to publish its PID file.
+///
+/// Generous on purpose: the wait below returns the moment the file appears, so
+/// the only thing a large value costs is how long a genuinely broken start
+/// takes to be reported. A tight bound, on the other hand, turns a cold binary
+/// on a slow disk — a fresh self-update, an on-access virus scan, a loaded CI
+/// runner — into a spurious "start failed".
+const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Waits for the daemon to write its PID file, which signals it reached the
+/// event loop. Polling the actual readiness signal is more reliable than a
+/// fixed sleep on slow disks / CI / containers.
+///
+/// A child that never gets there is killed rather than left running. It is
+/// spawned detached, so abandoning it would report a failed start while an
+/// initializing daemon is still on its way — leaving the user with a process
+/// they were told does not exist, and a retry that refuses with "already
+/// running". Nothing is lost by killing it: not having written the PID file is
+/// exactly what says it has not begun touching credentials yet.
+fn await_daemon_ready(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Result<u32> {
     let pid = child.id();
-    // Wait for the daemon to write its PID file, which signals it reached the
-    // event loop. Polling the actual readiness signal is more reliable than a
-    // fixed sleep on slow disks / CI / containers.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         // Did the child exit before initializing?
         if let Ok(Some(status)) = child.try_wait() {
@@ -75,12 +100,15 @@ fn start_detached() -> Result<()> {
             );
         }
         if pidfile::read_pidfile() == Some(pid) {
-            user_println(&format!("Daemon started (PID {pid})"));
-            return Ok(());
+            return Ok(pid);
         }
         if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
             anyhow::bail!(
-                "Daemon (PID {pid}) did not initialize within 2s (no PID file written); check logs"
+                "Daemon (PID {pid}) did not initialize within {}s (no PID file written) and was \
+                 stopped; check logs",
+                timeout.as_secs()
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -281,6 +309,22 @@ fn status(json: bool) -> Result<()> {
                             snap.consecutive_failures
                         ));
                     }
+                    // Repeated failures back polling off by up to sixteen
+                    // intervals. Without this line the daemon reads as healthy
+                    // while it is deliberately idle, so someone who has just
+                    // fixed the cause has no way to tell how long the fix will
+                    // take to show up — or that restarting would apply it now.
+                    if let Some(until) = snap.backoff_until {
+                        let remaining = until - crate::auth::now_unix_secs();
+                        if remaining > 0 {
+                            user_println(&format!(
+                                "  Polling suspended for another {remaining}s (until {}) after \
+                                 repeated failures; `daemon stop` then `daemon start` resumes it \
+                                 immediately",
+                                format_unix(until)
+                            ));
+                        }
+                    }
                 }
             }
             (Some(pid), false) => {
@@ -325,5 +369,57 @@ fn service_manager_name() -> &'static str {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "unsupported"
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::Duration;
+
+    /// A `daemon start` that reports failure must leave no daemon behind. The
+    /// child is spawned detached, so abandoning it on timeout hands the user a
+    /// process they were just told does not exist — and a second
+    /// `daemon start` that then refuses with "already running".
+    #[test]
+    fn a_daemon_that_never_signals_readiness_is_killed_not_abandoned() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os("CODEX_SWITCH_HOME");
+        // SAFETY: the process-wide env lock above is held for the whole test.
+        unsafe { std::env::set_var("CODEX_SWITCH_HOME", home.path()) };
+
+        // Stands in for a daemon that starts but never reaches the event loop:
+        // it stays alive and writes no PID file into the empty home above.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn stand-in daemon");
+        let pid = child.id();
+
+        let err = super::await_daemon_ready(&mut child, Duration::from_millis(200))
+            .expect_err("no PID file is ever written, so readiness cannot be reached");
+
+        // SAFETY: same held lock.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("CODEX_SWITCH_HOME", value),
+                None => std::env::remove_var("CODEX_SWITCH_HOME"),
+            }
+        }
+
+        assert!(
+            err.to_string().contains("did not initialize"),
+            "unexpected error: {err}"
+        );
+        // `process_alive` is not the check to make here: it reads the PID file
+        // first and so answers "no" for any PID once that file is absent,
+        // which is exactly the state under test. Reaping the child is the
+        // direct evidence — it can only have been killed and waited for.
+        assert!(
+            child.try_wait().expect("try_wait").is_some(),
+            "the daemon reported as failed is still running as PID {pid}"
+        );
     }
 }
