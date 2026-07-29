@@ -26,6 +26,8 @@ mod login;
 mod output;
 pub mod profile;
 #[allow(dead_code)]
+mod signals;
+#[allow(dead_code)]
 mod tui;
 #[allow(dead_code)]
 mod update;

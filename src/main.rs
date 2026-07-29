@@ -11,6 +11,7 @@ mod logging;
 mod login;
 mod output;
 mod profile;
+mod signals;
 mod tui;
 mod update;
 mod usage;
