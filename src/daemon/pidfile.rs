@@ -13,10 +13,24 @@ struct PidIdentity {
     version: u8,
     pid: u32,
     executable: PathBuf,
+    #[serde(default)]
+    generation: String,
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Deserialize, Serialize)]
+struct ShutdownRequest {
+    version: u8,
+    pid: u32,
+    generation: String,
 }
 
 pub fn pidfile_path() -> Result<PathBuf> {
     Ok(crate::auth::app_home()?.join("daemon.pid"))
+}
+
+fn shutdown_request_path() -> Result<PathBuf> {
+    Ok(crate::auth::app_home()?.join("daemon.shutdown"))
 }
 
 /// Atomically create a PID file using O_CREAT|O_EXCL semantics.
@@ -44,9 +58,10 @@ pub fn write_pidfile_exclusive() -> Result<()> {
     FileExt::lock(&file)
         .map_err(|e| anyhow::anyhow!("Failed to lock PID file {}: {e}", path.display()))?;
     let identity = PidIdentity {
-        version: 1,
+        version: 2,
         pid: std::process::id(),
         executable: std::env::current_exe()?,
+        generation: daemon_generation(),
     };
     use std::io::Write;
     let encoded = serde_json::to_vec(&identity)?;
@@ -54,6 +69,9 @@ pub fn write_pidfile_exclusive() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to write PID to {}: {e}", path.display()))?;
     file.sync_data()
         .map_err(|e| anyhow::anyhow!("Failed to sync PID file {}: {e}", path.display()))?;
+    // A fresh PID file has exclusive ownership, so any request left by a prior
+    // daemon cannot target this generation.
+    let _ = std::fs::remove_file(shutdown_request_path()?);
 
     let handle = PIDFILE_HANDLE.get_or_init(|| Mutex::new(None));
     let mut guard = handle
@@ -77,8 +95,68 @@ fn read_pid_from_raw(raw: &str) -> Option<u32> {
 
 fn parse_pid_identity(raw: &str) -> Option<PidIdentity> {
     let identity: PidIdentity = serde_json::from_str(raw).ok()?;
-    (identity.version == 1 && identity.pid > 0 && !identity.executable.as_os_str().is_empty())
+    let supported_version = match identity.version {
+        1 => identity.generation.is_empty(),
+        2 => !identity.generation.is_empty(),
+        _ => false,
+    };
+    (supported_version && identity.pid > 0 && !identity.executable.as_os_str().is_empty())
         .then_some(identity)
+}
+
+fn daemon_generation() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{nanos}", std::process::id())
+}
+
+#[cfg(target_os = "windows")]
+pub fn request_shutdown(pid: u32) -> Result<()> {
+    let path = pidfile_path()?;
+    let raw = std::fs::read_to_string(&path)?;
+    let identity = parse_pid_identity(&raw)
+        .filter(|identity| identity.pid == pid)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Refusing to stop PID {pid}: daemon process identity is stale")
+        })?;
+    let request = ShutdownRequest {
+        version: 1,
+        pid,
+        generation: identity.generation,
+    };
+    let request_path = shutdown_request_path()?;
+    crate::auth::atomic_write_private(&request_path, &serde_json::to_vec(&request)?)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn shutdown_requested() -> bool {
+    let Ok(pidfile_path) = pidfile_path() else {
+        return false;
+    };
+    let Ok(identity_raw) = std::fs::read_to_string(pidfile_path) else {
+        return false;
+    };
+    let Some(identity) = parse_pid_identity(&identity_raw) else {
+        return false;
+    };
+    let Ok(request_path) = shutdown_request_path() else {
+        return false;
+    };
+    let Ok(request_raw) = std::fs::read_to_string(request_path) else {
+        return false;
+    };
+    let Ok(request) = serde_json::from_str::<ShutdownRequest>(&request_raw) else {
+        return false;
+    };
+    shutdown_request_matches(&identity, &request)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn shutdown_request_matches(identity: &PidIdentity, request: &ShutdownRequest) -> bool {
+    request.version == 1 && request.pid == identity.pid && request.generation == identity.generation
 }
 
 fn release_pidfile_handle() {
@@ -234,16 +312,7 @@ pub fn send_sigterm(pid: u32) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let output = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let detail = if stderr.is_empty() { stdout } else { stderr };
-            anyhow::bail!("Failed to stop PID {pid}: {detail}");
-        }
-        Ok(())
+        request_shutdown(pid)
     }
     #[cfg(not(any(unix, target_os = "windows")))]
     {
@@ -259,10 +328,11 @@ pub fn is_daemon_running() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_pidfile_at, parse_pid_identity, pidfile_lock_is_held, read_pid_from_raw,
-        tasklist_contains_pid,
+        PidIdentity, ShutdownRequest, cleanup_pidfile_at, parse_pid_identity, pidfile_lock_is_held,
+        read_pid_from_raw, shutdown_request_matches, tasklist_contains_pid,
     };
     use fs4::FileExt;
+    use std::path::PathBuf;
 
     #[test]
     fn tasklist_reads_pid_from_second_csv_column() {
@@ -284,6 +354,37 @@ mod tests {
     fn legacy_pidfile_is_not_trusted() {
         assert!(parse_pid_identity("4242").is_none());
         assert_eq!(read_pid_from_raw("4242"), Some(4242));
+    }
+
+    #[test]
+    fn version_one_pid_identity_remains_trusted_during_upgrade() {
+        let raw = r#"{"version":1,"pid":4242,"executable":"/tmp/codex-switch"}"#;
+        let identity = parse_pid_identity(raw).expect("v1 daemon pidfile remains readable");
+        assert_eq!(identity.pid, 4242);
+        assert!(identity.generation.is_empty());
+    }
+
+    #[test]
+    fn shutdown_request_must_match_pid_and_generation() {
+        let identity = PidIdentity {
+            version: 2,
+            pid: 4242,
+            executable: PathBuf::from("codex-switch"),
+            generation: "old-generation".to_string(),
+        };
+        let matching = ShutdownRequest {
+            version: 1,
+            pid: 4242,
+            generation: "old-generation".to_string(),
+        };
+        assert!(shutdown_request_matches(&identity, &matching));
+        assert!(!shutdown_request_matches(
+            &identity,
+            &ShutdownRequest {
+                generation: "new-generation".to_string(),
+                ..matching
+            }
+        ));
     }
 
     #[test]

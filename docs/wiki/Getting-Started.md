@@ -61,7 +61,7 @@ codex-switch login work
 codex-switch login --device server
 ```
 
-If you already have `auth.json` backups, import a file or scan a whole directory. Imports are parsed, identity-checked, validated against the usage service, deduplicated by account identity, and assigned collision-free aliases:
+If you already have `auth.json` backups, import a file or scan a whole directory. Imports are parsed, identity-checked, validated against the usage service, and saved under collision-free aliases. An import never overwrites an existing profile: a Team workspace ID proves access to that workspace, not ownership of another user's saved credentials.
 
 ```bash
 codex-switch import ~/auth-backups

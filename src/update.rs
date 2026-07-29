@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 const REPO_OWNER: &str = "xjoker";
 const REPO_NAME: &str = "codex-switch";
 const BIN_NAME: &str = "codex-switch";
+const PROVENANCE_ASSET_NAME: &str = "codex-switch-build-provenance.json";
+const RELEASE_WORKFLOW: &str = "xjoker/codex-switch/.github/workflows/release.yml";
 const SYSTEM_INSTALL_DIR: &str = "/usr/local/bin";
 const SYSTEM_INSTALL_MARKER_NAME: &str = ".codex-switch-system-install-v1";
 const UPDATE_TTL_SECS: i64 = 12 * 60 * 60;
@@ -238,6 +240,23 @@ struct GithubRelease {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct GithubGitReference {
+    object: GithubGitObject,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubGitTag {
+    object: GithubGitObject,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubGitObject {
+    #[serde(rename = "type")]
+    kind: String,
+    sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct GithubAsset {
     name: String,
     browser_download_url: String,
@@ -415,14 +434,44 @@ async fn download_and_replace(
         .find(|a| a.name == checksum_name)
         .cloned()
         .with_context(|| format!("release does not contain checksum asset '{checksum_name}'"))?;
+    let provenance_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == PROVENANCE_ASSET_NAME)
+        .cloned()
+        .with_context(|| {
+            format!("release does not contain provenance asset '{PROVENANCE_ASSET_NAME}'")
+        })?;
 
     let temp_dir = tempfile::tempdir().context("creating temporary update directory")?;
     let archive_path = temp_dir.path().join(&archive_asset.name);
+    let provenance_path = temp_dir.path().join(PROVENANCE_ASSET_NAME);
     if show_progress {
         eprintln!("Downloading {}{}...", archive_asset.name, label_suffix);
     }
     download_file(&client, &archive_asset.browser_download_url, &archive_path).await?;
     verify_checksum(&client, &checksum_asset.browser_download_url, &archive_path).await?;
+    download_file(
+        &client,
+        &provenance_asset.browser_download_url,
+        &provenance_path,
+    )
+    .await?;
+    let source_digest = fetch_tag_commit_sha(&client, &release.tag_name).await?;
+    verify_build_provenance(
+        &archive_path,
+        &provenance_path,
+        &release.tag_name,
+        &source_digest,
+    )?;
+    let confirmed_digest = fetch_tag_commit_sha(&client, &release.tag_name).await?;
+    if confirmed_digest != source_digest {
+        anyhow::bail!(
+            "release tag '{}' moved from {source_digest} to {confirmed_digest} during update; \
+             refusing to replace the executable",
+            release.tag_name
+        );
+    }
 
     let extracted_path = temp_dir.path().join(extracted_binary_name());
     if show_progress {
@@ -440,6 +489,66 @@ async fn download_and_replace(
         )
     })?;
     Ok(())
+}
+
+fn attestation_verify_args(
+    archive_path: &Path,
+    bundle_path: &Path,
+    release_tag: &str,
+    source_digest: &str,
+) -> Vec<String> {
+    vec![
+        "attestation".to_string(),
+        "verify".to_string(),
+        archive_path.to_string_lossy().into_owned(),
+        "--bundle".to_string(),
+        bundle_path.to_string_lossy().into_owned(),
+        "--repo".to_string(),
+        format!("{REPO_OWNER}/{REPO_NAME}"),
+        "--signer-workflow".to_string(),
+        RELEASE_WORKFLOW.to_string(),
+        "--source-ref".to_string(),
+        format!("refs/tags/{release_tag}"),
+        "--source-digest".to_string(),
+        source_digest.to_string(),
+        "--deny-self-hosted-runners".to_string(),
+    ]
+}
+
+fn verify_build_provenance(
+    archive_path: &Path,
+    bundle_path: &Path,
+    release_tag: &str,
+    source_digest: &str,
+) -> Result<()> {
+    let args = attestation_verify_args(archive_path, bundle_path, release_tag, source_digest);
+    let output = std::process::Command::new("gh")
+        .args(&args)
+        .output()
+        .with_context(|| {
+            "running `gh attestation verify`; install a GitHub CLI version with attestation \
+             support before using self-update"
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    anyhow::bail!(
+        "release provenance verification failed for {}: {}",
+        archive_path.display(),
+        if detail.is_empty() {
+            "gh attestation verify returned a non-zero status"
+        } else {
+            detail
+        }
+    )
 }
 
 /// Returns true if the given version string contains a pre-release component
@@ -523,6 +632,61 @@ async fn fetch_release_inner(version: Option<&str>) -> Result<Option<GithubRelea
         .await
         .context("parsing GitHub release metadata")?;
     Ok(Some(release))
+}
+
+async fn fetch_tag_commit_sha(client: &reqwest::Client, tag: &str) -> Result<String> {
+    let reference = fetch_github_json::<GithubGitReference>(
+        client,
+        &tag_ref_api_url(tag),
+        "requesting GitHub release tag reference",
+    )
+    .await?;
+    let mut object = reference.object;
+    for _ in 0..5 {
+        match object.kind.as_str() {
+            "commit" => {
+                validate_commit_sha(&object.sha)?;
+                return Ok(object.sha.to_ascii_lowercase());
+            }
+            "tag" => {
+                let tag_object = fetch_github_json::<GithubGitTag>(
+                    client,
+                    &git_tag_api_url(&object.sha),
+                    "resolving annotated GitHub release tag",
+                )
+                .await?;
+                object = tag_object.object;
+            }
+            other => anyhow::bail!(
+                "release tag '{tag}' resolved to unsupported Git object type '{other}'"
+            ),
+        }
+    }
+    anyhow::bail!("release tag '{tag}' contains more than 5 nested annotated tags")
+}
+
+async fn fetch_github_json<T>(client: &reqwest::Client, url: &str, context: &str) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .with_context(|| context.to_string())?
+        .error_for_status()
+        .with_context(|| format!("{context}: {url}"))?
+        .json::<T>()
+        .await
+        .with_context(|| format!("parsing GitHub response from {url}"))
+}
+
+fn validate_commit_sha(sha: &str) -> Result<()> {
+    if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("GitHub release tag returned an invalid commit SHA: '{sha}'");
+    }
+    Ok(())
 }
 
 async fn download_file(client: &reqwest::Client, url: &str, path: &Path) -> Result<()> {
@@ -709,10 +873,7 @@ fn release_tag(version: &str) -> String {
 }
 
 fn release_api_url(version: Option<&str>) -> String {
-    let base = std::env::var("CS_GITHUB_API_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_string());
+    let base = github_api_base();
 
     match version {
         Some(version) => format!(
@@ -721,6 +882,28 @@ fn release_api_url(version: Option<&str>) -> String {
         ),
         None => format!("{base}/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest"),
     }
+}
+
+fn tag_ref_api_url(tag: &str) -> String {
+    format!(
+        "{}/repos/{REPO_OWNER}/{REPO_NAME}/git/ref/tags/{}",
+        github_api_base(),
+        urlencoding::encode(tag)
+    )
+}
+
+fn git_tag_api_url(sha: &str) -> String {
+    format!(
+        "{}/repos/{REPO_OWNER}/{REPO_NAME}/git/tags/{sha}",
+        github_api_base()
+    )
+}
+
+fn github_api_base() -> String {
+    std::env::var("CS_GITHUB_API_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_string())
 }
 
 fn normalize_version(version: &str) -> String {
@@ -830,6 +1013,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn attestation_verification_pins_repository_workflow_and_release_ref() {
+        let archive = Path::new("/tmp/cs-linux-amd64.tar.gz");
+        let bundle = Path::new("/tmp/codex-switch-build-provenance.json");
+        let source_digest = "0123456789abcdef0123456789abcdef01234567";
+        let args = attestation_verify_args(archive, bundle, "v20260729.2.0", source_digest);
+
+        assert_eq!(
+            args,
+            vec![
+                "attestation",
+                "verify",
+                "/tmp/cs-linux-amd64.tar.gz",
+                "--bundle",
+                "/tmp/codex-switch-build-provenance.json",
+                "--repo",
+                "xjoker/codex-switch",
+                "--signer-workflow",
+                "xjoker/codex-switch/.github/workflows/release.yml",
+                "--source-ref",
+                "refs/tags/v20260729.2.0",
+                "--source-digest",
+                source_digest,
+                "--deny-self-hosted-runners",
+            ]
+        );
+    }
+
+    #[test]
     fn version_compare_ignores_v_prefix() {
         assert!(is_newer_version("v0.0.2", "0.0.1"));
         assert!(is_older_version("0.0.1", "v0.0.2"));
@@ -897,6 +1108,25 @@ mod tests {
             release_api_url(Some("dev")),
             "https://api.github.com/repos/xjoker/codex-switch/releases/tags/dev"
         );
+    }
+
+    #[test]
+    fn tag_ref_api_url_uses_the_exact_release_tag() {
+        assert_eq!(
+            tag_ref_api_url("dev"),
+            "https://api.github.com/repos/xjoker/codex-switch/git/ref/tags/dev"
+        );
+        assert_eq!(
+            tag_ref_api_url("release/candidate"),
+            "https://api.github.com/repos/xjoker/codex-switch/git/ref/tags/release%2Fcandidate"
+        );
+    }
+
+    #[test]
+    fn commit_digest_must_be_a_full_sha1() {
+        validate_commit_sha("0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert!(validate_commit_sha("deadbeef").is_err());
+        assert!(validate_commit_sha("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
     }
 
     #[test]

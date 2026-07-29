@@ -338,6 +338,10 @@ fn preserve_refreshed_launch_auth(codex_auth: &std::path::Path, alias: &str) -> 
         return Ok(false);
     }
     ensure_same_account(alias, &saved, &live)?;
+    // Managed Codex policy may change while the launched process is running.
+    // Re-evaluate at the final credential-write boundary, after identity
+    // checks but before the rotated token reaches the profile store.
+    auth::validate_managed_auth_value(&live)?;
     auth::write_auth(&profile_path, &live)
         .with_context(|| format!("saving refreshed credentials into profile '{alias}'"))?;
     Ok(true)
@@ -706,6 +710,43 @@ mod tests {
             "the original live credentials must still be restored"
         );
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn restore_rechecks_managed_workspace_policy_before_saving_refreshed_credentials() {
+        let home = TestAppHome::new();
+        let staged = auth_value("allowed", "refresh-old", "2026-07-01T00:00:00Z");
+        let (profile_path, codex_auth, backup) = staged_launch(&home, &staged);
+        let refreshed = auth_value("allowed", "refresh-new", "2026-07-20T10:00:00Z");
+        crate::auth::write_auth(&codex_auth, &refreshed).unwrap();
+
+        let codex_home = home.path().join("codex");
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "forced_login_method = \"chatgpt\"\nforced_chatgpt_workspace_id = \"acct-blocked\"\n",
+        )
+        .unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+        let result = restore_launch_auth(&codex_auth, &backup, true, "work");
+        unsafe {
+            match previous_codex_home {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+
+        let err = result.expect_err("policy changes during launch must fail closed");
+        assert!(format!("{err:#}").contains("not allowed"));
+        assert_eq!(read_json(&profile_path), staged);
+        assert_eq!(
+            read_json(&codex_auth),
+            refreshed,
+            "the only rotated credential copy must remain recoverable"
+        );
+        assert!(backup.exists());
     }
 
     #[test]

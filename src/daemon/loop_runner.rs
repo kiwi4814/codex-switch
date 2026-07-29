@@ -4,6 +4,20 @@ use super::state::{self, DaemonState, PendingSwitch, SwitchRecord};
 use crate::signals::ShutdownListener;
 use crate::{auth, cache, config, profile, usage, warmup};
 
+async fn shutdown_request_received() {
+    #[cfg(target_os = "windows")]
+    {
+        loop {
+            if super::pidfile::shutdown_requested() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    std::future::pending::<()>().await;
+}
+
 /// Outcome of one monitor poll.
 enum PollOutcome {
     NoAction,
@@ -147,6 +161,10 @@ pub async fn run_daemon_loop() -> Result<()> {
                 tracing::info!("Received shutdown signal, exiting daemon loop");
                 break;
             }
+            _ = shutdown_request_received() => {
+                tracing::info!("Received Windows shutdown request, exiting daemon loop");
+                break;
+            }
         }
     }
     Ok(())
@@ -204,6 +222,7 @@ async fn check_and_switch() -> Result<PollOutcome> {
 
     // 3. Fetch all other candidates concurrently
     let team_priority = cfg.use_cfg.team_priority;
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.network.max_concurrent));
     let mut tasks = tokio::task::JoinSet::new();
 
     for alias in &profiles {
@@ -216,7 +235,12 @@ async fn check_and_switch() -> Result<PollOutcome> {
         };
         let alias = alias.clone();
         let current = current.clone();
+        let semaphore = semaphore.clone();
         tasks.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("candidate usage limiter must stay open");
             let u = usage::fetch_usage_retried(&alias, &path, &current).await;
             (alias, path, u)
         });
@@ -299,6 +323,10 @@ async fn check_and_switch() -> Result<PollOutcome> {
 #[cfg(test)]
 mod tests {
     use super::poll_backoff_secs;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn poll_backoff_doubles_and_caps_at_sixteen_intervals() {
@@ -306,6 +334,29 @@ mod tests {
         assert_eq!(poll_backoff_secs(60, 2), 240);
         assert_eq!(poll_backoff_secs(60, 4), 960);
         assert_eq!(poll_backoff_secs(60, 10), 960);
+    }
+
+    #[tokio::test]
+    async fn candidate_usage_requests_never_exceed_network_limit() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..6 {
+            let semaphore = semaphore.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            tasks.spawn(async move {
+                let _permit = semaphore.acquire_owned().await.unwrap();
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
     }
 }
 

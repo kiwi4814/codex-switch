@@ -13,13 +13,13 @@ codex-switch login work
 codex-switch login --device server
 ```
 
-Existing `auth.json` files can be imported individually or from a directory. Imports are validated in stages — JSON format, required token structure with a decodable `id_token`, then a live usage-service check — before being deduplicated by account identity and assigned collision-free aliases:
+Existing `auth.json` files can be imported individually or from a directory. Imports are validated in stages — JSON format, required token structure with a decodable `id_token`, then a live usage-service check — before being saved under collision-free aliases:
 
 ```bash
 codex-switch import ~/auth-backups
 ```
 
-Deduplication matches accounts by `account_id` first and falls back to email. Logging in or importing an account that already exists under another alias updates the existing profile instead of creating a duplicate.
+Interactive login deduplicates local profiles by `account_id` first and falls back to email when safe. Import is deliberately create-only and never updates an existing profile: Usage API validation proves that the bearer can access a workspace, but a Team workspace ID can be shared by several users and cannot authorize overwriting another saved credential.
 
 Profile deletion is recoverable. An inactive profile is moved under `deleted-profiles/` after confirmation; the active profile cannot be deleted. See [recovery instructions](Troubleshooting#recover-a-deleted-profile).
 

@@ -747,7 +747,7 @@ async fn refresh_that_cannot_be_saved_fails_the_account_instead_of_reporting_suc
         err.detail
     );
     assert!(
-        err.detail.contains("updating refreshed tokens for profile"),
+        err.detail.contains("reading") && err.detail.contains("auth.json"),
         "detail must carry the underlying IO/permission cause: {}",
         err.detail
     );
@@ -901,7 +901,7 @@ async fn opportunistic_refresh_reports_the_profile_whose_token_could_not_be_save
         "detail must state that saving the rotated credentials failed: {detail}"
     );
     assert!(
-        detail.contains("updating live auth for current profile blocked"),
+        detail.contains("reading") && detail.contains("auth.json"),
         "detail must carry the underlying IO/permission cause: {detail}"
     );
     assert!(
@@ -1162,6 +1162,7 @@ async fn import_validation_hands_back_rotated_tokens_when_usage_fails() {
             "id_token": "old_id",
             "access_token": expired_jwt(),
             "refresh_token": "refresh_old",
+            "account_id": "acct_import",
         },
     });
 
@@ -1590,6 +1591,40 @@ async fn opportunistic_refresh_skips_a_credential_the_server_already_rejected() 
         "a credential the server already rejected must not be refreshed in the \
          background either, saw {:?}",
         server.token_calls()
+    );
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn opportunistic_refresh_remembers_a_terminal_verdict_it_discovers() {
+    let _lock = ENV_LOCK.lock().await;
+    let server = MockServer::start_keyed_by_refresh_token(vec![(
+        "refresh_dead_tail".to_string(),
+        reused_refresh_reply(),
+    )])
+    .await;
+    let _fx = expiring_profiles_fixture(&server, &["dead_tail"]);
+
+    let first_failures = codex_switch::usage::refresh_expiring_tokens().await;
+    assert!(
+        first_failures.is_empty(),
+        "a rejected credential is not a persistence failure: {first_failures:?}"
+    );
+    assert_eq!(
+        server.token_calls(),
+        vec!["refresh_dead_tail".to_string()],
+        "the first opportunistic pass must contact the auth server once"
+    );
+
+    let second_failures = codex_switch::usage::refresh_expiring_tokens().await;
+    assert!(
+        second_failures.is_empty(),
+        "skipping a known rejection is not a persistence failure: {second_failures:?}"
+    );
+    assert_eq!(
+        server.token_calls(),
+        vec!["refresh_dead_tail".to_string()],
+        "a terminal verdict discovered by opportunistic refresh must prevent the next replay"
     );
     server.shutdown();
 }

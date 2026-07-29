@@ -17,7 +17,8 @@ use crate::profile::{
     switch_profile, sync_current_from_live, validate_alias,
 };
 use crate::usage::{
-    ConsumedResetCredit, UsageError, UsageInfo, fetch_usage_retried, fetch_usage_retried_force,
+    ConsumedResetCredit, Refresh, UsageError, UsageInfo, fetch_usage_retried,
+    fetch_usage_retried_force, fetch_usage_retried_unattended,
 };
 use crate::warmup::ModelEntry;
 
@@ -35,6 +36,29 @@ pub enum UsageStatus {
     Loading,
     Loaded(Box<UsageInfo>),
     Error(UsageError),
+}
+
+fn retained_usage_by_alias(accounts: Vec<AccountEntry>) -> HashMap<String, UsageStatus> {
+    accounts
+        .into_iter()
+        .map(|account| (account.alias, account.usage))
+        .collect()
+}
+
+fn refresh_fetches_loaded_usage(refresh: Refresh) -> bool {
+    !matches!(refresh, Refresh::Cached)
+}
+
+fn refresh_forces_negative_caches(refresh: Refresh) -> bool {
+    matches!(refresh, Refresh::Forced)
+}
+
+fn refresh_priority(refresh: Refresh) -> u8 {
+    match refresh {
+        Refresh::Cached => 0,
+        Refresh::Unattended => 1,
+        Refresh::Forced => 2,
+    }
 }
 
 #[derive(Debug)]
@@ -152,8 +176,11 @@ pub struct App {
     pub status_msg: Option<String>,
     pub status_is_error: bool,
     pub status_expiry: Option<Instant>,
-    pub pending_results: tokio::sync::mpsc::Receiver<(String, Result<UsageInfo, UsageError>)>,
-    pub result_sender: tokio::sync::mpsc::Sender<(String, Result<UsageInfo, UsageError>)>,
+    pub refreshing_requests: HashMap<String, (u64, Refresh)>,
+    pub pending_usage_refreshes: HashMap<String, Refresh>,
+    pub usage_next_id: u64,
+    pub pending_results: tokio::sync::mpsc::Receiver<(String, u64, Result<UsageInfo, UsageError>)>,
+    pub result_sender: tokio::sync::mpsc::Sender<(String, u64, Result<UsageInfo, UsageError>)>,
     pub pending_workspace: tokio::sync::mpsc::Receiver<String>,
     pub workspace_sender: tokio::sync::mpsc::Sender<String>,
     pub pending_warmup: tokio::sync::mpsc::Receiver<(u64, String, Result<(), String>)>,
@@ -205,6 +232,9 @@ impl App {
             status_msg: None,
             status_is_error: false,
             status_expiry: None,
+            refreshing_requests: HashMap::new(),
+            pending_usage_refreshes: HashMap::new(),
+            usage_next_id: 0,
             pending_results: rx,
             result_sender: tx,
             pending_workspace: workspace_rx,
@@ -608,6 +638,7 @@ impl App {
     }
 
     pub fn load_profiles(&mut self) {
+        let mut retained_usage = retained_usage_by_alias(std::mem::take(&mut self.accounts));
         let profiles = list_profiles().unwrap_or_else(|e| {
             tracing::warn!("failed to load profiles: {e}");
             Vec::new()
@@ -623,15 +654,20 @@ impl App {
                 let info = auth::read_account_info(&path);
                 let is_current = alias == current;
                 Some(AccountEntry {
+                    usage: retained_usage.remove(&alias).unwrap_or(UsageStatus::Idle),
                     alias,
                     info,
-                    usage: UsageStatus::Idle,
                     is_current,
                 })
             })
             .collect();
         self.marked
             .retain(|alias| self.accounts.iter().any(|account| &account.alias == alias));
+        // A reload can follow credential replacement for an existing alias.
+        // Invalidate old generations so their late results cannot bind to the
+        // newly loaded profile; the caller starts the replacement refresh.
+        self.refreshing_requests.clear();
+        self.pending_usage_refreshes.clear();
         self.selected = 0;
         self.view_indices.clear();
         self.update_view();
@@ -733,10 +769,11 @@ impl App {
     }
 
     pub fn loading_count(&self) -> usize {
-        self.accounts
-            .iter()
-            .filter(|a| matches!(a.usage, UsageStatus::Loading))
-            .count()
+        self.refreshing_requests.len()
+    }
+
+    pub fn is_refreshing(&self, alias: &str) -> bool {
+        self.refreshing_requests.contains_key(alias)
     }
 
     pub fn cycle_sort(&mut self) {
@@ -830,9 +867,8 @@ impl App {
         else {
             return;
         };
-        self.accounts[idx].usage = UsageStatus::Idle;
         self.model_cache.remove(alias);
-        self.fetch_usage_for(idx, true);
+        self.fetch_usage_for(idx, Refresh::Forced);
         self.ensure_models_loaded(alias);
         self.set_status(format!("Refreshing {alias}"), 3);
     }
@@ -926,10 +962,9 @@ impl App {
         }
         for alias in to_refresh {
             if let Some(idx) = self.accounts.iter().position(|a| a.alias == alias) {
-                // Always force a fresh fetch after warmup — reset to Idle even if currently
-                // Loading, so the post-warmup fetch reflects the newly opened quota window.
-                self.accounts[idx].usage = UsageStatus::Idle;
-                self.fetch_usage_for(idx, true);
+                // Always force a fresh fetch after warmup while keeping the previous
+                // quota visible until the replacement arrives.
+                self.fetch_usage_for(idx, Refresh::Forced);
             }
         }
     }
@@ -968,8 +1003,7 @@ impl App {
         }
         for alias in to_refresh {
             if let Some(idx) = self.accounts.iter().position(|a| a.alias == alias) {
-                self.accounts[idx].usage = UsageStatus::Idle;
-                self.fetch_usage_for(idx, true);
+                self.fetch_usage_for(idx, Refresh::Forced);
             }
         }
     }
@@ -997,16 +1031,28 @@ impl App {
         }
     }
 
-    fn fetch_usage_for(&mut self, idx: usize, force: bool) {
+    fn fetch_usage_for(&mut self, idx: usize, refresh: Refresh) {
         let entry = match self.accounts.get(idx) {
             Some(e) => e,
             None => return,
         };
-        if matches!(entry.usage, UsageStatus::Loading) {
+        if self.refreshing_requests.contains_key(&entry.alias) {
+            if refresh_fetches_loaded_usage(refresh) {
+                self.pending_usage_refreshes
+                    .entry(entry.alias.clone())
+                    .and_modify(|queued| {
+                        if refresh_priority(refresh) > refresh_priority(*queued) {
+                            *queued = refresh;
+                        }
+                    })
+                    .or_insert(refresh);
+            }
             return;
         }
-        let needs_usage = force || !matches!(entry.usage, UsageStatus::Loaded(_));
-        let needs_workspace = force
+        let needs_usage =
+            refresh_fetches_loaded_usage(refresh) || !matches!(entry.usage, UsageStatus::Loaded(_));
+        let force_negative_caches = refresh_forces_negative_caches(refresh);
+        let needs_workspace = force_negative_caches
             || entry
                 .info
                 .account_id
@@ -1027,28 +1073,40 @@ impl App {
         let current = read_current();
         let limiter = self.usage_limiter.clone();
 
-        if needs_usage {
+        if needs_usage && !matches!(self.accounts[idx].usage, UsageStatus::Loaded(_)) {
             self.accounts[idx].usage = UsageStatus::Loading;
         }
 
         let usage_tx = self.result_sender.clone();
         let workspace_tx = self.workspace_sender.clone();
+        let request_id = needs_usage.then(|| {
+            let request_id = self.usage_next_id;
+            self.usage_next_id = self.usage_next_id.wrapping_add(1);
+            self.refreshing_requests
+                .insert(alias.clone(), (request_id, refresh));
+            request_id
+        });
         tokio::spawn(async move {
             let _permit = limiter.acquire().await;
             if needs_usage {
-                let result = if force {
-                    fetch_usage_retried_force(&alias, &path, &current).await
-                } else {
-                    fetch_usage_retried(&alias, &path, &current).await
+                let result = match refresh {
+                    Refresh::Cached => fetch_usage_retried(&alias, &path, &current).await,
+                    Refresh::Unattended => {
+                        fetch_usage_retried_unattended(&alias, &path, &current).await
+                    }
+                    Refresh::Forced => fetch_usage_retried_force(&alias, &path, &current).await,
                 };
                 // Usage is independent of best-effort workspace metadata.
-                let _ = usage_tx.send((alias.clone(), result)).await;
+                let _ = usage_tx
+                    .send((alias.clone(), request_id.expect("usage request id"), result))
+                    .await;
             }
             if needs_workspace {
                 // Read auth after usage because that path may have refreshed the token.
                 if let Ok(auth) = crate::auth::read_auth(&path)
                     && let Err(err) =
-                        crate::workspace::refresh_for_auth_if_needed(&auth, force).await
+                        crate::workspace::refresh_for_auth_if_needed(&auth, force_negative_caches)
+                            .await
                 {
                     tracing::debug!("[{alias}] workspace metadata unavailable: {err}");
                 }
@@ -1057,20 +1115,20 @@ impl App {
         });
     }
 
-    fn refresh_indices(&mut self, target_indices: &[usize], force: bool) {
+    fn refresh_indices(&mut self, target_indices: &[usize], refresh: Refresh) {
         for &i in target_indices {
             let entry = &mut self.accounts[i];
-            match &entry.usage {
-                UsageStatus::Error(_) => entry.usage = UsageStatus::Idle,
-                UsageStatus::Loaded(_) if force => entry.usage = UsageStatus::Idle,
-                _ => {}
+            if let UsageStatus::Error(_) = &entry.usage {
+                entry.usage = UsageStatus::Idle;
             }
-            if !force && let Some(cached) = crate::cache::get(&entry.alias) {
+            if matches!(refresh, Refresh::Cached)
+                && let Some(cached) = crate::cache::get(&entry.alias)
+            {
                 entry.usage = UsageStatus::Loaded(Box::new(cached));
             }
         }
         for &i in target_indices {
-            self.fetch_usage_for(i, force);
+            self.fetch_usage_for(i, refresh);
         }
         self.update_view();
     }
@@ -1079,14 +1137,14 @@ impl App {
     /// Batch refresh of just the marked accounts is exposed separately
     /// via the Enter > Batch menu so the implicit "marks change scope"
     /// behavior is gone.
-    pub fn refresh(&mut self, force: bool) {
+    pub fn refresh(&mut self, refresh: Refresh) {
         let target_indices: Vec<usize> = self.view_indices.clone();
-        self.refresh_indices(&target_indices, force);
+        self.refresh_indices(&target_indices, refresh);
     }
 
-    pub fn refresh_all(&mut self, force: bool) {
+    pub fn refresh_all(&mut self, refresh: Refresh) {
         let target_indices: Vec<usize> = (0..self.accounts.len()).collect();
-        self.refresh_indices(&target_indices, force);
+        self.refresh_indices(&target_indices, refresh);
     }
 
     pub fn poll_results(&mut self) {
@@ -1096,7 +1154,15 @@ impl App {
             _ => None,
         };
         let mut refresh_open_account = false;
-        while let Ok((alias, result)) = self.pending_results.try_recv() {
+        while let Ok((alias, request_id, result)) = self.pending_results.try_recv() {
+            let is_current_request = self
+                .refreshing_requests
+                .get(&alias)
+                .is_some_and(|(active_id, _)| *active_id == request_id);
+            if !is_current_request {
+                continue;
+            }
+            self.refreshing_requests.remove(&alias);
             let Some(idx) = self.accounts.iter().position(|entry| entry.alias == alias) else {
                 continue;
             };
@@ -1107,6 +1173,9 @@ impl App {
             crate::cache::apply_workspace_name(&mut self.accounts[idx].info);
             refresh_open_account |= open_account_alias.as_deref() == Some(alias.as_str());
             changed = true;
+            if let Some(refresh) = self.pending_usage_refreshes.remove(&alias) {
+                self.fetch_usage_for(idx, refresh);
+            }
         }
         while let Ok(alias) = self.pending_workspace.try_recv() {
             if let Some(entry) = self.accounts.iter_mut().find(|entry| entry.alias == alias) {
@@ -1153,7 +1222,7 @@ impl App {
                 Ok(()) => {
                     self.set_status(format!("Deleted {alias} (recoverable)"), 3);
                     self.load_profiles();
-                    self.refresh(true);
+                    self.refresh(Refresh::Forced);
                 }
                 Err(e) => self.set_status_error(format!("Delete failed: {e}"), 5),
             },
@@ -1173,7 +1242,7 @@ impl App {
                 }
                 self.marked.clear();
                 self.load_profiles();
-                self.refresh(true);
+                self.refresh(Refresh::Forced);
                 let msg = if errors.is_empty() {
                     format!("Deleted {ok} account(s) (recoverable)")
                 } else {
@@ -1238,7 +1307,7 @@ impl App {
             .map(|(i, _)| i)
             .collect();
         let count = target_indices.len();
-        self.refresh_indices(&target_indices, true);
+        self.refresh_indices(&target_indices, Refresh::Forced);
         self.set_status(format!("Refreshing {count} marked account(s)..."), 3);
     }
 
@@ -1309,7 +1378,7 @@ impl App {
                         {
                             self.selected = view_idx;
                         }
-                        self.refresh(true);
+                        self.refresh(Refresh::Forced);
                     }
                     Err(e) => self.set_status_error(format!("Rename failed: {e}"), 5),
                 }
@@ -1527,7 +1596,7 @@ impl App {
         } else {
             0
         };
-        self.refresh_all(true);
+        self.refresh_all(Refresh::Unattended);
         self.next_auto_refresh = Some(now + self.auto_refresh_interval);
 
         let mut msg = format!("Auto refresh: refreshing {account_count} account(s)");
@@ -1576,7 +1645,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     app.update_view();
 
     if !app.accounts.is_empty() {
-        app.refresh(false);
+        app.refresh(Refresh::Cached);
     }
     app.start_update_check();
 
@@ -1675,7 +1744,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                     }
                 }
                 KeyCode::Char('a') => app.open_add_menu(),
-                KeyCode::Char('r') => app.refresh(true),
+                KeyCode::Char('r') => app.refresh(Refresh::Forced),
                 KeyCode::Char('t') => app.toggle_auto_refresh(),
                 KeyCode::Char('i') => app.toggle_detail_panel(),
                 KeyCode::Char('s') => app.cycle_sort(),
@@ -1851,7 +1920,7 @@ async fn perform_oauth(
         Ok(msg) => {
             app.set_status(msg, 5);
             app.load_profiles_preserving_selection();
-            app.refresh(true);
+            app.refresh(Refresh::Forced);
             // Reset auto-refresh timer so it doesn't fire immediately.
             if app.auto_refresh_enabled {
                 app.next_auto_refresh = Some(Instant::now() + app.auto_refresh_interval);
@@ -1926,7 +1995,7 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
         app.set_status_error(summary, 8);
     }
     app.load_profiles_preserving_selection();
-    app.refresh(true);
+    app.refresh(Refresh::Forced);
     if app.auto_refresh_enabled {
         app.next_auto_refresh = Some(Instant::now() + app.auto_refresh_interval);
     }
@@ -1989,10 +2058,13 @@ fn char_to_byte(s: &str, char_pos: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountEntry, App, ModelStatus, UsageStatus, reset_card_failure_from_outcome};
+    use super::{
+        AccountEntry, App, ModelStatus, UsageStatus, refresh_fetches_loaded_usage,
+        refresh_forces_negative_caches, reset_card_failure_from_outcome, retained_usage_by_alias,
+    };
     use crate::{
         jwt::{AccountInfo, OrgInfo},
-        usage::{ResetCredit, UsageInfo},
+        usage::{Refresh, ResetCredit, UsageInfo},
         warmup::ModelEntry,
     };
 
@@ -2053,17 +2125,112 @@ mod tests {
         app.view_indices.push(0);
         app.model_cache
             .insert("account".into(), ModelStatus::Loaded(Vec::new()));
+        app.refreshing_requests
+            .insert("account".into(), (1, Refresh::Cached));
         app.open_account_menu();
 
         app.result_sender
-            .try_send(("account".into(), Ok(UsageInfo::default())))
+            .try_send(("account".into(), 1, Ok(UsageInfo::default())))
             .unwrap();
         app.poll_results();
+        assert_eq!(app.loading_count(), 0);
 
         let Some(super::super::menu::MenuState::Account { info, .. }) = app.menu else {
             panic!("account detail should remain open");
         };
         assert!(info.usage.is_some());
+    }
+
+    #[test]
+    fn stale_usage_result_is_ignored_after_a_new_request_generation_starts() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::default()),
+            is_current: true,
+        });
+        app.view_indices.push(0);
+        app.refreshing_requests
+            .insert("account".into(), (2, Refresh::Forced));
+
+        app.result_sender
+            .try_send((
+                "account".into(),
+                1,
+                Err(crate::usage::UsageError {
+                    summary: "old request".into(),
+                    detail: "must be ignored".into(),
+                }),
+            ))
+            .unwrap();
+        app.poll_results();
+
+        assert!(matches!(app.accounts[0].usage, UsageStatus::Loaded(_)));
+        assert_eq!(app.loading_count(), 1);
+    }
+
+    #[test]
+    fn forced_follow_up_is_queued_when_usage_request_is_already_in_flight() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::default()),
+            is_current: true,
+        });
+        app.view_indices.push(0);
+        app.refreshing_requests
+            .insert("account".into(), (1, Refresh::Cached));
+
+        app.fetch_usage_for(0, Refresh::Forced);
+
+        assert_eq!(
+            app.pending_usage_refreshes.get("account"),
+            Some(&Refresh::Forced)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn force_refresh_keeps_last_loaded_usage_visible_while_request_is_in_flight() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::default()),
+            is_current: true,
+        });
+        app.view_indices.push(0);
+
+        app.refresh_indices(&[0], Refresh::Forced);
+
+        assert!(
+            matches!(app.accounts[0].usage, UsageStatus::Loaded(_)),
+            "force refresh must retain the last value until its replacement arrives"
+        );
+        assert_eq!(app.loading_count(), 1);
+    }
+
+    #[test]
+    fn profile_reload_retains_loaded_usage_by_alias() {
+        let retained = retained_usage_by_alias(vec![AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::default()),
+            is_current: false,
+        }]);
+
+        assert!(matches!(
+            retained.get("account"),
+            Some(UsageStatus::Loaded(_))
+        ));
+    }
+
+    #[test]
+    fn unattended_refresh_refetches_loaded_usage_without_forcing_negative_caches() {
+        assert!(refresh_fetches_loaded_usage(Refresh::Unattended));
+        assert!(!refresh_forces_negative_caches(Refresh::Unattended));
+        assert!(refresh_forces_negative_caches(Refresh::Forced));
     }
 
     #[test]

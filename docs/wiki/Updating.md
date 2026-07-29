@@ -10,7 +10,7 @@ codex-switch self-update            # update within the current channel
 codex-switch self-update --version <VERSION>   # install a specific newer stable version
 ```
 
-Downloaded archives are checked against the `.sha256` file in the same GitHub Release before the binary is replaced. This detects corruption, but it is not an independent signature: GitHub Releases over TLS remains the trust anchor. If the daemon is running, `self-update` stops it before replacing the binary and restarts it in the same mode afterwards.
+Downloaded archives are checked against the `.sha256` file in the same GitHub Release and the release's `codex-switch-build-provenance.json` Sigstore bundle before the binary is replaced. The updater resolves the release tag through the GitHub Git API, then runs `gh attestation verify` with the repository, release workflow, exact tag ref, and that tag's full commit digest pinned; attestations produced by self-hosted runners are rejected. It resolves the tag again after verification and aborts if it moved during the update. SHA-256 detects corruption; the artifact attestation proves the archive came from the exact source revision of this repository's GitHub Actions release workflow. Direct self-update therefore requires a current [GitHub CLI](https://cli.github.com/) with attestation support and fails closed when `gh`, the provenance bundle, or the exact tag commit cannot be verified. If the daemon is running, `self-update` asks it to stop before replacing the binary and restarts it in the same mode afterwards. On Windows, a daemon still finishing credential work after ten seconds is left running and the update aborts rather than force-killing a token rotation.
 
 ## Channels and version scheme
 

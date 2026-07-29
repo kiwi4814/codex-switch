@@ -89,7 +89,7 @@ GitHub Actions repeats the core checks on Linux, macOS, and Windows. A local pas
 - Use atomic replacement for credentials, cache, and daemon state.
 - Keep profile deletion recoverable and refuse deletion of the active profile.
 - Do not remove a daemon PID file without proving lock ownership.
-- Treat GitHub Release checksums as corruption detection, not an independent signature.
+- Keep both update trust layers: release checksums detect corruption, while `gh attestation verify` validates the Sigstore build-provenance bundle against this repository, the release workflow, and the exact tag ref.
 
 ## Update documentation
 

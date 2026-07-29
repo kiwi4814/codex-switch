@@ -110,7 +110,7 @@ fn spawned_binary_honors_app_home_override() {
     let sample = home.join("sample-auth.json");
     write_json(
         &sample,
-        &auth_json_with_access("override@example.com", "acct_override"),
+        &auth_json_needing_refresh("override@example.com", "acct_override"),
     );
 
     let mut cmd = command(
@@ -118,7 +118,15 @@ fn spawned_binary_honors_app_home_override() {
         &["--json", "import", sample.to_str().unwrap(), "override"],
     );
     cmd.env("CODEX_SWITCH_HOME", &app_home);
-    cmd.env("CS_IMPORT_SKIP_USAGE_VALIDATION", "1");
+    let server = start_rotating_mock(
+        jwt(
+            &serde_json::json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acct_override"}}),
+        ),
+        true,
+    );
+    for (key, value) in import_env(&server) {
+        cmd.env(key, value);
+    }
     let output = cmd.output().unwrap();
     assert!(output.status.success());
     assert!(app_home.join("profiles/override/auth.json").exists());
@@ -218,13 +226,19 @@ fn json_import_keeps_stdout_machine_readable() {
     let sample = home.join("sample-auth.json");
     write_json(
         &sample,
-        &auth_json_with_access("frank@example.com", "acct_frank"),
+        &auth_json_needing_refresh("frank@example.com", "acct_frank"),
     );
 
-    let output = run_with_env(
+    let server = start_rotating_mock(
+        jwt(
+            &serde_json::json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acct_frank"}}),
+        ),
+        true,
+    );
+    let output = run_import(
         &home,
         &["--json", "import", sample.to_str().unwrap(), "frank"],
-        &[("CS_IMPORT_SKIP_USAGE_VALIDATION", "1")],
+        &server,
     );
     assert!(output.status.success());
     assert_eq!(
@@ -232,6 +246,31 @@ fn json_import_keeps_stdout_machine_readable() {
         serde_json::json!({"ok": true, "alias": "frank", "action": "created"})
     );
 
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn import_skip_usage_validation_environment_variable_no_longer_bypasses_validation() {
+    let home = temp_home("import-no-skip-bypass");
+    let sample = home.join("sample-auth.json");
+    write_json(
+        &sample,
+        &auth_json_with_access("victim@example.com", "acct_victim"),
+    );
+    let output = run_with_env(
+        &home,
+        &["--json", "import", sample.to_str().unwrap(), "victim"],
+        &[("CS_IMPORT_SKIP_USAGE_VALIDATION", "1")],
+    );
+    assert!(
+        !output.status.success(),
+        "the retired environment escape hatch must not import credentials"
+    );
+    assert!(
+        !home
+            .join(".codex-switch/profiles/victim/auth.json")
+            .exists()
+    );
     let _ = fs::remove_dir_all(home);
 }
 
@@ -470,7 +509,7 @@ fn import_directory_recursively_validates_and_reports_results() {
     let root = home.join("to-import");
     write_json(
         root.join("nested/valid-auth.json"),
-        &auth_json_with_access("henry@example.com", "acct_henry"),
+        &auth_json_needing_refresh("henry@example.com", "acct_henry"),
     );
     write_json(
         root.join("nested/invalid-structure.json"),
@@ -479,10 +518,16 @@ fn import_directory_recursively_validates_and_reports_results() {
     fs::create_dir_all(root.join("broken")).unwrap();
     fs::write(root.join("broken/not-json.json"), "{invalid json").unwrap();
 
-    let output = run_with_env(
+    let server = start_rotating_mock(
+        jwt(
+            &serde_json::json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acct_henry"}}),
+        ),
+        true,
+    );
+    let output = run_import(
         &home,
         &["--json", "import", root.to_str().unwrap()],
-        &[("CS_IMPORT_SKIP_USAGE_VALIDATION", "1")],
+        &server,
     );
     assert!(output.status.success());
 
@@ -515,11 +560,7 @@ fn import_directory_returns_nonzero_when_every_file_is_skipped() {
         &serde_json::json!({"tokens": {}}),
     );
 
-    let output = run_with_env(
-        &home,
-        &["--json", "import", root.to_str().unwrap()],
-        &[("CS_IMPORT_SKIP_USAGE_VALIDATION", "1")],
-    );
+    let output = run(&home, &["--json", "import", root.to_str().unwrap()]);
     assert!(!output.status.success());
     let report = parse_stdout_json(&output);
     assert_eq!(report["ok"], false);
@@ -540,11 +581,7 @@ fn non_json_all_skipped_import_reports_each_failure_before_exiting() {
         &serde_json::json!({"tokens": {}}),
     );
 
-    let output = run_with_env(
-        &home,
-        &["import", root.to_str().unwrap()],
-        &[("CS_IMPORT_SKIP_USAGE_VALIDATION", "1")],
-    );
+    let output = run(&home, &["import", root.to_str().unwrap()]);
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("broken.json [file_format]"), "{stdout}");
@@ -890,6 +927,72 @@ fn run_import(home: &Path, args: &[&str], server: &MockServer) -> Output {
     run_with_env(home, args, &pairs)
 }
 
+#[test]
+fn import_rejects_an_invalid_alias_before_consuming_the_refresh_token() {
+    let home = temp_home("import-invalid-alias-preflight");
+    let sample = auth_json_needing_refresh("alias@example.com", "acct_alias");
+    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+    let source = home.join("donor-auth.json");
+    write_json(&source, &sample);
+
+    let server = start_rotating_mock(rotated_id_token, true);
+    let output = run_import(
+        &home,
+        &["--json", "import", source.to_str().unwrap(), "bad/name"],
+        &server,
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        server.token_calls.lock().unwrap().is_empty(),
+        "a deterministic alias failure must be reported before a single-use refresh token is sent"
+    );
+    assert!(
+        !home.join(".codex-switch/recovery").exists(),
+        "a preflight rejection must not need credential recovery"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn import_rejects_a_disallowed_workspace_before_consuming_the_refresh_token() {
+    let home = temp_home("import-managed-policy-preflight");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::write(
+        home.join(".codex/config.toml"),
+        "forced_chatgpt_workspace_id = \"acct_allowed\"\n",
+    )
+    .unwrap();
+    let sample = auth_json_needing_refresh("blocked@example.com", "acct_blocked");
+    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+    let source = home.join("donor-auth.json");
+    write_json(&source, &sample);
+
+    let server = start_rotating_mock(rotated_id_token, true);
+    let output = run_import(
+        &home,
+        &["--json", "import", source.to_str().unwrap(), "blocked"],
+        &server,
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        server.token_calls.lock().unwrap().is_empty(),
+        "managed policy must reject the source identity before its refresh token is sent"
+    );
+    let report = parse_stdout_json(&output);
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("managed_policy"),
+        "the rejection must identify the policy boundary: {report}"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
 fn stored_refresh_token(path: &Path) -> String {
     let raw = fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("reading {} failed: {e}", path.display()));
@@ -944,6 +1047,60 @@ fn import_persists_rotated_credentials_when_usage_validation_fails() {
         error.contains("donor"),
         "the failure must name where the rotated credentials were saved: {error}"
     );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn import_quarantines_rotated_credentials_when_refresh_loses_account_identity() {
+    let home = temp_home("import-rotated-missing-identity");
+    let mut sample = auth_json("rotate@example.com", "acct_rotate");
+    sample["tokens"]
+        .as_object_mut()
+        .unwrap()
+        .remove("access_token");
+    sample["tokens"]
+        .as_object_mut()
+        .unwrap()
+        .remove("account_id");
+    sample["tokens"]["refresh_token"] = serde_json::json!("refresh_old");
+    let source = home.join("donor-auth.json");
+    write_json(&source, &sample);
+
+    let rotated_id_token = jwt(&serde_json::json!({
+        "email": "rotate@example.com",
+        "exp": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() + 3600,
+    }));
+    let server = start_rotating_mock(rotated_id_token, false);
+    let output = run_import(
+        &home,
+        &["--json", "import", source.to_str().unwrap(), "donor"],
+        &server,
+    );
+
+    assert!(!output.status.success());
+    assert_eq!(
+        server.token_calls.lock().unwrap().clone(),
+        vec!["refresh_old".to_string()]
+    );
+    let recovery_dir = home.join(".codex-switch/recovery");
+    let recovered: Vec<_> = fs::read_dir(&recovery_dir)
+        .expect("rotated credentials must be quarantined even without an account id")
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(stored_refresh_token(&recovered[0]), "refresh_1");
+    assert!(
+        !home.join(".codex-switch/profiles/donor").exists(),
+        "unverified recovery credentials must not become an activatable profile"
+    );
+    let report = parse_stdout_json(&output);
+    let error = report["error"].as_str().unwrap_or_default();
+    assert!(error.contains("token_rotated"));
+    assert!(error.contains(&recovered[0].display().to_string()));
 
     let _ = fs::remove_dir_all(home);
 }
@@ -1053,10 +1210,12 @@ fn import_reports_loudly_when_rotated_credentials_cannot_be_saved() {
     let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
     let source = home.join("donor-auth.json");
     write_json(&source, &sample);
-    // Occupy the profile store with a regular file so every profile write fails
-    // deterministically, with no permission-bit semantics involved.
+    // Occupy both durable destinations with regular files so profile and
+    // quarantine writes fail deterministically, with no permission-bit
+    // semantics involved.
     fs::create_dir_all(home.join(".codex-switch")).unwrap();
     fs::write(home.join(".codex-switch/profiles"), "not a directory").unwrap();
+    fs::write(home.join(".codex-switch/recovery"), "not a directory").unwrap();
 
     let server = start_rotating_mock(rotated_id_token, false);
     let output = run_import(
@@ -1081,10 +1240,10 @@ fn import_reports_loudly_when_rotated_credentials_cannot_be_saved() {
 }
 
 /// The same single-use credential is at stake when validation *succeeds* and
-/// the profile write is what fails: the rotation is spent either way, so this
-/// failure must not read like an ordinary "could not save file".
+/// the profile write is what fails. A separate recovery store is still
+/// available, so the rotated token must be quarantined instead of discarded.
 #[test]
-fn import_reports_the_rotation_when_the_profile_write_fails_after_validation() {
+fn import_quarantines_the_rotation_when_the_profile_write_fails_after_validation() {
     let home = temp_home("import-rotated-save-failed");
     let sample = auth_json_needing_refresh("savefail@example.com", "acct_savefail");
     let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
@@ -1109,12 +1268,18 @@ fn import_reports_the_rotation_when_the_profile_write_fails_after_validation() {
     let report = parse_stdout_json(&output);
     let error = report["error"].as_str().unwrap_or_default();
     assert!(
-        error.contains("token_rotation_lost"),
-        "a failed write of rotated credentials needs its own stage, got: {error}"
+        error.contains("token_rotated"),
+        "a recoverable profile write failure must be reported as quarantined: {error}"
     );
+    let recovered: Vec<_> = fs::read_dir(home.join(".codex-switch/recovery"))
+        .expect("the rotated credential must fall back to the recovery store")
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(stored_refresh_token(&recovered[0]), "refresh_1");
     assert!(
-        error.contains("sign in again"),
-        "the user must learn the account needs a new login: {error}"
+        error.contains(&recovered[0].display().to_string()),
+        "the report must name the durable recovery path: {error}"
     );
 
     let _ = fs::remove_dir_all(home);
@@ -1195,6 +1360,7 @@ fn json_directory_import_surfaces_lost_credentials_at_top_level() {
     // "ok-auth.json".
     fs::create_dir_all(home.join(".codex-switch/profiles")).unwrap();
     fs::write(home.join(".codex-switch/profiles/lost"), "not a directory").unwrap();
+    fs::write(home.join(".codex-switch/recovery"), "not a directory").unwrap();
 
     let server = start_rotating_mock_with_failures(rotated_id_token, true, &["access_1"]);
     let output = run_import(

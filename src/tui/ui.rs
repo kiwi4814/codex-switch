@@ -316,6 +316,7 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                     C_RED,
                 ),
                 UsageStatus::Loaded(u) => {
+                    let refreshing = app.is_refreshing(&entry.alias);
                     let over_5h = u.primary.as_ref().is_some_and(|w| {
                         let used = w.used_percent.unwrap_or(0.0);
                         // Suppress pace warning when usage is negligible — a fresh window
@@ -356,7 +357,20 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                     let r7c = r7_ts.map(|ts| reset_color(ts - now)).unwrap_or(DIM);
                     let cards = reset_cards_table_text(u);
                     let cards_color = reset_cards_color(u);
-                    if is_available(u) {
+                    if refreshing {
+                        (
+                            "Refresh".into(),
+                            C_YELLOW,
+                            p5,
+                            p7,
+                            r5,
+                            r5c,
+                            r7,
+                            r7c,
+                            cards,
+                            cards_color,
+                        )
+                    } else if is_available(u) {
                         (
                             "OK".into(),
                             C_GREEN,

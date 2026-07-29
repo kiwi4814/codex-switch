@@ -39,7 +39,7 @@ Configuration is loaded once from `config.toml`. An existing unreadable or inval
 - `auth.lock` serializes replacement or synchronization of the live `auth.json`.
 - `launch.lock` serializes temporary authentication staging performed by `launch`.
 
-Profile identity prefers `account_id` and falls back to email when required. Tokens refreshed while a profile is active are written to both the saved profile and the live auth file under the same switching discipline.
+Profile identity prefers `account_id` and falls back to email when required for locally authenticated operations. Imports are intentionally create-only: Usage API access proves workspace membership, but a Team workspace ID can belong to several users and cannot authorize overwriting an existing profile. Tokens refreshed while a profile is active are written to both the saved profile and the live auth file under the same switching discipline. A rotated import that loses verifiable identity is written under `recovery/`, outside the selectable profile tree.
 
 ## Usage, refresh, and selection
 
@@ -100,7 +100,7 @@ The defaults are `~/.codex` and `~/.codex-switch`. `CODEX_SWITCH_HOME` never cha
 
 The branch CI workflow runs tests, Clippy, and debug builds on Linux, macOS, and Windows. Linux also checks formatting, dependency advisories, and shell syntax; Windows parses the PowerShell installer.
 
-Release artifacts are built only by GitHub Actions for six platform/architecture pairs. The workflow injects the tag-derived version, produces archives and checksums, verifies every checksum, and then creates the GitHub Release. Local release builds are diagnostic only and are never the distribution source of truth.
+Release artifacts are built only by GitHub Actions for six platform/architecture pairs. The workflow injects the tag-derived version, produces archives and checksums, verifies every checksum, and generates a Sigstore build-provenance bundle for the archives before creating the GitHub Release. Direct self-update verifies that bundle against this repository, the release workflow, and the exact tag ref before replacing the binary. Local release builds are diagnostic only and are never the distribution source of truth.
 
 ## Next steps
 

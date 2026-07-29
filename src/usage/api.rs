@@ -213,14 +213,17 @@ pub async fn fetch_usage_retried_force(
 /// failure rather than something to warn about and walk past.
 fn persist_refreshed_tokens(
     alias: &str,
+    presented_refresh_token: &str,
     new_tokens: &RefreshedTokens,
 ) -> std::result::Result<(), UsageError> {
-    crate::profile::update_profile_tokens_and_live_if_current(
+    crate::profile::update_profile_tokens_if_refresh_matches(
         alias,
+        presented_refresh_token,
         &new_tokens.id_token,
         &new_tokens.access_token,
         &new_tokens.refresh_token,
     )
+    .map(|_| ())
     .map_err(|err| UsageError::token_persist_failed(alias, &err))
 }
 
@@ -424,7 +427,13 @@ async fn fetch_usage_retried_inner(
         // would just spend a second single-use token we equally cannot keep.
         // Other aliases refresh in their own calls and are unaffected.
         if let Some(new_tokens) = &outcome.refreshed {
-            persist_refreshed_tokens(alias, new_tokens)?;
+            let presented = refresh_token.as_deref().ok_or_else(|| {
+                UsageError::token_persist_failed(
+                    alias,
+                    &anyhow::anyhow!("refresh response without presented refresh_token"),
+                )
+            })?;
+            persist_refreshed_tokens(alias, presented, new_tokens)?;
             at = new_tokens.access_token.clone();
             id_token = Some(new_tokens.id_token.clone());
             refresh_token = Some(new_tokens.refresh_token.clone());
@@ -660,8 +669,18 @@ async fn fetch_usage_capturing_refresh(
 /// that make it matter. See [`ImportValidation`].
 pub async fn validate_import_auth(val: &mut serde_json::Value) -> ImportValidation {
     let mut refreshed = None;
-    let result = validate_import_auth_capturing_refresh(val, &mut refreshed).await;
-    ImportValidation { refreshed, result }
+    let mut validated_account_id = None;
+    let result = validate_import_auth_capturing_refresh(val, &mut refreshed)
+        .await
+        .map(|(usage, account_id)| {
+            validated_account_id = Some(account_id);
+            usage
+        });
+    ImportValidation {
+        refreshed,
+        validated_account_id,
+        result,
+    }
 }
 
 /// Record a rotation and write it into the auth value being validated.
@@ -687,15 +706,7 @@ fn adopt_refreshed_tokens(
 async fn validate_import_auth_capturing_refresh(
     val: &mut serde_json::Value,
     refreshed: &mut Option<RefreshedTokens>,
-) -> Result<UsageInfo> {
-    if std::env::var("CS_IMPORT_SKIP_USAGE_VALIDATION")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        return Ok(UsageInfo::default());
-    }
-
+) -> Result<(UsageInfo, String)> {
     let (access_token, refresh_token) = auth::extract_tokens(val);
     let id_token = auth::extract_id_token(val);
     let account_info = crate::jwt::parse_account_info(val);
@@ -705,12 +716,15 @@ async fn validate_import_auth_capturing_refresh(
     let alias = "import";
     match (access_token, refresh_token) {
         (Some(at), rt) => {
+            let validated_account_id = account_id
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("imported auth must contain an account_id"))?;
             let outcome = fetch_usage_with_refresh(
                 alias,
                 &at,
                 id_token.as_deref(),
                 rt.as_deref(),
-                account_id.as_deref(),
+                Some(&validated_account_id),
                 is_fedramp,
             )
             .await;
@@ -721,7 +735,7 @@ async fn validate_import_auth_capturing_refresh(
             if let Err(err) = crate::workspace::refresh_for_auth(val).await {
                 debug!("workspace metadata unavailable while importing: {err}");
             }
-            Ok(usage)
+            Ok((usage, validated_account_id))
         }
         (None, Some(rt)) => {
             let client = auth::build_http_client()?;
@@ -733,13 +747,16 @@ async fn validate_import_auth_capturing_refresh(
             );
             adopt_refreshed_tokens(val, first, refreshed)?;
 
-            let account_id = crate::jwt::parse_account_info(val).account_id;
+            let validated_account_id = crate::jwt::parse_account_info(val)
+                .account_id
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("refreshed auth must contain an account_id"))?;
             let outcome = fetch_usage_with_refresh(
                 alias,
                 &access_token,
                 Some(&id_token),
                 Some(&refresh_token),
-                account_id.as_deref(),
+                Some(&validated_account_id),
                 is_fedramp,
             )
             .await;
@@ -750,7 +767,7 @@ async fn validate_import_auth_capturing_refresh(
             if let Err(err) = crate::workspace::refresh_for_auth(val).await {
                 debug!("workspace metadata unavailable while importing: {err}");
             }
-            Ok(usage)
+            Ok((usage, validated_account_id))
         }
         (None, None) => anyhow::bail!("auth.json missing access_token and refresh_token"),
     }
@@ -828,12 +845,21 @@ const OPPORTUNISTIC_REFRESH_CONCURRENCY: usize = 2;
 /// one — see [`refresh_expiring_tokens_within`].
 const OPPORTUNISTIC_START_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 
+fn profile_still_holds_refresh_token(profile_path: &Path, presented: &str) -> bool {
+    auth::read_auth(profile_path)
+        .ok()
+        .and_then(|value| auth::extract_tokens(&value).1)
+        .as_deref()
+        == Some(presented)
+}
+
 /// Opportunistically refresh tokens that are about to expire.
 ///
-/// Refresh *failures* are logged, not propagated — a token the server refused
-/// costs nothing but a retry later. Failures to **save** a rotated token are
-/// returned instead: the old credential is already dead server-side, so a lost
-/// write silently bricks that profile and the caller has to tell someone.
+/// Refresh *failures* are logged, not propagated. A memorable terminal
+/// rejection is cached against the presented credential so the next background
+/// pass does not replay it. Failures to **save** a rotated token are returned
+/// instead: the old credential is already dead server-side, so a lost write
+/// silently bricks that profile and the caller has to tell someone.
 pub async fn refresh_expiring_tokens() -> Vec<TokenPersistFailure> {
     refresh_expiring_tokens_within(OPPORTUNISTIC_START_BUDGET).await
 }
@@ -940,7 +966,7 @@ pub async fn refresh_expiring_tokens_within(
 
     loop {
         while tasks.len() < OPPORTUNISTIC_REFRESH_CONCURRENCY && started_at.elapsed() < budget {
-            let Some((alias, _path, id_token, access_token, rt, exp)) = queued.next() else {
+            let Some((alias, path, id_token, access_token, rt, exp)) = queued.next() else {
                 break;
             };
             tasks.spawn(async move {
@@ -964,7 +990,7 @@ pub async fn refresh_expiring_tokens_within(
                 )
                 .await
                 {
-                    Ok(new_tokens) => match persist_refreshed_tokens(&alias, &new_tokens) {
+                    Ok(new_tokens) => match persist_refreshed_tokens(&alias, &rt, &new_tokens) {
                         Ok(()) => {
                             info!("[{alias}] opportunistic token refresh succeeded");
                             None
@@ -975,7 +1001,27 @@ pub async fn refresh_expiring_tokens_within(
                         Err(error) => Some(TokenPersistFailure { alias, error }),
                     },
                     Err(e) => {
-                        debug!("[{alias}] opportunistic token refresh failed: {e}");
+                        let detail = format!("{e:#}");
+                        if let Some(terminal) = e.downcast_ref::<TerminalAuthError>() {
+                            let error = UsageError {
+                                summary: terminal.summary(),
+                                detail: detail.clone(),
+                            };
+                            if profile_still_holds_refresh_token(&path, &rt) {
+                                remember_terminal_verdict(
+                                    &alias,
+                                    &terminal.code,
+                                    Some(&rt),
+                                    &error,
+                                )
+                                .await;
+                            } else {
+                                debug!(
+                                    "[{alias}] not caching terminal verdict for a superseded credential"
+                                );
+                            }
+                        }
+                        debug!("[{alias}] opportunistic token refresh failed: {detail}");
                         None
                     }
                 }
@@ -1004,6 +1050,26 @@ mod tests {
     fn jwt_with_exp(exp: i64) -> String {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": exp}).to_string());
         format!("header.{payload}.signature")
+    }
+
+    #[test]
+    fn terminal_verdict_guard_rejects_a_superseded_refresh_token() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("auth.json");
+        crate::auth::write_auth(
+            &path,
+            &json!({
+                "tokens": {
+                    "id_token": "id",
+                    "access_token": "access",
+                    "refresh_token": "refresh_new"
+                }
+            }),
+        )
+        .unwrap();
+
+        assert!(!profile_still_holds_refresh_token(&path, "refresh_old"));
+        assert!(profile_still_holds_refresh_token(&path, "refresh_new"));
     }
 
     #[test]

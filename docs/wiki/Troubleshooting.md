@@ -8,15 +8,18 @@ Start with the complete error message, its file path, and the command that produ
 | Credential store is not file-backed | Set `cli_auth_credentials_store = "file"` in `$CODEX_HOME/config.toml`. |
 | Headless login cannot open a browser | Run `codex-switch login --device`. |
 | Windows daemon installation is denied | Open PowerShell as Administrator and retry. |
+| Windows daemon stop says credential work is still in flight | Wait briefly and run `codex-switch daemon stop` again. The process is intentionally left running instead of force-killed while a refresh token may be rotating. |
 | TUI layout is broken in Git Bash | Use Windows Terminal or PowerShell. |
 | Direct update does not replace a Homebrew binary | Run `brew upgrade xjoker/tap/codex-switch`. |
 | A Homebrew installation cannot switch to dev | Run `brew uninstall codex-switch`, then follow [Testing development releases](Development-Releases#install-the-rolling-dev-build). |
 | A direct dev installation should return to Homebrew | Run the direct uninstaller, keep the data directory when prompted, then run `brew install xjoker/tap/codex-switch`. |
 | macOS/Linux self-update reports that the install directory is not writable | Rerun the current installer once to migrate a legacy `/usr/local/bin` direct install to `$HOME/.local/bin`; see [Updating](Updating#legacy-direct-installs). Use `sudo codex-switch self-update` only for an intentional `--system` install. |
 | A dev build should return to stable | Run `codex-switch self-update --stable`. |
+| Self-update reports that `gh attestation verify` is unavailable | Install or upgrade [GitHub CLI](https://cli.github.com/), then retry. Direct self-update fails closed until it can verify the release provenance bundle. |
 | An installed daemon ignores `CODEX_SWITCH_HOME` | The generated service forwards only `HOME` and `CODEX_HOME`; add `CODEX_SWITCH_HOME` to the service definition manually. See [Configuration](Configuration#platform-integration). |
 | HTTPS fails with `invalid peer certificate: UnknownIssuer` | An intercepting proxy is re-signing traffic. See [HTTPS fails with an unknown issuer](#https-fails-with-invalid-peer-certificate-unknownissuer). |
 | An account reports `re-login required (refresh_token_reused)` | The stored refresh token was already spent and cannot be recovered. Run `codex-switch login <alias>` for that profile. The verdict is remembered, so the account costs no further requests until you sign in again; `codex-switch list -f` asks the server anyway. |
+| Import reports a quarantined rotated credential | The server replaced the source file's one-time token before identity or managed-policy validation failed. Keep the named file under `~/.codex-switch/recovery/` private, sign in again, then remove it only after the account works. Recovery files are deliberately not selectable profiles. |
 
 For network or API failures, rerun the smallest failing command with `--debug`:
 

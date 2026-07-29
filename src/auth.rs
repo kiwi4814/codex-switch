@@ -1,6 +1,8 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -180,6 +182,18 @@ pub(crate) fn validate_managed_chatgpt_account(id_token: &str) -> Result<()> {
     validate_managed_auth_config(&config, account_id.as_deref())
 }
 
+/// Enforce the managed ChatGPT workspace policy for a complete auth value.
+/// Keep this at credential-write boundaries: JWT claims are only a routing
+/// hint until a caller has otherwise authenticated the credentials.
+pub(crate) fn validate_managed_auth_value(auth: &serde_json::Value) -> Result<()> {
+    let codex_home = codex_home_from_values(std::env::var_os("CODEX_HOME"), dirs::home_dir())?;
+    let Some((_config_path, config)) = load_codex_config(&codex_home)? else {
+        return Ok(());
+    };
+    let account_id = crate::jwt::parse_account_info(auth).account_id;
+    validate_managed_auth_config(&config, account_id.as_deref())
+}
+
 /// ~/.codex-switch/
 pub fn app_home() -> Result<PathBuf> {
     // Keep application state relocatable without changing Codex's own home.
@@ -219,6 +233,8 @@ pub(crate) fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating directory {}", parent.display()))?;
+    #[cfg(windows)]
+    harden_windows_acl(parent, true)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -228,20 +244,84 @@ pub(crate) fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<()> {
 
     let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("creating temporary file in {}", parent.display()))?;
-    tmp.write_all(contents)
-        .with_context(|| format!("writing temporary file for {}", path.display()))?;
-    tmp.as_file()
-        .sync_all()
-        .with_context(|| format!("syncing temporary file for {}", path.display()))?;
+    #[cfg(windows)]
+    harden_windows_acl(tmp.path(), false)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("setting permissions on {}", tmp.path().display()))?;
     }
+    tmp.write_all(contents)
+        .with_context(|| format!("writing temporary file for {}", path.display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("syncing temporary file for {}", path.display()))?;
     tmp.persist(path)
         .map_err(|err| err.error)
         .with_context(|| format!("atomically replacing {}", path.display()))?;
+    #[cfg(windows)]
+    harden_windows_acl(path, false)?;
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_private_acl_script() -> &'static str {
+    r#"
+$ErrorActionPreference = 'Stop'
+$LiteralPath = $env:CS_ACL_PATH
+$Directory = $env:CS_ACL_KIND -eq 'directory'
+$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+if ($null -eq $currentSid) { throw 'current Windows identity has no SID' }
+$identities = @(
+    $currentSid,
+    [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+    [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+)
+if ($Directory) {
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit `
+        -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+} else {
+    $acl = [Security.AccessControl.FileSecurity]::new()
+    $inheritance = [Security.AccessControl.InheritanceFlags]::None
+}
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($identity in $identities) {
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+        $identity,
+        [Security.AccessControl.FileSystemRights]::FullControl,
+        $inheritance,
+        [Security.AccessControl.PropagationFlags]::None,
+        [Security.AccessControl.AccessControlType]::Allow
+    )
+    [void]$acl.AddAccessRule($rule)
+}
+if ($Directory) {
+    [IO.Directory]::SetAccessControl($LiteralPath, $acl)
+} else {
+    [IO.File]::SetAccessControl($LiteralPath, $acl)
+}
+"#
+}
+
+#[cfg(windows)]
+fn harden_windows_acl(path: &Path, directory: bool) -> Result<()> {
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            windows_private_acl_script(),
+        ])
+        .env("CS_ACL_PATH", path.as_os_str())
+        .env("CS_ACL_KIND", if directory { "directory" } else { "file" })
+        .status()
+        .with_context(|| format!("starting PowerShell ACL hardening for {}", path.display()))?;
+    if !status.success() {
+        anyhow::bail!("PowerShell ACL hardening failed for {}", path.display());
+    }
     Ok(())
 }
 
@@ -303,13 +383,10 @@ pub fn backup_auth(path: &Path) -> Result<()> {
     }
     let ts = now_unix_secs();
     let bak = path.with_extension(format!("json.bak.{ts}"));
-    std::fs::copy(path, &bak)
+    let contents =
+        std::fs::read(path).with_context(|| format!("reading backup source {}", path.display()))?;
+    atomic_write_private(&bak, &contents)
         .with_context(|| format!("backing up {} -> {}", path.display(), bak.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&bak, std::fs::Permissions::from_mode(0o600));
-    }
     cleanup_old_backups(path);
     Ok(())
 }
@@ -323,6 +400,7 @@ pub fn update_tokens(
     let mut val = read_auth(path)?;
     apply_tokens(&mut val, id_token, access_token, refresh_token)
         .with_context(|| format!("updating tokens in {}", path.display()))?;
+    validate_managed_auth_value(&val)?;
     write_auth(path, &val)
 }
 
@@ -430,9 +508,9 @@ pub fn validate_auth_value(val: &serde_json::Value) -> Result<crate::jwt::Accoun
         .map_err(|_| anyhow::anyhow!("tokens.id_token payload is not valid JSON"))?;
 
     let info = crate::jwt::parse_account_info(val);
-    if info.email.is_none() && info.account_id.is_none() {
+    if info.account_id.as_deref().is_none_or(str::is_empty) {
         return Err(anyhow::anyhow!(
-            "id_token does not contain a usable email or account_id"
+            "id_token does not contain a usable account_id"
         ));
     }
 
@@ -772,6 +850,17 @@ mod tests {
     }
 
     #[test]
+    fn windows_acl_script_replaces_the_dacl_instead_of_only_removing_inheritance() {
+        let script = windows_private_acl_script();
+        assert!(script.contains("SetAccessRuleProtection($true, $false)"));
+        assert!(script.contains("SetAccessControl"));
+        assert!(
+            !script.contains("icacls"),
+            "the exact DACL path must not preserve unknown explicit ACEs"
+        );
+    }
+
+    #[test]
     fn test_custom_ca_prefers_codex_ca_and_ignores_empty_values() {
         let selected = custom_ca_path_from_values(
             Some(OsString::from("/certs/codex.pem")),
@@ -826,6 +915,67 @@ mod tests {
         assert!(
             super::tls_trust_hint(msg).is_none(),
             "a hint about certificates would misdirect a plain connection failure"
+        );
+    }
+
+    #[test]
+    fn windows_private_acl_uses_language_neutral_trusted_sids() {
+        let script = super::windows_private_acl_script();
+        assert!(script.contains("WindowsIdentity]::GetCurrent().User"));
+        assert!(script.contains("S-1-5-18"));
+        assert!(script.contains("S-1-5-32-544"));
+        assert!(script.contains("InheritanceFlags]::ObjectInherit"));
+        assert!(script.contains("InheritanceFlags]::ContainerInherit"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_private_write_removes_unknown_explicit_windows_aces() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to seed an Everyone ACE");
+
+        let path = dir.path().join("auth.json");
+        super::atomic_write_private(&path, br#"{"refresh_token":"secret"}"#).unwrap();
+
+        let inspect = r#"
+$ErrorActionPreference = 'Stop'
+foreach ($item in @($env:CS_ACL_DIR, $env:CS_ACL_FILE)) {
+    $acl = Get-Acl -LiteralPath $item
+    Write-Output ('protected=' + $acl.AreAccessRulesProtected)
+    foreach ($rule in $acl.Access) {
+        Write-Output $rule.IdentityReference.Translate(
+            [Security.Principal.SecurityIdentifier]
+        ).Value
+    }
+}
+"#;
+        let output = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                inspect,
+            ])
+            .env("CS_ACL_DIR", dir.path())
+            .env("CS_ACL_FILE", &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ACL inspection failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let acl = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(acl.matches("protected=True").count(), 2);
+        assert!(
+            !acl.lines().any(|line| line.trim() == "S-1-1-0"),
+            "Everyone ACE survived exact DACL replacement:\n{acl}"
         );
     }
 }

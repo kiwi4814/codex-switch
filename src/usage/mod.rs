@@ -308,6 +308,8 @@ pub struct UsageFetchOutcome {
 /// the auth server still accepts and brick the account being imported.
 pub struct ImportValidation {
     pub refreshed: Option<RefreshedTokens>,
+    /// Account id that the Usage API accepted for these credentials.
+    pub validated_account_id: Option<String>,
     pub result: anyhow::Result<UsageInfo>,
 }
 

@@ -159,6 +159,39 @@ fn ci_runs_build_test_lint_format_audit_and_script_parsers() {
 }
 
 #[test]
+fn ci_actions_are_pinned_to_full_commit_shas() {
+    let workflow = repo_file(".github/workflows/ci.yml");
+
+    for line in workflow
+        .lines()
+        .filter(|line| line.trim().starts_with("uses:"))
+    {
+        let reference = line
+            .split_once('@')
+            .map(|(_, reference)| reference.split_whitespace().next().unwrap_or(""))
+            .unwrap_or("");
+        assert!(
+            reference.len() == 40 && reference.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "CI action must be pinned to a full commit SHA: {line}"
+        );
+    }
+}
+
+#[test]
+fn self_update_provenance_requirement_is_documented() {
+    let readme = repo_file("README.md");
+    let readme_cn = repo_file("README_CN.md");
+    let updating = repo_file("docs/wiki/Updating.md");
+    let release = repo_file("docs/RELEASE.md");
+
+    assert!(readme.contains("gh attestation verify"));
+    assert!(readme_cn.contains("gh attestation verify"));
+    assert!(updating.contains("codex-switch-build-provenance.json"));
+    assert!(updating.contains("gh attestation verify"));
+    assert!(release.contains("codex-switch-build-provenance.json"));
+}
+
+#[test]
 fn wiki_sync_uses_the_reviewed_repository_sources() {
     let workflow = repo_file(".github/workflows/wiki.yml");
 
@@ -424,6 +457,20 @@ fn self_update_checks_replace_permission_before_archive_download() {
 }
 
 #[test]
+fn self_update_attestation_is_bound_to_the_current_tag_commit() {
+    let update = repo_file("src/update.rs");
+
+    assert!(update.contains("\"--source-digest\""));
+    assert!(update.contains("fetch_tag_commit_sha(&client, &release.tag_name).await?"));
+    assert!(update.contains("if confirmed_digest != source_digest"));
+    assert_before(
+        &update,
+        "verify_build_provenance(",
+        "if confirmed_digest != source_digest",
+    );
+}
+
+#[test]
 fn self_update_gates_markerless_system_installs_before_network_checks() {
     let command = repo_file("src/commands/update.rs");
 
@@ -474,6 +521,86 @@ fn release_verifies_archives_before_creating_a_release() {
         &workflow,
         "Verify release checksums",
         "Create GitHub Release (stable)",
+    );
+}
+
+#[test]
+fn release_attests_archives_before_publishing_them() {
+    let workflow = repo_file(".github/workflows/release.yml");
+
+    for permission in [
+        "id-token: write",
+        "attestations: write",
+        "artifact-metadata: write",
+    ] {
+        assert!(
+            workflow.contains(permission),
+            "release workflow must grant `{permission}` to the attestation step"
+        );
+    }
+    assert!(workflow.contains("actions/attest@"));
+    assert!(workflow.contains("subject-path:"));
+    assert!(workflow.contains("artifacts/*.tar.gz"));
+    assert!(workflow.contains("artifacts/*.zip"));
+    assert!(workflow.contains("codex-switch-build-provenance.json"));
+    assert_eq!(
+        workflow
+            .matches("target_commitish: ${{ github.sha }}")
+            .count(),
+        2,
+        "dev and stable release metadata must both record the source commit"
+    );
+    assert_before(
+        &workflow,
+        "Attest release archives",
+        "Create GitHub Release (dev)",
+    );
+    assert_before(
+        &workflow,
+        "Attest release archives",
+        "Create GitHub Release (stable)",
+    );
+}
+
+#[test]
+fn windows_daemon_stop_never_force_kills_a_trusted_process() {
+    let daemon = repo_file("src/daemon/mod.rs");
+    assert!(
+        !daemon.contains("pidfile::force_kill(pid)"),
+        "a trusted daemon may be rotating credentials; a graceful-stop timeout must fail visibly \
+         instead of force-killing it"
+    );
+
+    let uninstall_start = daemon.find("fn uninstall()").unwrap();
+    let uninstall_end = daemon[uninstall_start..].find("async fn start").unwrap() + uninstall_start;
+    let uninstall = &daemon[uninstall_start..uninstall_end];
+    assert_eq!(
+        uninstall.matches("windows_stop_gate(").count(),
+        3,
+        "Windows uninstall must gate both before graceful shutdown and again immediately before \
+         Task Scheduler may force-stop the daemon"
+    );
+
+    let stop_start = daemon.find("fn stop()").unwrap();
+    let stop_end = daemon[stop_start..].find("fn stop_detached").unwrap() + stop_start;
+    let stop = &daemon[stop_start..stop_end];
+    assert!(
+        stop.contains("windows_stop_gate("),
+        "Windows stop must pass through the PID-lock gate before Task Scheduler may use /End"
+    );
+    assert!(
+        daemon.contains("cleanup_stale_pidfile()?;"),
+        "a false process diagnostic must acquire and remove the stale PID file or fail closed"
+    );
+    let detached_start = daemon.find("fn stop_detached()").unwrap();
+    let detached_end = daemon[detached_start..]
+        .find("fn wait_until_stopped_or_kill")
+        .unwrap()
+        + detached_start;
+    let detached = &daemon[detached_start..detached_end];
+    assert!(
+        !detached.contains("let _ = pidfile::cleanup_pidfile();"),
+        "Windows graceful-stop completion must propagate a locked PID-file cleanup failure"
     );
 }
 

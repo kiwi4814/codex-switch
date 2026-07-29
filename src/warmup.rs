@@ -484,9 +484,14 @@ async fn warmup_additional_models(
 ///
 /// Each caller owns a single account, so propagating this aborts that account
 /// only — batch drivers keep processing the rest.
-fn persist_refreshed_tokens(alias: &str, refreshed: &crate::usage::RefreshedTokens) -> Result<()> {
-    crate::profile::update_profile_tokens_and_live_if_current(
+fn persist_refreshed_tokens(
+    alias: &str,
+    presented_refresh_token: &str,
+    refreshed: &crate::usage::RefreshedTokens,
+) -> Result<()> {
+    let persisted = crate::profile::update_profile_tokens_if_refresh_matches(
         alias,
+        presented_refresh_token,
         &refreshed.id_token,
         &refreshed.access_token,
         &refreshed.refresh_token,
@@ -496,7 +501,14 @@ fn persist_refreshed_tokens(alias: &str, refreshed: &crate::usage::RefreshedToke
             "{}",
             crate::usage::UsageError::token_persist_failed(alias, &err).detail
         )
-    })
+    })?;
+    if !persisted {
+        debug!(
+            "[{alias}] skipped stale refreshed tokens because another process replaced the \
+             presented refresh token"
+        );
+    }
+    Ok(())
 }
 
 /// Send a minimal completion request to trigger the quota window countdown for a profile.
@@ -562,7 +574,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
         .await
         {
             Ok(refreshed) => {
-                persist_refreshed_tokens(alias, &refreshed)?;
+                persist_refreshed_tokens(alias, rt, &refreshed)?;
                 access_token = refreshed.access_token;
                 id_token = Some(refreshed.id_token);
                 refresh_token = Some(refreshed.refresh_token);
@@ -696,7 +708,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                 .await
                 {
                     Ok(refreshed) => {
-                        persist_refreshed_tokens(alias, &refreshed)?;
+                        persist_refreshed_tokens(alias, rt, &refreshed)?;
                         let mut retry_resp = make_request(
                             &client,
                             &refreshed.access_token,
@@ -778,7 +790,7 @@ pub(crate) async fn fetch_models_for_profile(
             Ok(refreshed) => {
                 // No degrade here: the refresh *worked*, so the old token this
                 // would fall back to has already been invalidated server-side.
-                persist_refreshed_tokens(alias, &refreshed)?;
+                persist_refreshed_tokens(alias, rt, &refreshed)?;
                 access_token = refreshed.access_token;
             }
             // Deliberate degrade: fall through and try /models with the

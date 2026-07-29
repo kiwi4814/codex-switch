@@ -90,10 +90,11 @@ git push origin refs/tags/dev:refs/tags/dev
 >
 > Step 2 likewise requires `refs/heads/dev:refs/heads/dev`.
 
-GitHub Actions Release builds are the only distribution source of truth; do not publish from local `target/release`. The Release job verifies every archive against its `.sha256` before creating a GitHub Release. Artifacts are:
+GitHub Actions Release builds are the only distribution source of truth; do not publish from local `target/release`. The Release job verifies every archive against its `.sha256`, then uses GitHub artifact attestations to generate a Sigstore bundle before creating a GitHub Release. Artifacts are:
 
 - Linux / macOS: `.tar.gz` archives named `cs-{linux,darwin}-{amd64,arm64}.tar.gz` plus `.sha256`
 - Windows: `.zip` archives named `cs-windows-{amd64,arm64}.zip` plus `.sha256`
+- Build provenance: `codex-switch-build-provenance.json`, covering every release archive
 - `install.sh` / `install.ps1`
 - User update path: `codex-switch self-update --dev`
 
@@ -106,6 +107,7 @@ Post-release verification must confirm at least:
 - The GitHub Actions Release run succeeds, including all six builds and the release job.
 - The macOS, Linux, and Windows `legacy-upgrade` jobs prove `v0.0.19` can replace itself with the published version.
 - A platform archive downloaded from GitHub Releases matches its `.sha256`.
+- A current GitHub CLI verifies that archive against `codex-switch-build-provenance.json` with the repository, `.github/workflows/release.yml`, exact tag ref, the full commit digest reached by that tag, and self-hosted runners denied.
 - The unpacked release binary reports the CI-injected version with `codex-switch --version`.
 - The original release path works, for example `codex-switch self-update --check --dev`.
 

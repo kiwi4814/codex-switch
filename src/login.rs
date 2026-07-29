@@ -21,6 +21,8 @@ use crate::output::user_println;
 const ORIGINATOR: &str = "codex_cli_rs";
 const SCOPE: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const CALLBACK_TIMEOUT_SECS: u64 = 300;
+const CALLBACK_CONNECTION_TIMEOUT_SECS: u64 = 5;
+const MAX_CONCURRENT_CALLBACK_CONNECTIONS: usize = 16;
 const CALLBACK_PORT: u16 = 1455;
 const CALLBACK_FALLBACK_PORT: u16 = 1457;
 const CALLBACK_HOST: &str = "127.0.0.1";
@@ -277,93 +279,134 @@ async fn write_callback_response(stream: &mut tokio::net::TcpStream, status: &st
 }
 
 async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<CallbackResult> {
+    let expected_state: std::sync::Arc<str> = expected_state.into();
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let (mut stream, _) = listener
-            .accept()
-            .await
-            .context("accepting OAuth callback connection")?;
-
-        // Read until we have the full first line (may arrive in multiple reads on Windows)
-        let mut buf = vec![0u8; 8192];
-        let mut total = 0;
-        let request_complete = loop {
-            let n = match stream.read(&mut buf[total..]).await {
-                Ok(n) => n,
-                Err(_) => break false,
-            };
-            if n == 0 {
-                break false;
+        if connections.len() >= MAX_CONCURRENT_CALLBACK_CONNECTIONS {
+            let completed = connections
+                .join_next()
+                .await
+                .expect("a full callback task set cannot be empty");
+            if let Some(callback) = completed.context("OAuth callback connection task failed")?? {
+                return Ok(callback);
             }
-            total += n;
-            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n")
-                || buf[..total].windows(2).any(|w| w == b"\n\n")
-            {
-                break true;
-            }
-            if total >= buf.len() {
-                break false;
-            }
-        };
-        if !request_complete {
-            write_callback_response(&mut stream, "400 Bad Request", "Invalid callback request")
-                .await;
             continue;
         }
 
-        let request = String::from_utf8_lossy(&buf[..total]);
-        let first_line = request.lines().next().unwrap_or("");
-        let mut request_parts = first_line.split_whitespace();
-        let method = request_parts.next().unwrap_or("");
-        let target = request_parts.next().unwrap_or("");
-        let (path, query) = target.split_once('?').unwrap_or((target, ""));
-
-        if method != "GET" || path != "/auth/callback" {
-            write_callback_response(&mut stream, "404 Not Found", "Not found").await;
-            continue;
-        }
-
-        let mut code = None;
-        let mut returned_state = None;
-        let mut error = None;
-
-        for part in query.split('&') {
-            if let Some((k, v)) = part.split_once('=') {
-                let decoded = urlencoding::decode(v).unwrap_or_default().into_owned();
-                match k {
-                    "code" => code = Some(decoded),
-                    "state" => returned_state = Some(decoded),
-                    "error" => error = Some(decoded),
-                    _ => {}
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.context("accepting OAuth callback connection")?;
+                let expected_state = expected_state.clone();
+                connections.spawn(async move {
+                    handle_callback_connection(stream, expected_state.as_ref()).await
+                });
+            }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                let completed = completed.expect("a non-empty callback task set must yield a task");
+                if let Some(callback) =
+                    completed.context("OAuth callback connection task failed")??
+                {
+                    return Ok(callback);
                 }
             }
         }
+    }
+}
 
-        if returned_state.as_deref() != Some(expected_state) {
-            write_callback_response(&mut stream, "403 Forbidden", "Invalid callback state").await;
-            continue;
+async fn handle_callback_connection(
+    mut stream: tokio::net::TcpStream,
+    expected_state: &str,
+) -> Result<Option<CallbackResult>> {
+    // Read until we have the full first line (may arrive in multiple reads on Windows).
+    let mut buf = vec![0u8; 8192];
+    let mut total = 0;
+    let request_complete = tokio::time::timeout(
+        Duration::from_secs(CALLBACK_CONNECTION_TIMEOUT_SECS),
+        async {
+            loop {
+                let n = match stream.read(&mut buf[total..]).await {
+                    Ok(n) => n,
+                    Err(_) => break false,
+                };
+                if n == 0 {
+                    break false;
+                }
+                total += n;
+                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n")
+                    || buf[..total].windows(2).any(|w| w == b"\n\n")
+                {
+                    break true;
+                }
+                if total >= buf.len() {
+                    break false;
+                }
+            }
+        },
+    )
+    .await;
+    let (request_complete, status, body) = match request_complete {
+        Ok(true) => (true, "", ""),
+        Ok(false) => (false, "400 Bad Request", "Invalid callback request"),
+        Err(_) => (false, "408 Request Timeout", "Callback request timed out"),
+    };
+    if !request_complete {
+        write_callback_response(&mut stream, status, body).await;
+        return Ok(None);
+    }
+
+    let request = String::from_utf8_lossy(&buf[..total]);
+    let first_line = request.lines().next().unwrap_or("");
+    let mut request_parts = first_line.split_whitespace();
+    let method = request_parts.next().unwrap_or("");
+    let target = request_parts.next().unwrap_or("");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+
+    if method != "GET" || path != "/auth/callback" {
+        write_callback_response(&mut stream, "404 Not Found", "Not found").await;
+        return Ok(None);
+    }
+
+    let mut code = None;
+    let mut returned_state = None;
+    let mut error = None;
+
+    for part in query.split('&') {
+        if let Some((k, v)) = part.split_once('=') {
+            let decoded = urlencoding::decode(v).unwrap_or_default().into_owned();
+            match k {
+                "code" => code = Some(decoded),
+                "state" => returned_state = Some(decoded),
+                "error" => error = Some(decoded),
+                _ => {}
+            }
         }
+    }
 
-        if let Some(e) = error {
-            write_callback_response(&mut stream, "400 Bad Request", "Authorization failed").await;
-            bail!("Authorization failed: {e}");
-        }
+    if returned_state.as_deref() != Some(expected_state) {
+        write_callback_response(&mut stream, "403 Forbidden", "Invalid callback state").await;
+        return Ok(None);
+    }
 
-        let Some(code) = code.filter(|code| !code.is_empty()) else {
-            write_callback_response(
-                &mut stream,
-                "400 Bad Request",
-                "Callback did not include an authorization code",
-            )
-            .await;
-            continue;
-        };
+    if let Some(e) = error {
+        write_callback_response(&mut stream, "400 Bad Request", "Authorization failed").await;
+        bail!("Authorization failed: {e}");
+    }
 
-        let html = r#"<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:60px">
+    let Some(code) = code.filter(|code| !code.is_empty()) else {
+        write_callback_response(
+            &mut stream,
+            "400 Bad Request",
+            "Callback did not include an authorization code",
+        )
+        .await;
+        return Ok(None);
+    };
+
+    let html = r#"<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:60px">
 <h2>✓ Login successful</h2><p>You may close this tab and return to the terminal.</p>
 </body></html>"#;
-        write_callback_response(&mut stream, "200 OK", html).await;
-        return Ok(CallbackResult { code });
-    }
+    write_callback_response(&mut stream, "200 OK", html).await;
+    Ok(Some(CallbackResult { code }))
 }
 
 // ── Token exchange ────────────────────────────────────────
@@ -1181,6 +1224,46 @@ mod tests {
         assert!(valid.starts_with("HTTP/1.1 200 OK"));
 
         assert_eq!(callback.await.unwrap().unwrap().code, "valid-code");
+    }
+
+    #[tokio::test]
+    async fn callback_slow_connection_does_not_block_a_valid_callback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let callback = tokio::spawn(async move { wait_for_callback(listener, "expected").await });
+
+        let mut slow_connections = Vec::new();
+        for _ in 0..8 {
+            slow_connections.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        let valid = tokio::time::timeout(
+            Duration::from_secs(1),
+            send_callback_request(addr, "/auth/callback?code=valid-code&state=expected"),
+        )
+        .await
+        .expect("half-open connections must be handled concurrently");
+
+        assert!(valid.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(callback.await.unwrap().unwrap().code, "valid-code");
+        drop(slow_connections);
+    }
+
+    #[tokio::test]
+    async fn callback_accepts_a_request_split_across_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let callback = tokio::spawn(async move { wait_for_callback(listener, "expected").await });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /auth/callback?code=split&state=expected HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        stream.write_all(b"Host: localhost\r\n\r\n").await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(callback.await.unwrap().unwrap().code, "split");
     }
 
     #[test]

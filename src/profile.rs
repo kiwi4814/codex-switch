@@ -64,6 +64,10 @@ pub fn read_current() -> String {
 fn ensure_private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)
         .with_context(|| format!("creating directory {}", path.display()))?;
+    #[cfg(windows)]
+    crate::auth::atomic_write_private(&path.join(".acl-probe"), b"")
+        .and_then(|_| std::fs::remove_file(path.join(".acl-probe")).map_err(Into::into))
+        .with_context(|| format!("securing directory {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -228,6 +232,7 @@ fn switch_live_auth(alias: &str) -> Result<()> {
 
     let _transaction = lock_auth_transaction()?;
     let val = read_auth(&src)?;
+    crate::auth::validate_managed_auth_value(&val)?;
     let dst = codex_auth_path()?;
     backup_auth(&dst)?;
     write_auth(&dst, &val)?;
@@ -235,41 +240,52 @@ fn switch_live_auth(alias: &str) -> Result<()> {
     Ok(())
 }
 
-/// Persist refreshed tokens and, if this alias is current, update the live
-/// Codex credentials under the same cross-process transaction.
-pub fn update_profile_tokens_and_live_if_current(
+/// Compare-and-swap a refresh rotation while holding the auth transaction.
+/// A concurrent re-login supersedes the presented token and must win.
+pub fn update_profile_tokens_if_refresh_matches(
     alias: &str,
+    presented_refresh_token: &str,
     id_token: &str,
     access_token: &str,
-    refresh_token: &str,
-) -> Result<()> {
-    update_profile_tokens_and_live_if_current_after_launch(
+    new_refresh_token: &str,
+) -> Result<bool> {
+    update_profile_tokens_if_refresh_matches_after_launch(
         alias,
+        presented_refresh_token,
         id_token,
         access_token,
-        refresh_token,
+        new_refresh_token,
         || {},
     )
 }
 
-fn update_profile_tokens_and_live_if_current_after_launch(
+fn update_profile_tokens_if_refresh_matches_after_launch(
     alias: &str,
+    presented_refresh_token: &str,
     id_token: &str,
     access_token: &str,
-    refresh_token: &str,
+    new_refresh_token: &str,
     after_launch: impl FnOnce(),
-) -> Result<()> {
+) -> Result<bool> {
     validate_alias(alias)?;
     let profile_path = profile_auth_path(alias)?;
     let _transaction = lock_auth_transaction_after_launch(after_launch)?;
-    crate::auth::update_tokens(&profile_path, id_token, access_token, refresh_token)
-        .with_context(|| format!("updating refreshed tokens for profile {alias}"))?;
+    let profile = read_auth(&profile_path)?;
+    if refresh_token(&profile) != Some(presented_refresh_token) {
+        return Ok(false);
+    }
+    let mut updated = profile;
+    crate::auth::apply_tokens(&mut updated, id_token, access_token, new_refresh_token)?;
+    crate::auth::validate_managed_auth_value(&updated)?;
+    crate::auth::update_tokens(&profile_path, id_token, access_token, new_refresh_token)?;
     if read_current() == alias {
         let live = codex_auth_path()?;
-        crate::auth::update_tokens(&live, id_token, access_token, refresh_token)
-            .with_context(|| format!("updating live auth for current profile {alias}"))?;
+        let live_auth = read_auth(&live)?;
+        if refresh_token(&live_auth) == Some(presented_refresh_token) {
+            crate::auth::update_tokens(&live, id_token, access_token, new_refresh_token)?;
+        }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Replace a saved profile and its live copy, when current, as one serialized
@@ -281,6 +297,7 @@ pub fn replace_profile_auth_and_live_if_current(
     validate_alias(alias)?;
     let profile_path = profile_auth_path(alias)?;
     let _transaction = lock_auth_transaction()?;
+    crate::auth::validate_managed_auth_value(val)?;
     ensure_same_account_identity(alias, &read_auth(&profile_path)?, val)?;
     write_auth(&profile_path, val)?;
     if read_current() == alias {
@@ -495,6 +512,13 @@ impl SaveAction {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Binary-only import command consumes these fields.
+pub(crate) enum RecoveredImportAction {
+    Profile(SaveAction),
+    Quarantined { path: PathBuf, reason: String },
+}
+
+#[derive(Debug)]
 pub struct ImportSuccess {
     pub source: PathBuf,
     pub alias: String,
@@ -678,15 +702,17 @@ fn ensure_live_not_older(
 /// The one door through which credentials reach an existing profile.
 ///
 /// Every entry point that copies an already-minted auth.json into the profile
-/// store (`cmd_save`, `save_imported_auth_value`, `update_profile_from_live`)
-/// goes through here, so the two invariants cannot be bypassed by adding a
-/// caller: the credentials must belong to this profile's account, and they must
-/// not roll its single-use `refresh_token` backwards.
+/// store (`cmd_save`, `update_profile_from_live`, and login replacement) goes
+/// through here, so the two invariants cannot be bypassed by adding a caller:
+/// the credentials must belong to this profile's account, and they must not
+/// roll its single-use `refresh_token` backwards. Imports are create-only and
+/// never select an existing profile.
 ///
 /// A profile that does not exist yet has nothing to protect, so this doubles as
 /// the create path; callers that require an existing profile check that first.
 fn write_profile_credentials(alias: &str, incoming: &serde_json::Value) -> Result<()> {
     validate_alias(alias)?;
+    crate::auth::validate_managed_auth_value(incoming)?;
     let dst = profile_auth_path(alias)?;
     if let Ok(existing) = read_auth(&dst) {
         ensure_same_account_identity(alias, &existing, incoming)?;
@@ -847,9 +873,7 @@ pub fn cmd_save(alias: Option<&str>) -> Result<SaveAction> {
     if dst.exists() {
         let unique = make_unique_alias(&resolved_alias)?;
         validate_alias(&unique)?;
-        let unique_path = profile_auth_path(&unique)?;
-        ensure_profile_parent(&unique_path)?;
-        write_auth(&unique_path, &val)?;
+        write_profile_credentials(&unique, &val)?;
         write_current(&unique)?;
         user_println(&format!(
             "Saved profile: {unique} (alias '{resolved_alias}' already taken)"
@@ -857,8 +881,7 @@ pub fn cmd_save(alias: Option<&str>) -> Result<SaveAction> {
         return Ok(SaveAction::Created(unique));
     }
 
-    ensure_profile_parent(&dst)?;
-    write_auth(&dst, &val)?;
+    write_profile_credentials(&resolved_alias, &val)?;
     write_current(&resolved_alias)?;
     user_println(&format!("Saved profile: {resolved_alias}"));
     Ok(SaveAction::Created(resolved_alias))
@@ -930,6 +953,7 @@ pub fn stage_profile_auth(alias: &str) -> Result<()> {
         return Err(CsError::NotFound(alias.to_string()).into());
     }
     let val = read_auth(&src)?;
+    crate::auth::validate_managed_auth_value(&val)?;
     let dst = codex_auth_path()?;
     write_auth(&dst, &val)?;
     Ok(())
@@ -1007,26 +1031,103 @@ fn collect_import_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Resul
 }
 
 pub fn save_imported_auth_value(
-    val: serde_json::Value,
+    val: &serde_json::Value,
     hint_alias: Option<&str>,
+    validated_account_id: &str,
+    suggested_alias: Option<&str>,
 ) -> Result<SaveAction> {
     let _transaction = lock_auth_transaction()?;
-    let identity = extract_identity(&val);
-
-    // An imported dump is credentials of unknown age, so it is held to the same
-    // identity and rollback rules as a read-back from ~/.codex/auth.json.
-    let update_target = match hint_alias {
-        Some(a) => resolve_named_target(a, &identity)?,
-        None => resolve_identity_target(&identity)?,
-    };
-    if let Some(target) = update_target {
-        write_profile_credentials(&target, &val)?;
-        return Ok(SaveAction::Updated(target));
+    let identity = extract_identity(val);
+    let account_id = identity
+        .account_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("imported auth must contain a non-empty account_id"))?;
+    if account_id != validated_account_id {
+        anyhow::bail!(
+            "imported account_id '{account_id}' does not match Usage API validated account_id \
+             '{validated_account_id}'"
+        );
     }
+    crate::auth::validate_managed_auth_value(val)?;
 
+    // Usage API proves the bearer can access this workspace, but a Team
+    // workspace id is shared by multiple users and the JWT is not
+    // signature-verified here. It therefore cannot prove ownership of an
+    // existing profile. Imports are create-only; collisions get a unique alias.
+    create_import_profile(val, hint_alias, suggested_alias)
+}
+
+/// Preserve credentials rotated by the auth server after validation later
+/// failed. Without a successful Usage API response they may never overwrite an
+/// existing profile; a unique recovery profile is the only safe destination.
+#[allow(dead_code)] // Called by the binary-only import command, not the library target.
+pub(crate) fn save_recovered_import_auth_value(
+    val: serde_json::Value,
+    hint_alias: Option<&str>,
+    suggested_alias: Option<&str>,
+) -> Result<RecoveredImportAction> {
+    let _transaction = lock_auth_transaction()?;
+    let account_id = extract_identity(&val)
+        .account_id
+        .filter(|account_id| !account_id.is_empty());
+    let validation = account_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("rotated credentials have no authenticated account_id"))
+        .and_then(|_| crate::auth::validate_managed_auth_value(&val));
+    let profile_result = validation.and_then(|_| {
+        create_import_profile(&val, hint_alias, suggested_alias).map(RecoveredImportAction::Profile)
+    });
+    match profile_result {
+        Ok(action) => Ok(action),
+        Err(error) => {
+            let path = quarantine_recovered_import(&val).with_context(|| {
+                format!(
+                    "profile recovery failed ({error:#}) and quarantining rotated credentials \
+                     also failed"
+                )
+            })?;
+            Ok(RecoveredImportAction::Quarantined {
+                path,
+                reason: error.to_string(),
+            })
+        }
+    }
+}
+
+fn quarantine_recovered_import(val: &serde_json::Value) -> Result<PathBuf> {
+    let recovery_dir = crate::auth::app_home()?.join("recovery");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    let contents = serde_json::to_vec_pretty(val).context("serializing recovered credentials")?;
+    for suffix in 0..1000u16 {
+        let filename = if suffix == 0 {
+            format!("rotated-import-{timestamp}.json")
+        } else {
+            format!("rotated-import-{timestamp}-{suffix}.json")
+        };
+        let path = recovery_dir.join(filename);
+        if path.exists() {
+            continue;
+        }
+        crate::auth::atomic_write_private(&path, &contents)?;
+        return Ok(path);
+    }
+    anyhow::bail!("could not allocate a unique rotated-import recovery path")
+}
+
+fn create_import_profile(
+    val: &serde_json::Value,
+    hint_alias: Option<&str>,
+    suggested_alias: Option<&str>,
+) -> Result<SaveAction> {
+    let identity = extract_identity(val);
     let alias = hint_alias
         .map(|s| s.to_string())
         .or_else(|| identity.email.as_deref().map(alias_from_email))
+        .or_else(|| suggested_alias.map(str::to_string))
         .unwrap_or_else(|| "account".to_string());
     validate_alias(&alias)?;
     let alias = if profile_auth_path(&alias)?.exists() {
@@ -1036,9 +1137,7 @@ pub fn save_imported_auth_value(
     };
     validate_alias(&alias)?;
 
-    let dst = profile_auth_path(&alias)?;
-    ensure_profile_parent(&dst)?;
-    write_auth(&dst, &val)?;
+    write_profile_credentials(&alias, val)?;
     Ok(SaveAction::Created(alias))
 }
 
@@ -1073,6 +1172,7 @@ pub fn rename_profile(old_alias: &str, new_alias: &str) -> Result<()> {
 
 pub fn save_auth_value(val: serde_json::Value, hint_alias: Option<&str>) -> Result<SaveAction> {
     let _transaction = lock_auth_transaction()?;
+    crate::auth::validate_managed_auth_value(&val)?;
     let identity = extract_identity(&val);
 
     let existing = match hint_alias {
@@ -1386,8 +1486,9 @@ mod tests {
         let updater = std::thread::spawn(move || {
             done_tx
                 .send(
-                    super::update_profile_tokens_and_live_if_current_after_launch(
+                    super::update_profile_tokens_if_refresh_matches_after_launch(
                         "alice",
+                        "a-ref",
                         "a-id-new",
                         "a-new",
                         "a-ref-new",
@@ -1403,7 +1504,9 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(1))
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .then_some(())
+            .expect("refresh CAS should persist");
         updater.join().unwrap();
         switcher.join().unwrap().unwrap();
 
@@ -2228,17 +2331,168 @@ mod tests {
     }
 
     #[test]
-    fn save_imported_auth_value_with_explicit_alias_writes_to_that_profile_not_its_email_twin() {
+    fn save_imported_auth_value_rejects_email_only_credentials_even_with_explicit_alias() {
         let _env = TestEnv::new();
         seed_email_twins();
         let imported = auth_json_without_account_id("oai001@ozi.xyz", "acc_imp", "ref_imp");
 
-        match super::save_imported_auth_value(imported, Some("oai001_20x")) {
-            Ok(super::SaveAction::Updated(alias)) => assert_eq!(alias, "oai001_20x"),
-            other => panic!("expected the named profile to be updated, got {other:?}"),
-        }
-        assert_eq!(profile_refresh_token("oai001_20x"), "ref_imp");
+        let err =
+            super::save_imported_auth_value(&imported, Some("oai001_20x"), "acct_import", None)
+                .expect_err("unverified JWT email must not select an existing profile");
+        assert!(err.to_string().contains("non-empty account_id"));
+        assert_eq!(profile_refresh_token("oai001_20x"), "ref_p");
         assert_eq!(profile_refresh_token("oai001"), "ref_t");
+    }
+
+    #[test]
+    fn save_imported_auth_value_does_not_overwrite_an_explicit_alias() {
+        let _env = TestEnv::new();
+        seed_email_twins();
+        let imported = realistic_auth_json("oai001@ozi.xyz", "acct_attacker", "acc_imp", "ref_imp");
+        let action =
+            super::save_imported_auth_value(&imported, Some("oai001_20x"), "acct_attacker", None)
+                .expect("an explicit alias collision should create a unique profile");
+        match action {
+            super::SaveAction::Created(alias) => assert_eq!(alias, "oai001_20x_2"),
+            other => panic!("import must never update the named profile, got {other:?}"),
+        }
+        assert_eq!(profile_refresh_token("oai001_20x"), "ref_p");
+        assert_eq!(profile_refresh_token("oai001_20x_2"), "ref_imp");
+    }
+
+    #[test]
+    fn save_imported_auth_value_requires_usage_validated_account_id_match() {
+        let _env = TestEnv::new();
+        let imported = realistic_auth_json("alice@example.com", "acct_alice", "acc_imp", "ref_imp");
+        let err = super::save_imported_auth_value(&imported, None, "acct_other", None)
+            .expect_err("unverified JWT identity cannot replace validation evidence");
+        assert!(err.to_string().contains("does not match Usage API"));
+        assert!(super::list_profiles().unwrap().is_empty());
+    }
+
+    #[test]
+    fn imported_credentials_never_overwrite_an_existing_profile_without_user_proof() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "alice",
+            &realistic_auth_json(
+                "alice@example.com",
+                "acct_shared_workspace",
+                "access_existing",
+                "refresh_existing",
+            ),
+        );
+        let imported = realistic_auth_json(
+            "alice@example.com",
+            "acct_shared_workspace",
+            "access_imported",
+            "refresh_imported",
+        );
+
+        let action = super::save_imported_auth_value(
+            &imported,
+            None,
+            "acct_shared_workspace",
+            Some("alice"),
+        )
+        .expect("a validated import should be preserved in a new profile");
+
+        match action {
+            super::SaveAction::Created(alias) => assert_eq!(alias, "alice_2"),
+            other => panic!("import must create instead of overwriting, got {other:?}"),
+        }
+        assert_eq!(profile_refresh_token("alice"), "refresh_existing");
+        assert_eq!(profile_refresh_token("alice_2"), "refresh_imported");
+    }
+
+    #[test]
+    fn refresh_token_cas_does_not_overwrite_a_concurrent_relogin() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "alice",
+            &realistic_auth_json("alice@example.com", "acct_a", "old_access", "refresh_new"),
+        );
+        let written = super::update_profile_tokens_if_refresh_matches(
+            "alice",
+            "refresh_old",
+            "stale_id",
+            "stale_access",
+            "stale_refresh",
+        )
+        .unwrap();
+        assert!(
+            !written,
+            "a re-login that replaced the presented token wins"
+        );
+        assert_eq!(profile_refresh_token("alice"), "refresh_new");
+
+        let written = super::update_profile_tokens_if_refresh_matches(
+            "alice",
+            "refresh_new",
+            "fresh_id",
+            "fresh_access",
+            "fresh_refresh",
+        )
+        .unwrap();
+        assert!(written);
+        assert_eq!(profile_refresh_token("alice"), "fresh_refresh");
+    }
+
+    #[test]
+    fn switch_rejects_disallowed_managed_workspace_without_changing_live_auth() {
+        let env = TestEnv::new();
+        seed_profile(
+            "blocked",
+            &realistic_auth_json(
+                "blocked@example.com",
+                "workspace-blocked",
+                "blocked_access",
+                "blocked_refresh",
+            ),
+        );
+        let original = realistic_auth_json(
+            "allowed@example.com",
+            "workspace-allowed",
+            "live_access",
+            "live_refresh",
+        );
+        write_live(&original);
+        std::fs::create_dir_all(env._home.path().join(".codex")).unwrap();
+        std::fs::write(
+            env._home.path().join(".codex/config.toml"),
+            "forced_chatgpt_workspace_id = \"workspace-allowed\"\n",
+        )
+        .unwrap();
+
+        let err = super::switch_profile("blocked").expect_err("managed policy must fail closed");
+        assert!(err.to_string().contains("not allowed"));
+        assert_eq!(
+            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn save_rejects_disallowed_managed_workspace_before_creating_profile() {
+        let env = TestEnv::new();
+        let blocked = realistic_auth_json(
+            "blocked@example.com",
+            "workspace-blocked",
+            "blocked_access",
+            "blocked_refresh",
+        );
+        write_live(&blocked);
+        std::fs::create_dir_all(env._home.path().join(".codex")).unwrap();
+        std::fs::write(
+            env._home.path().join(".codex/config.toml"),
+            "forced_chatgpt_workspace_id = \"workspace-allowed\"\n",
+        )
+        .unwrap();
+
+        let err = super::cmd_save(Some("blocked"))
+            .expect_err("managed policy must guard new profile creation");
+        assert!(err.to_string().contains("not allowed"));
+        assert!(!super::profile_auth_path("blocked").unwrap().exists());
     }
 
     // ── Rollback protection on the save/import entry points ──
@@ -2280,7 +2534,7 @@ mod tests {
     }
 
     #[test]
-    fn save_imported_auth_value_refuses_to_roll_a_profile_back_to_a_revoked_token() {
+    fn save_imported_auth_value_preserves_a_stale_dump_without_overwriting() {
         let _env = TestEnv::new();
         seed_profile_ahead_of_live();
         // A stale auth.json dump on disk is the same hazard as a stale live file.
@@ -2292,10 +2546,14 @@ mod tests {
             Some("2026-07-20T00:00:00Z"),
         );
 
-        let err = super::save_imported_auth_value(imported, None)
-            .expect_err("import must not overwrite a newer profile");
-        assert_eq!(assert_rollback_refusal(&err).alias, "alice");
+        let action = super::save_imported_auth_value(&imported, None, "acct_a", None)
+            .expect("import should preserve the dump in a unique profile");
+        match action {
+            super::SaveAction::Created(alias) => assert_eq!(alias, "alice_2"),
+            other => panic!("import must not update the newer profile, got {other:?}"),
+        }
         assert_eq!(profile_refresh_token("alice"), "ref_new");
+        assert_eq!(profile_refresh_token("alice_2"), "ref_dead");
     }
 
     #[test]
