@@ -65,8 +65,7 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)
         .with_context(|| format!("creating directory {}", path.display()))?;
     #[cfg(windows)]
-    crate::auth::atomic_write_private(&path.join(".acl-probe"), b"")
-        .and_then(|_| std::fs::remove_file(path.join(".acl-probe")).map_err(Into::into))
+    crate::auth::harden_windows_private_directory(path)
         .with_context(|| format!("securing directory {}", path.display()))?;
     #[cfg(unix)]
     {

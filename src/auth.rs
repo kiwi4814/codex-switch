@@ -325,6 +325,11 @@ fn harden_windows_acl(path: &Path, directory: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+pub(crate) fn harden_windows_private_directory(path: &Path) -> Result<()> {
+    harden_windows_acl(path, true)
+}
+
 pub fn write_auth(path: &Path, val: &serde_json::Value) -> Result<()> {
     let raw = serde_json::to_string_pretty(val)?;
     atomic_write_private(path, raw.as_bytes())
@@ -945,7 +950,11 @@ mod tests {
         let inspect = r#"
 $ErrorActionPreference = 'Stop'
 foreach ($item in @($env:CS_ACL_DIR, $env:CS_ACL_FILE)) {
-    $acl = Get-Acl -LiteralPath $item
+    $acl = if (Test-Path -LiteralPath $item -PathType Container) {
+        [IO.Directory]::GetAccessControl($item)
+    } else {
+        [IO.File]::GetAccessControl($item)
+    }
     Write-Output ('protected=' + $acl.AreAccessRulesProtected)
     foreach ($rule in $acl.Access) {
         Write-Output $rule.IdentityReference.Translate(
