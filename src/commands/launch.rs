@@ -1,6 +1,33 @@
 use crate::output::{print_json, user_println};
+use crate::signals::ShutdownListener;
 use crate::{auth, config, profile};
 use anyhow::{Context, Result};
+
+/// How the window Codex needs to read the staged `auth.json` ended.
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchWait {
+    Elapsed,
+    Interrupted,
+}
+
+/// Waits out that window, returning early if the user interrupts.
+///
+/// `interrupt` is deliberately a parameter rather than something this function
+/// builds: it has to be registered before staging starts. Tokio discards a
+/// signal that arrives with nothing registered for it, so a listener created
+/// here would leave the whole staging window under the default terminate
+/// action — Ctrl+C during the swap would kill the process outright, with the
+/// staged profile left live and the user's own credentials stranded in a
+/// `.bak` file whose name nothing ever printed.
+async fn wait_for_codex_to_read_auth(
+    interrupt: &mut ShutdownListener,
+    delay: std::time::Duration,
+) -> LaunchWait {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => LaunchWait::Elapsed,
+        _ = interrupt.recv() => LaunchWait::Interrupted,
+    }
+}
 
 pub(crate) async fn launch_cmd(
     alias: Option<&str>,
@@ -56,6 +83,12 @@ pub(crate) async fn launch_cmd(
         std::process::id(),
         auth::now_unix_secs()
     ));
+
+    // Registered before the first byte of the user's auth.json moves, so a
+    // Ctrl+C anywhere from here to the restore is recorded rather than
+    // discarded. See `wait_for_codex_to_read_auth`.
+    let mut interrupt = ShutdownListener::interrupt_only()
+        .context("registering the interrupt handler that guards the staged auth.json")?;
 
     // The dedicated launch lease covers only stage -> process start -> short
     // read window -> restore. It does not hold the auth write lock or wait for
@@ -134,18 +167,13 @@ pub(crate) async fn launch_cmd(
 
     // Give codex time to read auth.json, then restore immediately.
     // Configurable via [launch] restore_delay_secs (default: 3).
-    let delay = config::get().launch.restore_delay_secs;
-    // If the user interrupts (Ctrl+C) during this window, still restore the
-    // original auth.json before exiting rather than leaving the staged profile
-    // in place. tokio's ctrl_c handler overrides the default-terminate, so the
-    // restore block below always runs.
-    tokio::select! {
-        _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {}
-        _ = tokio::signal::ctrl_c() => {
-            if !json {
-                user_println("Interrupted; restoring original auth.json...");
-            }
-        }
+    let delay = std::time::Duration::from_secs(config::get().launch.restore_delay_secs);
+    // An interrupt anywhere since staging began — including one that landed
+    // while the swap itself was running — lands here, and the restore below
+    // still runs.
+    if wait_for_codex_to_read_auth(&mut interrupt, delay).await == LaunchWait::Interrupted && !json
+    {
+        user_println("Interrupted; restoring original auth.json...");
     }
 
     {
@@ -369,6 +397,70 @@ mod tests {
     // unconditional import is dead on Windows and fails `-D warnings` there.
     #[cfg(unix)]
     use super::backup_launch_auth;
+
+    /// Staging moves the user's live `auth.json` aside and puts a profile's
+    /// credentials in its place; the restore that undoes it only runs once the
+    /// wait below returns. A Ctrl+C pressed *during* staging therefore lands
+    /// before the wait starts polling — and if the listener is created inside
+    /// the wait, tokio has nothing registered at broadcast time, discards the
+    /// signal's record of itself, and the default terminate action kills the
+    /// process with the staged profile still live and the original stranded in
+    /// a `.bak` file the user never sees named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupt_arriving_during_staging_still_triggers_the_restore() {
+        use super::{LaunchWait, wait_for_codex_to_read_auth};
+        use crate::signals::{RAISE_LOCK, ShutdownListener};
+        use std::time::Duration;
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let _raise = RAISE_LOCK.lock().await;
+        // Registered where `launch_cmd` registers it: before the first byte of
+        // the user's auth.json is touched.
+        let mut interrupt = ShutdownListener::interrupt_only().expect("interrupt listener");
+
+        // Turns "tokio finished broadcasting" into an awaitable event so the
+        // assertion never depends on sleeping long enough.
+        let mut witness = signal(SignalKind::interrupt()).expect("witness listener");
+
+        // SAFETY: raising SIGINT at our own process, with both listeners above
+        // already registered, so the default terminate action cannot fire.
+        // This stands in for the staging window: the signal lands well before
+        // anything polls for it.
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        witness.recv().await;
+
+        // A delay long enough that returning `Elapsed` is impossible.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_codex_to_read_auth(&mut interrupt, Duration::from_secs(600)),
+        )
+        .await
+        .expect("the wait must observe an interrupt that predates it");
+        assert_eq!(
+            outcome,
+            LaunchWait::Interrupted,
+            "the restore has to run, so the wait must report the interrupt"
+        );
+    }
+
+    /// The ordinary path: nothing interrupts, so the wait just times out and
+    /// the restore runs on schedule.
+    #[tokio::test]
+    async fn an_uninterrupted_wait_reports_the_elapsed_delay() {
+        use super::{LaunchWait, wait_for_codex_to_read_auth};
+        use crate::signals::{RAISE_LOCK, ShutdownListener};
+        use std::time::Duration;
+
+        // Not raising anything, but a sibling test does, and a raise is
+        // process-wide: without the lock this listener can catch it.
+        let _raise = RAISE_LOCK.lock().await;
+        let mut interrupt = ShutdownListener::interrupt_only().expect("interrupt listener");
+        assert_eq!(
+            wait_for_codex_to_read_auth(&mut interrupt, Duration::from_millis(10)).await,
+            LaunchWait::Elapsed
+        );
+    }
 
     struct TestAppHome {
         _lock: MutexGuard<'static, ()>,
