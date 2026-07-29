@@ -285,11 +285,23 @@ async fn import_one_file(
         }
     };
 
-    let mut account = auth::validate_auth_value(&val).map_err(|e| profile::ImportFailure {
-        source: source.to_path_buf(),
-        stage: "structure",
-        error: e.to_string(),
-    })?;
+    // This second structure check inspects the *refreshed* value, so a
+    // malformed refresh reply fails it at a point where the source file's
+    // token is already spent. `val` is then the only credential the auth
+    // server still accepts and has to be rescued, exactly as above.
+    let mut account = match auth::validate_auth_value(&val) {
+        Ok(account) => account,
+        Err(error) if rotated => {
+            return Err(rescue_rotated_credentials(source, val, alias, &error));
+        }
+        Err(error) => {
+            return Err(profile::ImportFailure {
+                source: source.to_path_buf(),
+                stage: "structure",
+                error: error.to_string(),
+            });
+        }
+    };
     cache::apply_workspace_name(&mut account);
 
     let action = profile::save_imported_auth_value(val, alias).map_err(|e| {

@@ -1120,6 +1120,52 @@ fn import_reports_the_rotation_when_the_profile_write_fails_after_validation() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// The structure check that runs *after* usage validation inspects the value
+/// the auth server just rotated, not the file on disk. A malformed refresh
+/// reply therefore fails a check whose failure arrives when `refresh_old` is
+/// already spent — so reporting it as an ordinary structure error would drop
+/// the only credential the server still accepts.
+#[test]
+fn import_rescues_rotated_credentials_when_the_refreshed_value_is_malformed() {
+    let home = temp_home("import-rotated-structure");
+    let sample = auth_json_needing_refresh("badid@example.com", "acct_badid");
+    let source = home.join("donor-auth.json");
+    write_json(&source, &sample);
+
+    // Usage succeeds, so the only thing that can fail afterwards is the
+    // structure check — and it fails because the rotation handed back an
+    // id_token that is not a JWT.
+    let server = start_rotating_mock("not-a-jwt".to_string(), true);
+    let output = run_import(
+        &home,
+        &["--json", "import", source.to_str().unwrap(), "donor"],
+        &server,
+    );
+
+    assert!(
+        !output.status.success(),
+        "the refreshed credentials are malformed, so the import must not succeed"
+    );
+    assert_eq!(
+        server.token_calls.lock().unwrap().clone(),
+        vec!["refresh_old".to_string()],
+        "the scenario only holds if the credential really was rotated"
+    );
+    assert_eq!(
+        stored_refresh_token(&home.join(".codex-switch/profiles/donor/auth.json")),
+        "refresh_1",
+        "the rotated refresh token was dropped; the account can no longer authenticate"
+    );
+    let report = parse_stdout_json(&output);
+    let error = report["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("token_rotated"),
+        "the failure must be tagged as a rotation rescue, got: {error}"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
 /// A `--json` directory import that imports one file fine but loses another
 /// account's rotated credentials (`token_rotation_lost`) must not read as an
 /// overall success: a script that only checks a top-level discovery field,
