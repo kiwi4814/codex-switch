@@ -1,5 +1,10 @@
 # Changelog
 
+## v20260730.2.0 — 2026-07-30
+
+- **The daemon no longer switches credentials underneath an active Codex session** — Process detection now classifies the actual Codex subcommand instead of scanning every prompt word for infrastructure names such as `login` or `mcp-server`. Unix reads structured process arguments where the platform exposes them, while Windows follows Win32 quoting and backslash rules, so quoted prompts and attached global option values retain their intended boundaries.
+- **Concurrent opportunistic refreshes now share one HTTP client** — The refresh batch builds the client once before its start budget begins and clones it into each task, instead of repeating synchronous TLS and proxy initialization inside every spawned task. This preserves the rule that the budget only limits opening new rotations and still waits for every started single-use refresh-token rotation to be saved through the existing compare-and-swap boundary.
+
 ## v20260730.1.0 — 2026-07-30
 
 - **TUI refresh is incremental instead of blanking the screen** — Reloads keep the last known quota visible while each account refreshes independently. Request generations discard late results from an older profile list, and one coalesced pending refresh preserves a stronger manual request without spawning duplicate work.

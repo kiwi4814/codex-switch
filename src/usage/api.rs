@@ -885,8 +885,9 @@ pub async fn refresh_expiring_tokens() -> Vec<TokenPersistFailure> {
 /// window (more rotations cut off mid-flight), so neither is tuned for latency.
 ///
 /// Worst-case wall clock for a synchronous caller (`list`, `best`) is therefore
-/// `budget` + one HTTP client timeout: a refresh started just before the budget
-/// expired may still hang for the client's full timeout.
+/// HTTP client construction + `budget` + one HTTP client timeout. Client
+/// construction is deliberately outside the start budget; a refresh started
+/// just before the budget expired may still hang for the client's full timeout.
 pub async fn refresh_expiring_tokens_within(
     budget: std::time::Duration,
 ) -> Vec<TokenPersistFailure> {
@@ -957,6 +958,19 @@ pub async fn refresh_expiring_tokens_within(
         OPPORTUNISTIC_REFRESH_MARGIN
     );
 
+    // Build before starting the budget: client construction can synchronously
+    // initialize TLS state, but the budget is only for opening rotations.
+    let client = match auth::build_http_client() {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(
+                stage = "client_build_failed",
+                "opportunistic token refresh unavailable: {error:#}"
+            );
+            return Vec::new();
+        }
+    };
+
     // Start refreshes while the budget lasts, then wait for every started one:
     // an in-flight rotation is not cancellable without losing the credential.
     let started_at = std::time::Instant::now();
@@ -969,17 +983,10 @@ pub async fn refresh_expiring_tokens_within(
             let Some((alias, path, id_token, access_token, rt, exp)) = queued.next() else {
                 break;
             };
+            let client = client.clone();
             tasks.spawn(async move {
                 let remaining = exp - auth::now_unix_secs();
                 debug!("[{alias}] token expires in {remaining}s, refreshing");
-
-                let client = match auth::build_http_client() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        debug!("[{alias}] skipping refresh: {e}");
-                        return None;
-                    }
-                };
 
                 match do_refresh_token(
                     &alias,
