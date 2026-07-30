@@ -9,7 +9,7 @@ This document is for maintainers. Users should follow the installation and updat
 All of the following must be true before any release push:
 
 - The local branch is `dev`, the worktree is clean, and all intended changes are committed.
-- `VERSION` contains the target base version, `Cargo.toml` matches it, and the top of `docs/CHANGELOG.md` contains the matching release section. Ordinary dev builds may keep it Unreleased; the final dev candidate must carry the intended stable date so promotion requires no edit.
+- `VERSION` contains the target base version, `Cargo.toml` matches it, and the top of `docs/CHANGELOG.md` contains the matching release section. Ordinary dev builds may keep it Unreleased; allocate the final dev candidate's stable base from the real local date before publishing it so promotion requires no edit.
 - Independent code review has no CRITICAL or HIGH findings. Authentication, update, or user-data changes also require security review.
 - The local quality gate and a real CLI smoke test pass.
 - `git push` has explicit authorization and the commit to publish is recorded.
@@ -28,19 +28,19 @@ The Wiki sync workflow publishes the reviewed `docs/wiki/` sources from `dev`. T
 
 ## Version policy
 
-Base versions use the SemVer-compatible `YYYYMMDD.V.0` format:
+Base versions use the SemVer-compatible `YYYYMMDD.N.0` format:
 
-- `YYYYMMDD` is the release date; 2026-07-12 becomes `20260712`.
-- `V` is the release sequence for that date, starting at `1`; the second release that day is `20260712.2.0`.
+- `YYYYMMDD` is the version-allocation date captured with `date` immediately before publishing the candidate; 2026-07-12 becomes `20260712`. A stable promotion may happen on a later calendar date and keeps the accepted candidate's version.
+- `N` is the release sequence allocated on that date, starting at `1`; the second candidate allocated that day is `20260712.2.0`.
 - The final component is always `0` because Cargo and SemVer require `major.minor.patch`. Do not use the invalid two-component form `20260712.1`.
 - Keep the date in `YYYYMMDD` order; `YYYYDDMM` breaks chronological sorting.
 - Migrating from `0.0.x` to the calendar version is an upgrade. Never publish a smaller `0.x` version afterward because self-update will treat it as a downgrade.
 
 | Pushed tag | Version produced by CI | GitHub Release name | Self-update channel | Homebrew |
 |---|---|---|---|---|
-| `dev` (rolling, overwritten) | `YYYYMMDD.V.0-dev` | `dev` | `--dev` | No |
-| `vYYYYMMDD.V.0-<suffix>` (permanent prerelease) | `YYYYMMDD.V.0-<suffix>` | Same as tag | Unavailable to the hardcoded `dev` channel | No |
-| `vYYYYMMDD.V.0` (stable) | `YYYYMMDD.V.0` | Same as tag | Default channel | Yes |
+| `dev` (rolling, overwritten) | `YYYYMMDD.N.0-dev` | `dev` | `--dev` | No |
+| `vYYYYMMDD.N.0-<suffix>` (permanent prerelease) | `YYYYMMDD.N.0-<suffix>` | Same as tag | Unavailable to the hardcoded `dev` channel | No |
+| `vYYYYMMDD.N.0` (stable) | `YYYYMMDD.N.0` | Same as tag | Default channel | Yes |
 
 > The root `VERSION` file is the release source of truth. The `version` field in `Cargo.toml` mirrors it and never includes `-dev`; CI validates the match and adds the suffix during version injection.
 > The final dev and stable builds come from the same commit. The Release workflow adds `-dev` for the rolling `dev` tag and leaves the manifest base unchanged for the stable tag; this version display difference does not require a source edit.
@@ -121,7 +121,9 @@ git rev-parse refs/heads/dev
 git rev-parse refs/tags/dev
 
 # 2) After explicit user acceptance, fast-forward master without edits.
-git checkout master && git merge --ff-only dev && git push origin master
+git checkout master
+git merge --ff-only refs/heads/dev
+git push origin refs/heads/master:refs/heads/master
 
 # 3) Tag that exact commit. This example is the first release on 2026-07-12.
 git tag v20260712.1.0
@@ -132,10 +134,12 @@ git push origin refs/tags/v20260712.1.0:refs/tags/v20260712.1.0
 
 After tagging, confirm `refs/heads/master`, `refs/tags/dev`, and the stable tag still point to the accepted SHA. A mismatch is a release blocker.
 
-Before release:
+A stable promotion may happen on a later calendar date. Do not bump or edit `VERSION`, `Cargo.toml`, or `docs/CHANGELOG.md` after acceptance; doing so would invalidate the tested candidate.
 
-- Run `date` to obtain the real local date, then bump `VERSION` and the synchronized `Cargo.toml` to that day's `YYYYMMDD.V.0`.
-- Add the matching `## vYYYYMMDD.V.0 — YYYY-MM-DD` section at the top of `docs/CHANGELOG.md`.
+Before publishing the final dev candidate:
+
+- Run `date` to obtain the real local date, then bump `VERSION` and the synchronized `Cargo.toml` to that day's `YYYYMMDD.N.0`.
+- Add the matching `## vYYYYMMDD.N.0 — YYYY-MM-DD` section at the top of `docs/CHANGELOG.md`.
 
 ## Troubleshooting
 
@@ -149,4 +153,4 @@ Check whether the Release workflow was triggered and whether `on.push.tags` stil
 The GitHub Release tag must be the lowercase literal `dev`. A separate tag such as `v20260712.1.0-dev` creates an independent prerelease that the client channel cannot see.
 
 **Should the Cargo.toml version contain `-dev`?**
-No. CI appends `-dev`; the local manifest keeps the clean `YYYYMMDD.V.0` base. Increment `V` before another release on the same date or clients will treat it as the version they already have.
+No. CI appends `-dev`; the local manifest keeps the clean `YYYYMMDD.N.0` base. Increment `N` before another candidate on the same date or clients will treat it as the version they already have.

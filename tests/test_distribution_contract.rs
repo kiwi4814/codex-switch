@@ -87,11 +87,11 @@ fn version_file_is_the_release_source_of_truth() {
     let manifest = repo_file("Cargo.toml");
     let release = repo_file(".github/workflows/release.yml");
 
-    // Pin the documented YYYYMMDD.V.0 shape rather than one literal version, which
+    // Pin the documented YYYYMMDD.N.0 shape rather than one literal version, which
     // every release had to edit. This also catches the two forms RELEASE.md warns
     // about: the two-component `20260712.1`, and YYYYDDMM, which sorts wrongly.
     let (date, rest) = version.split_once('.').expect("version needs a date part");
-    let (sequence, patch) = rest.split_once('.').expect("version must be YYYYMMDD.V.0");
+    let (sequence, patch) = rest.split_once('.').expect("version must be YYYYMMDD.N.0");
     assert!(
         date.len() == 8 && date.chars().all(|c| c.is_ascii_digit()),
         "version must start with an 8-digit YYYYMMDD date, got {date:?}"
@@ -112,6 +112,43 @@ fn version_file_is_the_release_source_of_truth() {
     assert!(manifest.contains(&format!("version = \"{version}\"")));
     assert!(release.contains("BASE=$(cat VERSION)"));
     assert!(!release.contains("BASE=$(grep '^version' Cargo.toml"));
+}
+
+#[test]
+fn release_docs_preserve_zero_drift_across_calendar_days() {
+    let release = repo_file("docs/RELEASE.md");
+    let updating = repo_file("docs/wiki/Updating.md");
+    let readme_cn = repo_file("README_CN.md");
+
+    for required in [
+        "`YYYYMMDD` is the version-allocation date",
+        "A stable promotion may happen on a later calendar date",
+        "Do not bump or edit `VERSION`, `Cargo.toml`, or `docs/CHANGELOG.md` after acceptance",
+    ] {
+        assert!(
+            release.contains(required),
+            "release docs must preserve the cross-day zero-drift contract: `{required}`"
+        );
+    }
+    assert!(
+        updating.contains("version-allocation date"),
+        "user update docs must not promise that a cross-day stable tag date is encoded"
+    );
+    assert!(
+        readme_cn.contains("版本分配日期"),
+        "the Chinese README must describe the calendar component as the allocation date"
+    );
+}
+
+#[test]
+fn stable_release_docs_use_full_branch_refspecs() {
+    let release = repo_file("docs/RELEASE.md");
+
+    assert!(release.contains("git push origin refs/heads/master:refs/heads/master"));
+    assert!(
+        !release.contains("git push origin master"),
+        "stable release instructions must not contradict the full-refspec rule"
+    );
 }
 
 #[test]

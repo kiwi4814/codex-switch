@@ -1,5 +1,9 @@
 # Changelog
 
+## v20260730.3.0 — 2026-07-30
+
+- **Cross-day stable promotion is explicit** — The release guide now defines the calendar component as the date the final dev version is allocated, requires the same accepted commit and version to be promoted even when the stable tag is created on a later day, and uses full branch refspecs in the stable push example.
+
 ## v20260730.2.0 — 2026-07-30
 
 - **The daemon no longer switches credentials underneath an active Codex session** — Process detection now classifies the actual Codex subcommand instead of scanning every prompt word for infrastructure names such as `login` or `mcp-server`. Unix reads structured process arguments where the platform exposes them, while Windows follows Win32 quoting and backslash rules, so quoted prompts and attached global option values retain their intended boundaries.
@@ -117,8 +121,8 @@
 ### Changed
 
 - **User-owned direct installation** — macOS and Linux now install to `$HOME/.local/bin` by default and configure the user's shell PATH; Windows keeps its existing `%LOCALAPPDATA%` installation. Unix administrators can explicitly select `/usr/local/bin` with `--system`, while Homebrew remains package-manager owned.
-- **Calendar versioning** — Release bases now use SemVer-compatible `YYYYMMDD.V.0` values, starting with `20260712.1.0`; `V` starts at 1 each day and increments for additional same-day releases. Existing `0.0.x` stable and dev builds remain directly upgradable because the calendar version sorts higher under SemVer.
-- **Short dev versions** — Rolling dev releases now use `YYYYMMDD.V.0-dev` without an appended timestamp. Additional same-day releases must increment `V` before publishing.
+- **Calendar versioning** — Release bases now use SemVer-compatible `YYYYMMDD.N.0` values, starting with `20260712.1.0`; `N` starts at 1 each day and increments for additional same-day releases. Existing `0.0.x` stable and dev builds remain directly upgradable because the calendar version sorts higher under SemVer.
+- **Short dev versions** — Rolling dev releases now use `YYYYMMDD.N.0-dev` without an appended timestamp. Additional same-day releases must increment `N` before publishing.
 - **Codex 0.144.1 authentication alignment** — Browser and device login follow the current Codex callback and polling contracts, refresh responses preserve omitted tokens, managed authentication policy is enforced, custom CA settings are honored, and `CODEX_HOME` uses the same empty-value fallback as Codex.
 - **File credential store requirement** — `codex-switch` now requires Codex's file-backed credential store and rejects explicit `keyring`, `auto`, or `ephemeral` modes because reliable profile switching depends on the live `auth.json`.
 - **Usage and reset-credit alignment** — Usage, models, and warmup requests carry workspace/FedRAMP routing headers; empty or structurally drifted usage responses are rejected; account-limited state is persisted; reset credits support no-expiry entries; consume retries reuse one redemption request ID and only `code=reset` is success.
@@ -347,7 +351,7 @@
 - **`warmup` command** — `codex-switch warmup [alias]` sends a minimal Codex request (`ping`) to activate the 5h/7d quota window countdown for a fresh account. Omit alias to warm up all saved profiles concurrently. Already-active accounts (reset time still in the future) are automatically skipped. Supports `--json` output with per-account results and a top-level `ok` field
 - **TUI warmup** — Press `w` to warm up the selected account or `W` to warm up all accounts. Usage is automatically refreshed after warmup completes
 - **Pace Marker** — Usage bars (CLI and TUI) now display a `|` pace marker showing expected consumption based on elapsed window time, making it easy to see if you're ahead or behind budget
-- **Dev update channel** — `self-update --dev` installs the latest dev build; `self-update --stable` switches back. Without flags, auto-detects the current channel. Legacy `0.0.x` dev builds used timestamped semver; current calendar versions use the shorter `YYYYMMDD.V.0-dev` form.
+- **Dev update channel** — `self-update --dev` installs the latest dev build; `self-update --stable` switches back. Without flags, auto-detects the current channel. Legacy `0.0.x` dev builds used timestamped semver; current calendar versions use the shorter `YYYYMMDD.N.0-dev` form.
 - **Install scripts enhanced** — `install.sh --dev` / `$env:CS_DEV="1"` for dev channel install; `install.sh --uninstall` / `$env:CS_UNINSTALL="1"` for clean removal. Homebrew-installed versions are detected and blocked from direct-install to prevent PATH conflicts
 - **Startup auth change detection** — On launch, codex-switch compares the live `~/.codex/auth.json` against all saved profiles. If a new account is detected (e.g., the user ran `codex login`), it prompts to save as a new profile. If tokens were refreshed for an existing account, it prompts to update the corresponding profile
 - **Non-interactive safety** — When stdin is not a TTY (pipes, cron, CI), startup detection informs without silently mutating state. EOF on stdin is treated as rejection
