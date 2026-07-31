@@ -20,7 +20,7 @@ use crate::output::user_println;
 
 const ORIGINATOR: &str = "codex_cli_rs";
 const SCOPE: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
-const CALLBACK_TIMEOUT_SECS: u64 = 300;
+const CALLBACK_TIMEOUT_SECS: u64 = 600;
 const CALLBACK_CONNECTION_TIMEOUT_SECS: u64 = 5;
 const MAX_CONCURRENT_CALLBACK_CONNECTIONS: usize = 16;
 const CALLBACK_PORT: u16 = 1455;
@@ -39,6 +39,14 @@ pub struct LoginTokens {
     /// API key from the post-login token exchange (browser flow only,
     /// best-effort — Codex persists it as OPENAI_API_KEY).
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Cancelled by user.")]
+pub(crate) struct LoginCancelled;
+
+pub(crate) fn is_login_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LoginCancelled>().is_some()
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,7 +163,7 @@ pub async fn run_device_auth() -> Result<LoginTokens> {
         }
         _ = tokio::signal::ctrl_c() => {
             user_println("");
-            bail!("Cancelled by user.");
+            return Err(LoginCancelled.into());
         }
     };
 
@@ -525,23 +533,16 @@ const DEVICE_USERCODE_URL: &str = "https://auth.openai.com/api/accounts/deviceau
 const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 const DEVICE_VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
 const DEVICE_POLL_INTERVAL_SECS: u64 = 5;
-const MAX_CONSECUTIVE_DEVICE_POLL_FAILURES: u8 = 3;
 
 #[derive(Default)]
-struct DevicePollFailureBudget {
-    consecutive: u8,
+struct DevicePollFailureTracker {
+    consecutive: u32,
 }
 
-impl DevicePollFailureBudget {
-    fn record(&mut self, detail: &str) -> Result<()> {
+impl DevicePollFailureTracker {
+    fn record(&mut self) -> u32 {
         self.consecutive = self.consecutive.saturating_add(1);
-        if self.consecutive >= MAX_CONSECUTIVE_DEVICE_POLL_FAILURES {
-            bail!(
-                "Device authorization polling failed {} consecutive times: {detail}",
-                self.consecutive
-            );
-        }
-        Ok(())
+        self.consecutive
     }
 
     fn reset(&mut self) {
@@ -627,6 +628,24 @@ fn device_poll_error_action(body: &serde_json::Value) -> Option<DevicePollErrorA
     })
 }
 
+fn is_device_poll_pending_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND
+}
+
+fn is_device_poll_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn device_poll_next_wake(
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    interval_secs: u64,
+) -> tokio::time::Instant {
+    (now + Duration::from_secs(interval_secs)).min(deadline)
+}
+
 /// Run Device Code Flow: request code → display to user → poll for token
 pub async fn run_device_code_auth() -> Result<LoginTokens> {
     crate::auth::ensure_file_credentials_store()?;
@@ -687,15 +706,15 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
     // Step 3: Poll for token (Ctrl+C safe)
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
     let mut poll_count = 0u32;
-    let mut poll_failures = DevicePollFailureBudget::default();
+    let mut poll_failures = DevicePollFailureTracker::default();
 
     loop {
-        // Sleep with Ctrl+C support
+        let next_wake = device_poll_next_wake(tokio::time::Instant::now(), deadline, interval_secs);
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
+            _ = tokio::time::sleep_until(next_wake) => {}
             _ = tokio::signal::ctrl_c() => {
                 user_println("");
-                bail!("Cancelled by user.");
+                return Err(LoginCancelled.into());
             }
         }
 
@@ -706,43 +725,64 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
         poll_count += 1;
         eprint!("\r  Polling... ({poll_count})    ");
 
-        let poll_resp = match client
+        let poll_request = client
             .post(DEVICE_TOKEN_URL)
             .json(&serde_json::json!({
                 "device_auth_id": device_auth_id,
                 "user_code": user_code,
                 "client_id": CLIENT_ID,
             }))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                info!("Device poll network error (retrying): {e}");
-                let detail = format!("network error: {e}");
-                eprintln!(
-                    "\n  Device polling failed ({}/{}): {detail}",
-                    poll_failures.consecutive + 1,
-                    MAX_CONSECUTIVE_DEVICE_POLL_FAILURES
-                );
-                poll_failures.record(&detail)?;
-                continue;
+            .send();
+        let poll_result = tokio::select! {
+            result = tokio::time::timeout_at(deadline, poll_request) => result,
+            _ = tokio::signal::ctrl_c() => {
+                user_println("");
+                return Err(LoginCancelled.into());
             }
         };
-
-        let body: serde_json::Value = match poll_resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                info!("Device poll parse error (retrying): {e}");
-                let detail = format!("invalid response: {e}");
+        let poll_resp = match poll_result {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => {
+                info!("Device poll network error (retrying): {e}");
+                let detail = format!("network error: {e}");
+                let failure_count = poll_failures.record();
                 eprintln!(
-                    "\n  Device polling failed ({}/{}): {detail}",
-                    poll_failures.consecutive + 1,
-                    MAX_CONSECUTIVE_DEVICE_POLL_FAILURES
+                    "\n  Device polling failed ({failure_count}); retrying until the 15-minute timeout: {detail}"
                 );
-                poll_failures.record(&detail)?;
                 continue;
             }
+            Err(_) => bail!("Device authorization timed out. Please try again."),
+        };
+
+        let poll_status = poll_resp.status();
+        let body_result = tokio::select! {
+            result = tokio::time::timeout_at(deadline, poll_resp.json()) => result,
+            _ = tokio::signal::ctrl_c() => {
+                user_println("");
+                return Err(LoginCancelled.into());
+            }
+        };
+        let body: serde_json::Value = match body_result {
+            Ok(Ok(body)) => body,
+            Ok(Err(_)) if is_device_poll_pending_status(poll_status) => {
+                poll_failures.reset();
+                continue;
+            }
+            Ok(Err(e))
+                if poll_status.is_success() || is_device_poll_retryable_status(poll_status) =>
+            {
+                info!("Device poll parse error (retrying): {e}");
+                let detail = format!("invalid response: {e}");
+                let failure_count = poll_failures.record();
+                eprintln!(
+                    "\n  Device polling failed ({failure_count}); retrying until the 15-minute timeout: {detail}"
+                );
+                continue;
+            }
+            Ok(Err(e)) => {
+                bail!("Device authorization failed (HTTP {poll_status}): invalid response: {e}")
+            }
+            Err(_) => bail!("Device authorization timed out. Please try again."),
         };
         let log_body = redacted_device_poll_log_body(&body);
         debug!("Device poll response: {log_body}");
@@ -768,20 +808,50 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
                 }
                 DevicePollErrorAction::RetryUnknown { code, message } => {
                     let detail = format!("unrecognized server error '{code}': {message}");
+                    if !poll_status.is_success()
+                        && !is_device_poll_pending_status(poll_status)
+                        && !is_device_poll_retryable_status(poll_status)
+                    {
+                        bail!("Device authorization failed (HTTP {poll_status}): {detail}");
+                    }
+                    let failure_count = poll_failures.record();
                     eprintln!(
-                        "\n  Device polling failed ({}/{}): {detail}",
-                        poll_failures.consecutive + 1,
-                        MAX_CONSECUTIVE_DEVICE_POLL_FAILURES
+                        "\n  Device polling failed ({failure_count}); retrying until the 15-minute timeout: {detail}"
                     );
-                    poll_failures.record(&detail)?;
                     continue;
                 }
             }
         }
 
+        if is_device_poll_pending_status(poll_status) {
+            poll_failures.reset();
+            continue;
+        }
+
+        if !poll_status.is_success() {
+            if is_device_poll_retryable_status(poll_status) {
+                let failure_count = poll_failures.record();
+                eprintln!(
+                    "\n  Device polling failed ({failure_count}); retrying until the 15-minute timeout: HTTP {poll_status}"
+                );
+                continue;
+            }
+            bail!("Device authorization failed (HTTP {poll_status})");
+        }
+
         // Success — got authorization_code, need to exchange for tokens.
+        let (auth_code, verifier) = match parse_device_poll_success(body) {
+            Ok(success) => success,
+            Err(error) => {
+                let detail = error.to_string();
+                let failure_count = poll_failures.record();
+                eprintln!(
+                    "\n  Device polling failed ({failure_count}); retrying until the 15-minute timeout: {detail}"
+                );
+                continue;
+            }
+        };
         poll_failures.reset();
-        let (auth_code, verifier) = parse_device_poll_success(body)?;
 
         eprint!("\r                          \r");
         info!("Device authorization successful, exchanging code for tokens");
@@ -1156,6 +1226,43 @@ mod tests {
     }
 
     #[test]
+    fn device_poll_forbidden_and_not_found_statuses_mean_authorization_is_pending() {
+        assert!(super::is_device_poll_pending_status(
+            reqwest::StatusCode::FORBIDDEN
+        ));
+        assert!(super::is_device_poll_pending_status(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+        assert!(!super::is_device_poll_pending_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
+
+    #[test]
+    fn device_poll_retries_transient_http_statuses_but_not_deterministic_client_errors() {
+        assert!(super::is_device_poll_retryable_status(
+            reqwest::StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(super::is_device_poll_retryable_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(super::is_device_poll_retryable_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!super::is_device_poll_retryable_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+    }
+
+    #[test]
+    fn device_poll_sleep_is_capped_at_the_authorization_deadline() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + Duration::from_secs(3);
+
+        assert_eq!(super::device_poll_next_wake(now, deadline, 30), deadline);
+    }
+
+    #[test]
     fn test_device_poll_error_action_retries_unknown_errors() {
         let body = serde_json::json!({
             "error": "temporarily_unavailable",
@@ -1267,23 +1374,37 @@ mod tests {
     }
 
     #[test]
-    fn device_poll_failures_stop_after_three_consecutive_errors() {
-        let mut failures = super::DevicePollFailureBudget::default();
-        assert!(failures.record("network error").is_ok());
-        assert!(failures.record("parse error").is_ok());
-        let err = failures.record("network error again").unwrap_err();
-        assert!(err.to_string().contains("3 consecutive times"));
-        assert!(err.to_string().contains("network error again"));
+    fn device_poll_transient_failures_do_not_end_before_timeout() {
+        let mut failures = super::DevicePollFailureTracker::default();
+        for attempt in 1..=4 {
+            assert_eq!(failures.record(), attempt);
+        }
     }
 
     #[test]
-    fn valid_device_poll_response_resets_failure_budget() {
-        let mut failures = super::DevicePollFailureBudget::default();
-        assert!(failures.record("network error").is_ok());
-        assert!(failures.record("parse error").is_ok());
+    fn interactive_login_waits_ten_minutes_for_browser_and_fifteen_for_device_code() {
+        assert_eq!(super::CALLBACK_TIMEOUT_SECS, 10 * 60);
+        assert_eq!(super::DEVICE_TIMEOUT_SECS, 15 * 60);
+    }
+
+    #[test]
+    fn user_cancellation_has_a_typed_identity_for_batch_login() {
+        let error: anyhow::Error = super::LoginCancelled.into();
+
+        assert!(super::is_login_cancelled(&error));
+        assert!(!super::is_login_cancelled(&anyhow::anyhow!(
+            "network error"
+        )));
+    }
+
+    #[test]
+    fn valid_device_poll_response_resets_failure_tracker() {
+        let mut failures = super::DevicePollFailureTracker::default();
+        assert_eq!(failures.record(), 1);
+        assert_eq!(failures.record(), 2);
         failures.reset();
-        assert!(failures.record("network error").is_ok());
-        assert!(failures.record("parse error").is_ok());
+        assert_eq!(failures.record(), 1);
+        assert_eq!(failures.record(), 2);
     }
 
     // ── Token exchange retry / error-shape tests ──────────────

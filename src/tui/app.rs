@@ -1938,6 +1938,42 @@ async fn perform_oauth(
 ///
 /// User can abort the whole batch with Ctrl+C between rounds (handled by
 /// the underlying login::run_device_*) or by closing the browser tab.
+fn batch_relogin_not_attempted(total: usize, ok: usize, failed: usize, cancelled: bool) -> usize {
+    total.saturating_sub(ok + failed + usize::from(cancelled))
+}
+
+async fn finish_login_or_cancel<T, LoginFuture, CancelFuture>(
+    login_future: LoginFuture,
+    cancel_future: CancelFuture,
+) -> Result<T>
+where
+    LoginFuture: std::future::Future<Output = Result<T>>,
+    CancelFuture: std::future::Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(login_future);
+    tokio::pin!(cancel_future);
+    tokio::select! {
+        biased;
+        result = &mut login_future => result,
+        signal = &mut cancel_future => {
+            signal.context("listening for Ctrl+C during batch re-login")?;
+            Err(login::LoginCancelled.into())
+        }
+    }
+}
+
+async fn finish_refresh_then_commit<T, RefreshFuture, Commit>(
+    refresh_future: RefreshFuture,
+    commit: Commit,
+) -> Result<T>
+where
+    RefreshFuture: std::future::Future<Output = ()>,
+    Commit: FnOnce() -> Result<T>,
+{
+    refresh_future.await;
+    commit()
+}
+
 async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, device: bool) {
     let aliases: Vec<String> = app.marked.iter().cloned().collect();
     if aliases.is_empty() {
@@ -1957,12 +1993,18 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
 
     let mut ok = 0usize;
     let mut failed: Vec<(String, String)> = Vec::new();
+    let mut cancelled = false;
 
     for (i, alias) in aliases.iter().enumerate() {
         println!("\n--- [{}/{}] {alias} ---", i + 1, total);
         let mode = OAuthMode::Relogin(alias.clone());
-        match run_oauth_inner(mode, device).await {
+        match finish_login_or_cancel(run_oauth_inner(mode, device), tokio::signal::ctrl_c()).await {
             Ok(_) => ok += 1,
+            Err(e) if login::is_login_cancelled(&e) => {
+                eprintln!("[cancelled] Batch re-login stopped by user");
+                cancelled = true;
+                break;
+            }
             Err(e) => {
                 eprintln!("[err] {alias}: {e}");
                 failed.push((alias.clone(), e.to_string()));
@@ -1971,7 +2013,15 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     }
 
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    println!("\n=== Batch complete: {ok} ok, {} failed ===", failed.len());
+    if cancelled {
+        let not_attempted = batch_relogin_not_attempted(total, ok, failed.len(), true);
+        println!(
+            "\n=== Batch cancelled: {ok} ok, {} failed, 1 cancelled, {not_attempted} not attempted ===",
+            failed.len()
+        );
+    } else {
+        println!("\n=== Batch complete: {ok} ok, {} failed ===", failed.len());
+    }
     if !failed.is_empty() {
         for (a, e) in &failed {
             println!("  - {a}: {e}");
@@ -1984,12 +2034,15 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     resume_tui_after_plain_output(terminal);
 
     app.marked.clear();
-    let summary = if failed.is_empty() {
+    let summary = if cancelled {
+        let not_attempted = batch_relogin_not_attempted(total, ok, failed.len(), true);
+        format!("Batch re-login cancelled: {ok} ok, 1 cancelled, {not_attempted} not attempted")
+    } else if failed.is_empty() {
         format!("Batch re-login: {ok} ok")
     } else {
         format!("Batch re-login: {ok} ok, {} failed", failed.len())
     };
-    if failed.is_empty() {
+    if failed.is_empty() && !cancelled {
         app.set_status(summary, 8);
     } else {
         app.set_status_error(summary, 8);
@@ -2011,24 +2064,43 @@ async fn run_oauth_inner(mode: OAuthMode, device: bool) -> Result<String> {
 
     match mode {
         OAuthMode::Add => {
-            let action = profile::save_auth_value(auth_val.clone(), None)?;
-            if let Err(err) = crate::workspace::refresh_for_auth(&auth_val).await {
-                tracing::debug!("workspace metadata unavailable after TUI login: {err}");
-            }
-            let alias = action.alias().to_string();
-            let verb = action.action(); // "created" / "updated"
-            let email_disp = info.email.as_deref().unwrap_or("unknown");
-            println!("[ok] Account {verb}: {alias} ({email_disp})");
-            Ok(format!("Account {verb}: {alias}"))
+            let refresh_auth = auth_val.clone();
+            finish_refresh_then_commit(
+                async {
+                    if let Err(err) = crate::workspace::refresh_for_auth(&refresh_auth).await {
+                        tracing::debug!(
+                            "workspace metadata unavailable before TUI login save: {err}"
+                        );
+                    }
+                },
+                || {
+                    let action = profile::save_auth_value(auth_val, None)?;
+                    let alias = action.alias().to_string();
+                    let verb = action.action(); // "created" / "updated"
+                    let email_disp = info.email.as_deref().unwrap_or("unknown");
+                    println!("[ok] Account {verb}: {alias} ({email_disp})");
+                    Ok(format!("Account {verb}: {alias}"))
+                },
+            )
+            .await
         }
         OAuthMode::Relogin(alias) => {
-            profile::replace_profile_auth_and_live_if_current(&alias, &auth_val)?;
-            if let Err(err) = crate::workspace::refresh_for_auth(&auth_val).await {
-                tracing::debug!("workspace metadata unavailable after TUI re-login: {err}");
-            }
-            let email_disp = info.email.as_deref().unwrap_or("unknown");
-            println!("[ok] Re-logged in: {alias} ({email_disp})");
-            Ok(format!("Re-logged in: {alias}"))
+            finish_refresh_then_commit(
+                async {
+                    if let Err(err) = crate::workspace::refresh_for_auth(&auth_val).await {
+                        tracing::debug!(
+                            "workspace metadata unavailable before TUI re-login save: {err}"
+                        );
+                    }
+                },
+                || {
+                    profile::replace_profile_auth_and_live_if_current(&alias, &auth_val)?;
+                    let email_disp = info.email.as_deref().unwrap_or("unknown");
+                    println!("[ok] Re-logged in: {alias} ({email_disp})");
+                    Ok(format!("Re-logged in: {alias}"))
+                },
+            )
+            .await
         }
     }
 }
@@ -2059,7 +2131,8 @@ fn char_to_byte(s: &str, char_pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountEntry, App, ModelStatus, UsageStatus, refresh_fetches_loaded_usage,
+        AccountEntry, App, ModelStatus, UsageStatus, batch_relogin_not_attempted,
+        finish_login_or_cancel, finish_refresh_then_commit, refresh_fetches_loaded_usage,
         refresh_forces_negative_caches, reset_card_failure_from_outcome, retained_usage_by_alias,
     };
     use crate::{
@@ -2067,6 +2140,42 @@ mod tests {
         usage::{Refresh, ResetCredit, UsageInfo},
         warmup::ModelEntry,
     };
+
+    #[test]
+    fn cancelled_batch_counts_the_current_account_as_attempted() {
+        assert_eq!(batch_relogin_not_attempted(3, 1, 0, true), 1);
+        assert_eq!(batch_relogin_not_attempted(3, 1, 1, false), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_batch_login_wins_over_a_simultaneous_cancel() {
+        let result = finish_login_or_cancel(async { Ok("saved") }, async { Ok(()) }).await;
+
+        assert_eq!(result.unwrap(), "saved");
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_an_unfinished_batch_login_round() {
+        let login = std::future::pending::<anyhow::Result<&'static str>>();
+        let result = finish_login_or_cancel(login, async { Ok(()) }).await;
+
+        assert!(crate::login::is_login_cancelled(&result.unwrap_err()));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_workspace_refresh_finishes_does_not_commit_credentials() {
+        let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let committed_by_save = committed.clone();
+        let login = finish_refresh_then_commit(std::future::pending(), move || {
+            committed_by_save.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("saved")
+        });
+
+        let result = finish_login_or_cancel(login, async { Ok(()) }).await;
+
+        assert!(crate::login::is_login_cancelled(&result.unwrap_err()));
+        assert!(!committed.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn model_result_rebuilds_an_open_account_detail() {

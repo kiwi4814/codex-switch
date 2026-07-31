@@ -1,5 +1,9 @@
 # Changelog
 
+## v20260731.1.0 — 2026-07-31
+
+- **Interactive sign-in waits for the user instead of a retry counter** — Browser login now allows ten minutes for its callback, while device-code login uses its full fifteen-minute lifetime. Pending and transient device responses continue until that hard deadline, deterministic rejection still fails immediately, and Ctrl+C stops a whole TUI batch rather than advancing to the next account.
+
 ## v20260730.3.0 — 2026-07-30
 
 - **Cross-day stable promotion is explicit** — The release guide now defines the calendar component as the date the final dev version is allocated, requires the same accepted commit and version to be promoted even when the stable tag is created on a later day, and uses full branch refspecs in the stable push example.
