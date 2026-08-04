@@ -18,8 +18,8 @@ fn models_url() -> String {
 }
 
 static CODEX_VERSION: OnceCell<String> = OnceCell::const_new();
-/// The models one warmup should touch, keyed by account (alias) so one
-/// account's resolution never leaks into another's warmup.
+/// The models one warmup should touch, keyed by account *and* by the quota
+/// pools that produced the selection (see [`warmup_cache_key`]).
 ///
 /// The whole selected set is cached, not just the main-pool model: the main
 /// request and the additional-pool requests are answered by a single `/models`
@@ -277,6 +277,32 @@ fn normalized_pool_name(value: &str) -> String {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+/// The cache key for one account's resolved warmup model set.
+///
+/// The alias alone is not enough to name the entry: the resolved set bakes in
+/// the additional pools that existed when it was built. A process that outlives
+/// a pool change — the daemon with `auto_warmup`, which runs for days — would
+/// otherwise keep warming the old set, and a pool the account just gained would
+/// never get its quota window opened until someone restarted the daemon. That
+/// failure is silent: nothing errors, so nothing invalidates the entry either.
+///
+/// Only the pools `select_warmup_models` acts on take part, and they are sorted,
+/// so an upstream reordering does not needlessly discard a good entry.
+fn warmup_cache_key(
+    alias: &str,
+    additional_limits: &[crate::usage::AdditionalRateLimit],
+) -> String {
+    let mut pools: Vec<String> = additional_limits
+        .iter()
+        .filter(|limit| is_model_quota_limit(limit))
+        .map(|limit| normalized_pool_name(limit.limit_name.as_deref().unwrap_or_default()))
+        .collect();
+    pools.sort_unstable();
+    // Unit separator: cannot appear in an alias or a normalized pool name, so
+    // no pool list can be confused with a different account's key.
+    format!("{alias}\u{1f}{}", pools.join("\u{1e}"))
 }
 
 fn is_model_quota_limit(limit: &crate::usage::AdditionalRateLimit) -> bool {
@@ -632,8 +658,9 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
 
     // One `/models` answer covers both the main-pool request below and every
     // additional-pool request after it.
+    let cache_key = warmup_cache_key(alias, &additional_limits);
     let selected_models = resolve_warmup_models(
-        alias,
+        &cache_key,
         &client,
         &access_token,
         account_id.as_deref(),
@@ -683,9 +710,9 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                 debug!(
                     "[{alias}] model {model:?} not supported, refreshing model cache and retrying"
                 );
-                model_cache_invalidate(&mut *MODEL_CACHE.lock().await, alias);
+                model_cache_invalidate(&mut *MODEL_CACHE.lock().await, &cache_key);
                 let refreshed_models = resolve_warmup_models(
-                    alias,
+                    &cache_key,
                     &client,
                     &access_token,
                     account_id.as_deref(),
@@ -900,6 +927,67 @@ mod tests {
     #[test]
     fn test_split_main_model_rejects_an_empty_selection() {
         assert!(split_main_model(&[]).is_err());
+    }
+
+    fn model_pool(limit_name: &str) -> crate::usage::AdditionalRateLimit {
+        crate::usage::AdditionalRateLimit {
+            limit_name: Some(limit_name.to_string()),
+            metered_feature: Some("codex_mini".to_string()),
+            allowed: Some(true),
+            limit_reached: Some(false),
+            primary: None,
+            secondary: None,
+        }
+    }
+
+    #[test]
+    fn cache_key_separates_accounts_that_share_a_pool_set() {
+        assert_ne!(
+            warmup_cache_key("alice", &[model_pool("gpt-5-mini")]),
+            warmup_cache_key("bob", &[model_pool("gpt-5-mini")])
+        );
+    }
+
+    /// A changed pool set must produce a different key — that miss is the only
+    /// thing that re-resolves the model list for a long-running daemon.
+    #[test]
+    fn cache_key_changes_when_a_pool_is_added() {
+        let before = warmup_cache_key("alice", &[]);
+        let after = warmup_cache_key("alice", &[model_pool("gpt-5-mini")]);
+        assert_ne!(before, after);
+    }
+
+    /// The mirror image: upstream reordering the same pools must not throw away
+    /// a perfectly good entry and buy a `/models` round trip per warmup.
+    #[test]
+    fn cache_key_ignores_pool_order() {
+        let one = warmup_cache_key(
+            "alice",
+            &[model_pool("gpt-5-mini"), model_pool("gpt-5-spark")],
+        );
+        let other = warmup_cache_key(
+            "alice",
+            &[model_pool("gpt-5-spark"), model_pool("gpt-5-mini")],
+        );
+        assert_eq!(one, other);
+    }
+
+    /// Pools that `select_warmup_models` never acts on must not perturb the key
+    /// either, or an unrelated non-model quota would invalidate a good entry.
+    #[test]
+    fn cache_key_ignores_pools_that_are_not_warmed() {
+        let non_model = crate::usage::AdditionalRateLimit {
+            metered_feature: Some("code_review".to_string()),
+            ..model_pool("Code review")
+        };
+        let exhausted = crate::usage::AdditionalRateLimit {
+            limit_reached: Some(true),
+            ..model_pool("gpt-5-spark")
+        };
+        assert_eq!(
+            warmup_cache_key("alice", &[model_pool("gpt-5-mini")]),
+            warmup_cache_key("alice", &[model_pool("gpt-5-mini"), non_model, exhausted])
+        );
     }
 
     #[test]
@@ -2048,6 +2136,130 @@ mod tests {
                 1,
                 "warming an additional pool must reuse the list already resolved for the \
                  main pool rather than asking again"
+            );
+        }
+
+        /// Same mock as above, but it serves two models and also counts the
+        /// warmup requests, so a test can tell *which* pools were warmed rather
+        /// than only how often the model list was fetched. Two models are the
+        /// minimum that distinguishes them: a pool claiming the only model would
+        /// leave the main pool no candidate (see `select_warmup_models`), and
+        /// both requests would collapse into one.
+        async fn start_counting_mock_server()
+        -> (Arc<AtomicUsize>, Arc<AtomicUsize>, Vec<EnvVarGuard>) {
+            let models_calls = Arc::new(AtomicUsize::new(0));
+            let responses_calls = Arc::new(AtomicUsize::new(0));
+            let models_counter = models_calls.clone();
+            let responses_counter = responses_calls.clone();
+
+            let app = Router::new()
+                .route(
+                    "/codex/models",
+                    get(move || {
+                        let counter = models_counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "models": [
+                                        {"slug": "gpt-5-mini", "supported_in_api": true},
+                                        {"slug": "gpt-5-spark", "supported_in_api": true}
+                                    ]
+                                })),
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/codex/responses",
+                    post(move || {
+                        let counter = responses_counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::OK, "")
+                        }
+                    }),
+                );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let guards = vec![
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models")),
+                EnvVarGuard::set(
+                    "CS_RESPONSES_URL",
+                    &format!("http://{addr}/codex/responses"),
+                ),
+            ];
+            (models_calls, responses_calls, guards)
+        }
+
+        /// The resolved set bakes in the additional pools that existed when it
+        /// was cached, so keying the cache on the alias alone freezes it for the
+        /// life of the process. The CLI exits between warmups and never notices;
+        /// the daemon with `auto_warmup` runs for days, so an account that gains
+        /// a model quota pool would keep warming the old set — the new pool's
+        /// quota window silently never opens until someone restarts the daemon.
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn a_pool_added_after_the_first_warmup_is_still_warmed() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = tempfile::tempdir().unwrap();
+            let _codex_switch_home =
+                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+
+            let alias = "models-cache-pool-set-changed";
+            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+            let (models_calls, responses_calls, _guards) = start_counting_mock_server().await;
+
+            // First warmup: the account has no additional quota pool.
+            crate::cache::put(alias, &crate::usage::UsageInfo::default());
+            warmup_account(alias, &profile_path)
+                .await
+                .expect("the first warmup against a healthy mock server must succeed");
+            assert_eq!(
+                responses_calls.load(Ordering::SeqCst),
+                1,
+                "with no additional pool only the main-pool request is expected"
+            );
+
+            // The account gains a model quota pool while the process keeps running.
+            crate::cache::put(
+                alias,
+                &crate::usage::UsageInfo {
+                    additional_limits: vec![crate::usage::AdditionalRateLimit {
+                        limit_name: Some("gpt-5-spark".to_string()),
+                        metered_feature: Some("codex_spark".to_string()),
+                        allowed: Some(true),
+                        limit_reached: Some(false),
+                        primary: None,
+                        secondary: None,
+                    }],
+                    ..Default::default()
+                },
+            );
+            warmup_account(alias, &profile_path)
+                .await
+                .expect("the second warmup against a healthy mock server must succeed");
+
+            assert_eq!(
+                models_calls.load(Ordering::SeqCst),
+                2,
+                "a changed pool set must miss the cache; reusing the entry resolved for the \
+                 old set is what leaves the new pool cold"
+            );
+            assert_eq!(
+                responses_calls.load(Ordering::SeqCst),
+                3,
+                "the second warmup must open a quota window for the main pool AND the pool \
+                 the account just gained"
             );
         }
     }
