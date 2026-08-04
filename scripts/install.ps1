@@ -55,10 +55,15 @@ if ($env:CS_UNINSTALL -eq "1") {
         Remove-Item -Force $InstallDir
     }
 
-    # Remove from PATH
+    # Remove from PATH. Compared entry by entry rather than with -like: the
+    # pattern operators treat [ and ] in a path (a username can contain them) as
+    # wildcards, and a substring match would also fire on an unrelated directory
+    # that merely starts with this one. Empty entries are dropped on the way out
+    # because Windows resolves them to the current working directory.
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    if ($UserPath -like "*$InstallDir*") {
-        $NewPath = ($UserPath -split ";" | Where-Object { $_ -ne $InstallDir }) -join ";"
+    $PathEntries = @($UserPath -split ";" | Where-Object { $_.Trim() -ne "" })
+    if ($PathEntries -contains $InstallDir) {
+        $NewPath = ($PathEntries | Where-Object { $_ -ne $InstallDir }) -join ";"
         [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
         Write-Host "[info]  Removed $InstallDir from user PATH" -ForegroundColor Blue
     }
@@ -142,10 +147,19 @@ Expand-Archive -Path $ZipPath -DestinationPath $TmpDir -Force
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 Move-Item -Path (Join-Path $TmpDir $BinaryName) -Destination (Join-Path $InstallDir $BinaryName) -Force
 
-# Add to PATH if not already present
+# Add to PATH if not already present.
+#
+# Rebuilt from entries instead of concatenating "$UserPath;$InstallDir": when the
+# user has no User-scoped Path, or it ends with a separator, that concatenation
+# produces an empty PATH element. Windows resolves an empty element to the
+# current working directory when it searches for an executable, so the installer
+# would leave every directory the user later cd's into on the search path for
+# every command they run — a persistent change outliving the tool itself.
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($UserPath -notlike "*$InstallDir*") {
-    [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
+$PathEntries = @($UserPath -split ";" | Where-Object { $_.Trim() -ne "" })
+if ($PathEntries -notcontains $InstallDir) {
+    $NewPath = ($PathEntries + $InstallDir) -join ";"
+    [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
     Write-Host "[info]  Added $InstallDir to user PATH (restart terminal to take effect)" -ForegroundColor Blue
 }
 
