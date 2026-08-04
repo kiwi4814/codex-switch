@@ -18,22 +18,28 @@ fn models_url() -> String {
 }
 
 static CODEX_VERSION: OnceCell<String> = OnceCell::const_new();
-// Keyed by account (alias) so one account's resolved model never leaks into another's warmup.
-static MODEL_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
+/// The models one warmup should touch, keyed by account (alias) so one
+/// account's resolution never leaks into another's warmup.
+///
+/// The whole selected set is cached, not just the main-pool model: the main
+/// request and the additional-pool requests are answered by a single `/models`
+/// response, so caching only the first one made every warmup fetch that
+/// response twice — and with no additional pools, threw the second away.
+static MODEL_CACHE: LazyLock<Mutex<HashMap<String, Vec<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 // Serialize duplicate fetches for the same account without blocking unrelated accounts.
 static MODEL_FETCH_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn model_cache_get(cache: &HashMap<String, String>, key: &str) -> Option<String> {
+fn model_cache_get(cache: &HashMap<String, Vec<String>>, key: &str) -> Option<Vec<String>> {
     cache.get(key).cloned()
 }
 
-fn model_cache_set(cache: &mut HashMap<String, String>, key: &str, model: String) {
-    cache.insert(key.to_string(), model);
+fn model_cache_set(cache: &mut HashMap<String, Vec<String>>, key: &str, models: Vec<String>) {
+    cache.insert(key.to_string(), models);
 }
 
-fn model_cache_invalidate(cache: &mut HashMap<String, String>, key: &str) {
+fn model_cache_invalidate(cache: &mut HashMap<String, Vec<String>>, key: &str) {
     cache.remove(key);
 }
 
@@ -242,24 +248,26 @@ pub(crate) async fn fetch_models(
     unreachable!("models fetch loop always returns")
 }
 
-async fn fetch_warmup_model(
+/// Resolve every model this warmup should touch, from one `/models` response:
+/// the main-pool model first, then one per additional quota pool.
+async fn fetch_warmup_models(
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
     additional_limits: &[crate::usage::AdditionalRateLimit],
-) -> Result<String> {
+) -> Result<Vec<String>> {
     let models = fetch_models(client, access_token, account_id, is_fedramp).await?;
     let selected = select_warmup_models(&models, additional_limits)?;
-    require_official_model(
-        selected
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("official models endpoint returned no main-pool model")),
-    )
+    if selected.is_empty() {
+        return require_official_model(Err(anyhow::anyhow!(
+            "official models endpoint returned no main-pool model"
+        )));
+    }
+    Ok(selected)
 }
 
-fn require_official_model(result: Result<String>) -> Result<String> {
+fn require_official_model<T>(result: Result<T>) -> Result<T> {
     result.map_err(|error| anyhow::anyhow!("could not resolve an official warmup model: {error:#}"))
 }
 
@@ -378,16 +386,16 @@ fn select_warmup_models(
     Ok(selected)
 }
 
-async fn resolve_model(
+async fn resolve_warmup_models(
     cache_key: &str,
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
     additional_limits: &[crate::usage::AdditionalRateLimit],
-) -> Result<String> {
-    if let Some(model) = model_cache_get(&*MODEL_CACHE.lock().await, cache_key) {
-        return Ok(model);
+) -> Result<Vec<String>> {
+    if let Some(models) = model_cache_get(&*MODEL_CACHE.lock().await, cache_key) {
+        return Ok(models);
     }
 
     let fetch_lock = {
@@ -398,11 +406,11 @@ async fn resolve_model(
             .clone()
     };
     let _fetch_guard = fetch_lock.lock().await;
-    if let Some(model) = model_cache_get(&*MODEL_CACHE.lock().await, cache_key) {
-        return Ok(model);
+    if let Some(models) = model_cache_get(&*MODEL_CACHE.lock().await, cache_key) {
+        return Ok(models);
     }
 
-    let model = fetch_warmup_model(
+    let models = fetch_warmup_models(
         client,
         access_token,
         account_id,
@@ -410,8 +418,19 @@ async fn resolve_model(
         additional_limits,
     )
     .await?;
-    model_cache_set(&mut *MODEL_CACHE.lock().await, cache_key, model.clone());
-    Ok(model)
+    model_cache_set(&mut *MODEL_CACHE.lock().await, cache_key, models.clone());
+    Ok(models)
+}
+
+/// Split a resolved set into the main-pool model and the additional-pool ones.
+///
+/// `fetch_warmup_models` rejects an empty set, so the `None` arm is only
+/// reachable through a cache entry that was never produced that way.
+fn split_main_model(models: &[String]) -> Result<(&str, &[String])> {
+    models
+        .split_first()
+        .map(|(main, additional)| (main.as_str(), additional))
+        .ok_or_else(|| anyhow::anyhow!("no warmup model was resolved"))
 }
 
 fn build_body(model: &str) -> serde_json::Value {
@@ -450,20 +469,20 @@ fn make_request(
     .json(body)
 }
 
+/// Warm one request per additional quota pool.
+///
+/// Takes the models already resolved for this warmup rather than fetching the
+/// list again: both halves come from the same `/models` answer, and
+/// `select_warmup_models` already excludes the main-pool model from this slice.
 async fn warmup_additional_models(
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
-    additional_limits: &[crate::usage::AdditionalRateLimit],
-    warmed_model: &str,
+    additional_models: &[String],
 ) -> Result<()> {
-    let models = fetch_models(client, access_token, account_id, is_fedramp).await?;
-    for model in select_warmup_models(&models, additional_limits)?
-        .into_iter()
-        .filter(|model| model != warmed_model)
-    {
-        let body = build_body(&model);
+    for model in additional_models {
+        let body = build_body(model);
         debug!("warmup additional pool POST → {RESPONSES_URL} (model={model})");
         let mut resp = make_request(client, access_token, account_id, is_fedramp, &body)
             .send()
@@ -515,6 +534,13 @@ fn persist_refreshed_tokens(
         )
     })?;
     if !persisted {
+        // Deliberately weaker than the usage path, which answers the same race
+        // by re-reading the profile and retrying (`reload_rotated_credentials`).
+        // Losing the CAS means a peer already wrote a newer credential, so the
+        // profile is healthy and warmup has nothing left to do — warmup only
+        // opens a quota window, and the next one will use the stored token.
+        // Adding a recovery round here would buy nothing and duplicate the
+        // hardest logic in the codebase.
         debug!(
             "[{alias}] skipped stale refreshed tokens because another process replaced the \
              presented refresh token"
@@ -604,7 +630,9 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
         }
     }
 
-    let model = resolve_model(
+    // One `/models` answer covers both the main-pool request below and every
+    // additional-pool request after it.
+    let selected_models = resolve_warmup_models(
         alias,
         &client,
         &access_token,
@@ -614,7 +642,9 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
     )
     .await
     .with_context(|| format!("{alias}: failed to select a supported warmup model"))?;
-    let body = build_body(&model);
+    let (model, additional_models) = split_main_model(&selected_models)
+        .with_context(|| format!("{alias}: failed to select a supported warmup model"))?;
+    let body = build_body(model);
 
     debug!("[{alias}] warmup POST → {RESPONSES_URL} (model={model})");
 
@@ -642,8 +672,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                 &access_token,
                 account_id.as_deref(),
                 is_fedramp,
-                &additional_limits,
-                &model,
+                additional_models,
             )
             .await
         }
@@ -655,7 +684,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                     "[{alias}] model {model:?} not supported, refreshing model cache and retrying"
                 );
                 model_cache_invalidate(&mut *MODEL_CACHE.lock().await, alias);
-                let new_model = resolve_model(
+                let refreshed_models = resolve_warmup_models(
                     alias,
                     &client,
                     &access_token,
@@ -667,7 +696,11 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                 .with_context(|| {
                     format!("{alias}: failed to refresh the supported warmup model")
                 })?;
-                let retry_body = build_body(&new_model);
+                let (new_model, new_additional_models) = split_main_model(&refreshed_models)
+                    .with_context(|| {
+                        format!("{alias}: failed to refresh the supported warmup model")
+                    })?;
+                let retry_body = build_body(new_model);
                 let mut retry_resp = make_request(
                     &client,
                     &access_token,
@@ -686,8 +719,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                         &access_token,
                         account_id.as_deref(),
                         is_fedramp,
-                        &additional_limits,
-                        &new_model,
+                        new_additional_models,
                     )
                     .await;
                 }
@@ -741,8 +773,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                                 &refreshed.access_token,
                                 account_id.as_deref(),
                                 is_fedramp,
-                                &additional_limits,
-                                &model,
+                                additional_models,
                             )
                             .await;
                         }
@@ -825,29 +856,50 @@ mod tests {
 
     #[test]
     fn test_model_cache_keys_are_isolated_per_account() {
-        let mut cache: HashMap<String, String> = HashMap::new();
-        model_cache_set(&mut cache, "account-a", "model-a".to_string());
+        let mut cache: HashMap<String, Vec<String>> = HashMap::new();
+        model_cache_set(&mut cache, "account-a", vec!["model-a".to_string()]);
 
         assert_eq!(
             model_cache_get(&cache, "account-a"),
-            Some("model-a".to_string())
+            Some(vec!["model-a".to_string()])
         );
         assert_eq!(model_cache_get(&cache, "account-b"), None);
     }
 
     #[test]
     fn test_model_cache_invalidation_only_affects_target_key() {
-        let mut cache: HashMap<String, String> = HashMap::new();
-        model_cache_set(&mut cache, "account-a", "model-a".to_string());
-        model_cache_set(&mut cache, "account-b", "model-b".to_string());
+        let mut cache: HashMap<String, Vec<String>> = HashMap::new();
+        model_cache_set(&mut cache, "account-a", vec!["model-a".to_string()]);
+        model_cache_set(&mut cache, "account-b", vec!["model-b".to_string()]);
 
         model_cache_invalidate(&mut cache, "account-a");
 
         assert_eq!(model_cache_get(&cache, "account-a"), None);
         assert_eq!(
             model_cache_get(&cache, "account-b"),
-            Some("model-b".to_string())
+            Some(vec!["model-b".to_string()])
         );
+    }
+
+    /// The cache holds the whole resolved set, so an additional-pool model
+    /// survives alongside the main one and the second `/models` fetch that used
+    /// to retrieve it is unnecessary.
+    #[test]
+    fn test_model_cache_round_trips_the_whole_selected_set() {
+        let mut cache: HashMap<String, Vec<String>> = HashMap::new();
+        let selected = vec!["gpt-5-mini".to_string(), "gpt-5-spark".to_string()];
+        model_cache_set(&mut cache, "account-a", selected.clone());
+
+        let cached = model_cache_get(&cache, "account-a").expect("entry must round-trip");
+        let (main, additional) = split_main_model(&cached).unwrap();
+
+        assert_eq!(main, "gpt-5-mini");
+        assert_eq!(additional, ["gpt-5-spark".to_string()]);
+    }
+
+    #[test]
+    fn test_split_main_model_rejects_an_empty_selection() {
+        assert!(split_main_model(&[]).is_err());
     }
 
     #[test]
@@ -1166,8 +1218,10 @@ mod tests {
 
     #[test]
     fn test_model_fetch_failure_is_not_replaced_with_a_hardcoded_model() {
-        let error = require_official_model(Err(anyhow::anyhow!("models endpoint unavailable")))
-            .unwrap_err();
+        let error = require_official_model::<Vec<String>>(Err(anyhow::anyhow!(
+            "models endpoint unavailable"
+        )))
+        .unwrap_err();
 
         assert!(error.to_string().contains("models endpoint unavailable"));
         assert!(!error.to_string().contains("gpt-5.3-codex"));
@@ -1414,7 +1468,7 @@ mod tests {
             let client = reqwest::Client::new();
             let first_client = client.clone();
             let first = tokio::spawn(async move {
-                resolve_model(
+                resolve_warmup_models(
                     "concurrent-model-account-one",
                     &first_client,
                     "token-one",
@@ -1427,7 +1481,7 @@ mod tests {
             assert_eq!(arrival_rx.recv().await.as_deref(), Some("workspace-one"));
 
             let second = tokio::spawn(async move {
-                resolve_model(
+                resolve_warmup_models(
                     "concurrent-model-account-two",
                     &client,
                     "token-two",
@@ -1867,6 +1921,133 @@ mod tests {
                 healthy_result.is_ok(),
                 "one account's persist failure must not take down the others in the batch: \
                  {healthy_result:?}"
+            );
+        }
+
+        // ── /models is resolved once per warmup ──────────────────
+        //
+        // The model list decides both the main-pool request and the additional
+        // -pool ones, so it is one question with one answer. Asking twice costs
+        // an upstream round trip per warmup, and the daemon runs warmup on a
+        // timer across every profile when `auto_warmup` is on.
+
+        /// Mock server that counts `/codex/models` requests. `/codex/responses`
+        /// always succeeds, so nothing but the fetch count is under test.
+        async fn start_models_counting_mock_server() -> (Arc<AtomicUsize>, Vec<EnvVarGuard>) {
+            let models_calls = Arc::new(AtomicUsize::new(0));
+            let counter = models_calls.clone();
+
+            let app = Router::new()
+                .route(
+                    "/codex/models",
+                    get(move || {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "models": [{"slug": "gpt-5-mini", "supported_in_api": true}]
+                                })),
+                            )
+                        }
+                    }),
+                )
+                .route("/codex/responses", post(|| async { (StatusCode::OK, "") }));
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let guards = vec![
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models")),
+                EnvVarGuard::set(
+                    "CS_RESPONSES_URL",
+                    &format!("http://{addr}/codex/responses"),
+                ),
+            ];
+            (models_calls, guards)
+        }
+
+        /// The common case: an account with no additional quota pools. The
+        /// second fetch's answer was filtered down to nothing and discarded, so
+        /// the request bought precisely nothing.
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn a_warmup_without_additional_pools_fetches_the_model_list_once() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = tempfile::tempdir().unwrap();
+            let _codex_switch_home =
+                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+
+            // Unique alias: MODEL_CACHE is process-global and outlives one test.
+            let alias = "models-fetch-count-no-pools";
+            // Cached usage with no `additional_limits`, so the usage-fetch path
+            // stays out of this and there is no additional pool to warm.
+            crate::cache::put(alias, &crate::usage::UsageInfo::default());
+            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+
+            let (models_calls, _guards) = start_models_counting_mock_server().await;
+
+            warmup_account(alias, &profile_path)
+                .await
+                .expect("a warmup against a healthy mock server must succeed");
+
+            assert_eq!(
+                models_calls.load(Ordering::SeqCst),
+                1,
+                "the model list answers one question and must be fetched once; a second \
+                 /models request with no additional pool to warm is a round trip whose \
+                 answer is thrown away"
+            );
+        }
+
+        /// The same guarantee where the second fetch actually had a consumer:
+        /// an additional pool still gets warmed, from the list already in hand.
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn a_warmup_with_an_additional_pool_still_fetches_the_model_list_once() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = tempfile::tempdir().unwrap();
+            let _codex_switch_home =
+                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+
+            let alias = "models-fetch-count-with-pool";
+            crate::cache::put(
+                alias,
+                &crate::usage::UsageInfo {
+                    additional_limits: vec![crate::usage::AdditionalRateLimit {
+                        limit_name: Some("gpt-5-mini".to_string()),
+                        metered_feature: Some("codex_mini".to_string()),
+                        allowed: Some(true),
+                        limit_reached: Some(false),
+                        primary: None,
+                        secondary: None,
+                    }],
+                    ..Default::default()
+                },
+            );
+            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+
+            let (models_calls, _guards) = start_models_counting_mock_server().await;
+
+            warmup_account(alias, &profile_path)
+                .await
+                .expect("a warmup against a healthy mock server must succeed");
+
+            assert_eq!(
+                models_calls.load(Ordering::SeqCst),
+                1,
+                "warming an additional pool must reuse the list already resolved for the \
+                 main pool rather than asking again"
             );
         }
     }
