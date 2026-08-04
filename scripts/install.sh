@@ -23,12 +23,48 @@ info()  { printf '\033[0;34m[info]\033[0m  %s\n' "$*"; }
 warn()  { printf '\033[0;33m[warn]\033[0m  %s\n' "$*" >&2; }
 error() { printf '\033[0;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
-remove_path_block() {
+resolve_profile_target() (
+  local profile_target="$1"
+  local link_target link_hops=0 physical_dir
+  while [ -L "$profile_target" ]; do
+    link_hops=$((link_hops + 1))
+    [ "$link_hops" -le 40 ] || error "Too many symbolic links while resolving $1."
+    link_target="$(readlink "$profile_target")" || error "Failed to resolve symbolic link $1."
+    case "$link_target" in
+      /*) ;;
+      *) link_target="$(dirname "$profile_target")/${link_target}" ;;
+    esac
+    profile_target="$link_target"
+  done
+  physical_dir="$(CDPATH= cd -P "$(dirname "$profile_target")" && pwd -P)" || error "Failed to resolve profile directory for $1."
+  printf '%s/%s\n' "$physical_dir" "$(basename "$profile_target")"
+)
+
+file_identity() (
+  local path="$1" identity
+  if identity="$(stat -f '%d:%i' "$path" 2>/dev/null)"; then
+    printf '%s\n' "$identity"
+  elif identity="$(stat -c '%d:%i' "$path" 2>/dev/null)"; then
+    printf '%s\n' "$identity"
+  else
+    error "Failed to identify ${path}."
+  fi
+)
+
+remove_path_block() (
   local profile_file="$1"
-  local tmp_file
+  local profile_target current_profile_target profile_identity current_profile_identity
+  local profile_dir tmp_file=""
   [ -f "$profile_file" ] || return 0
   grep -F "$PATH_BLOCK_BEGIN" "$profile_file" >/dev/null 2>&1 || return 0
-  tmp_file="$(mktemp)"
+  profile_target="$(resolve_profile_target "$profile_file")"
+  profile_identity="$(file_identity "$profile_target")"
+  profile_dir="$(dirname "$profile_target")"
+  tmp_file="$(mktemp "${profile_dir}/.${BINARY_NAME}.XXXXXX")" || error "Failed to create temporary profile file for ${profile_file}."
+  trap '[ -z "$tmp_file" ] || rm -f "$tmp_file"' EXIT
+  if ! cp -p "$profile_target" "$tmp_file"; then
+    error "Failed to prepare temporary profile file for ${profile_file}."
+  fi
   if ! awk -v begin="$PATH_BLOCK_BEGIN" -v end="$PATH_BLOCK_END" '
     $0 == begin {
       if (inside || seen_begin) invalid = 1
@@ -46,14 +82,23 @@ remove_path_block() {
     END {
       if (invalid || !seen_begin || !seen_end || inside) exit 1
     }
-  ' "$profile_file" > "$tmp_file"; then
-    rm -f "$tmp_file"
+  ' "$profile_target" > "$tmp_file"; then
     error "Failed to remove codex-switch PATH block from ${profile_file}."
   fi
-  cat "$tmp_file" > "$profile_file"
-  rm -f "$tmp_file"
+  current_profile_target="$(resolve_profile_target "$profile_file")"
+  if [ "$current_profile_target" != "$profile_target" ]; then
+    error "Profile link changed while updating ${profile_file}; original file was left unchanged."
+  fi
+  current_profile_identity="$(file_identity "$current_profile_target")"
+  if [ "$current_profile_identity" != "$profile_identity" ]; then
+    error "Profile file changed while updating ${profile_file}; newer contents were left unchanged."
+  fi
+  if ! mv -f "$tmp_file" "$profile_target"; then
+    error "Failed to replace ${profile_file} with the updated PATH configuration."
+  fi
+  tmp_file=""
   info "Removed codex-switch PATH entry from ${profile_file}."
-}
+)
 
 remove_managed_path_blocks() {
   remove_path_block "${HOME}/.zprofile"

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, bail};
 use tokio::sync::{Mutex, OnceCell};
@@ -18,9 +18,11 @@ fn models_url() -> String {
 }
 
 static CODEX_VERSION: OnceCell<String> = OnceCell::const_new();
-// tokio Mutex held across the await in resolve_model, ensuring only one fetch per process.
 // Keyed by account (alias) so one account's resolved model never leaks into another's warmup.
 static MODEL_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+// Serialize duplicate fetches for the same account without blocking unrelated accounts.
+static MODEL_FETCH_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn model_cache_get(cache: &HashMap<String, String>, key: &str) -> Option<String> {
@@ -384,12 +386,22 @@ async fn resolve_model(
     is_fedramp: bool,
     additional_limits: &[crate::usage::AdditionalRateLimit],
 ) -> Result<String> {
-    let mut guard = MODEL_CACHE.lock().await;
-    if let Some(model) = model_cache_get(&guard, cache_key) {
+    if let Some(model) = model_cache_get(&*MODEL_CACHE.lock().await, cache_key) {
         return Ok(model);
     }
-    // Hold the lock across the fetch so concurrent callers wait here instead of
-    // each issuing a redundant request.
+
+    let fetch_lock = {
+        let mut locks = MODEL_FETCH_LOCKS.lock().await;
+        locks
+            .entry(cache_key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _fetch_guard = fetch_lock.lock().await;
+    if let Some(model) = model_cache_get(&*MODEL_CACHE.lock().await, cache_key) {
+        return Ok(model);
+    }
+
     let model = fetch_warmup_model(
         client,
         access_token,
@@ -398,7 +410,7 @@ async fn resolve_model(
         additional_limits,
     )
     .await?;
-    model_cache_set(&mut guard, cache_key, model.clone());
+    model_cache_set(&mut *MODEL_CACHE.lock().await, cache_key, model.clone());
     Ok(model)
 }
 
@@ -1352,6 +1364,92 @@ mod tests {
                 ),
             ];
             (token_calls, guards)
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn model_resolution_for_different_accounts_fetches_concurrently() {
+            let _lock = ENV_LOCK.lock().await;
+            let (arrival_tx, mut arrival_rx) = tokio::sync::mpsc::unbounded_channel();
+            let release_first = Arc::new(tokio::sync::Semaphore::new(0));
+
+            let app = Router::new().route(
+                "/codex/models",
+                get({
+                    let release_first = release_first.clone();
+                    move |headers: axum::http::HeaderMap| {
+                        let arrival_tx = arrival_tx.clone();
+                        let release_first = release_first.clone();
+                        async move {
+                            let account_id = headers
+                                .get("chatgpt-account-id")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string();
+                            arrival_tx.send(account_id.clone()).unwrap();
+                            if account_id == "workspace-one" {
+                                let _permit = release_first.acquire().await.unwrap();
+                            }
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "models": [{
+                                        "slug": "gpt-5-mini",
+                                        "supported_in_api": true
+                                    }]
+                                })),
+                            )
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let _models_url =
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
+
+            let client = reqwest::Client::new();
+            let first_client = client.clone();
+            let first = tokio::spawn(async move {
+                resolve_model(
+                    "concurrent-model-account-one",
+                    &first_client,
+                    "token-one",
+                    Some("workspace-one"),
+                    false,
+                    &[],
+                )
+                .await
+            });
+            assert_eq!(arrival_rx.recv().await.as_deref(), Some("workspace-one"));
+
+            let second = tokio::spawn(async move {
+                resolve_model(
+                    "concurrent-model-account-two",
+                    &client,
+                    "token-two",
+                    Some("workspace-two"),
+                    false,
+                    &[],
+                )
+                .await
+            });
+            let second_arrived_in_parallel =
+                tokio::time::timeout(std::time::Duration::from_millis(300), arrival_rx.recv())
+                    .await
+                    .is_ok();
+
+            release_first.add_permits(1);
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+
+            assert!(
+                second_arrived_in_parallel,
+                "a slow /models fetch for one account must not block another account"
+            );
         }
 
         // `CODEX_SWITCH_HOME` is also mutated by `profile::tests` under its own

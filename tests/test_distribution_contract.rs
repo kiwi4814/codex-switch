@@ -446,6 +446,273 @@ fn unix_installer_preserves_migration_and_path_lifecycle() {
 }
 
 #[test]
+fn unix_installer_rewrites_shell_profiles_atomically() {
+    let script = repo_file("scripts/install.sh");
+
+    for required in [
+        "remove_path_block() (",
+        "resolve_profile_target() (",
+        "file_identity() (",
+        "while [ -L \"$profile_target\" ]",
+        "link_target=\"$(readlink \"$profile_target\")\"",
+        "cd -P \"$(dirname \"$profile_target\")\" && pwd -P",
+        "mktemp \"${profile_dir}/.${BINARY_NAME}.XXXXXX\"",
+        "cp -p \"$profile_target\" \"$tmp_file\"",
+        "current_profile_target=\"$(resolve_profile_target \"$profile_file\")\"",
+        "current_profile_identity=\"$(file_identity \"$current_profile_target\")\"",
+        "mv -f \"$tmp_file\" \"$profile_target\"",
+    ] {
+        assert!(
+            script.contains(required),
+            "Unix installer must preserve the atomic profile rewrite step `{required}`"
+        );
+    }
+    assert!(
+        !script.contains("cat \"$tmp_file\" > \"$profile_file\""),
+        "Unix installer must not truncate a live shell profile in place"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_installer_preserves_multi_level_profile_symlinks() {
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+
+    let script = repo_file("scripts/install.sh");
+    let function_prefix = script
+        .split("\nremove_managed_path_blocks() {")
+        .next()
+        .expect("installer must define remove_managed_path_blocks");
+    let temp = tempfile::tempdir().unwrap();
+    let real_profile = temp.path().join("real-profile");
+    let middle_link = temp.path().join("middle-profile");
+    let profile_link = temp.path().join(".zprofile");
+    fs::write(
+        &real_profile,
+        "export KEEP=1\n# >>> codex-switch PATH >>>\nexport PATH=/tmp/cs:$PATH\n# <<< codex-switch PATH <<<\n",
+    )
+    .unwrap();
+    symlink("real-profile", &middle_link).unwrap();
+    symlink("middle-profile", &profile_link).unwrap();
+
+    let harness = temp.path().join("remove-path-block.sh");
+    fs::write(
+        &harness,
+        format!("{function_prefix}\nremove_path_block \"$1\"\n"),
+    )
+    .unwrap();
+    let output = Command::new("bash")
+        .arg(&harness)
+        .arg(&profile_link)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "remove_path_block failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(&profile_link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        fs::symlink_metadata(&middle_link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_to_string(&real_profile).unwrap(),
+        "export KEEP=1\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_installer_aborts_if_profile_symlink_changes_during_rewrite() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::process::Command;
+
+    let script = repo_file("scripts/install.sh");
+    let function_prefix = script
+        .split("\nremove_managed_path_blocks() {")
+        .next()
+        .expect("installer must define remove_managed_path_blocks");
+    let temp = tempfile::tempdir().unwrap();
+    let original_profile = temp.path().join("original-profile");
+    let replacement_profile = temp.path().join("replacement-profile");
+    let profile_link = temp.path().join(".zprofile");
+    let managed =
+        "# >>> codex-switch PATH >>>\nexport PATH=/tmp/cs:$PATH\n# <<< codex-switch PATH <<<\n";
+    let original_contents = format!("export ORIGINAL=1\n{managed}");
+    let replacement_contents = format!("export REPLACEMENT=1\n{managed}");
+    fs::write(&original_profile, &original_contents).unwrap();
+    fs::write(&replacement_profile, &replacement_contents).unwrap();
+    symlink("original-profile", &profile_link).unwrap();
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let fake_cp = fake_bin.join("cp");
+    fs::write(
+        &fake_cp,
+        "#!/bin/sh\nrm -f \"$PROFILE_LINK\"\nln -s \"$REPLACEMENT_PROFILE\" \"$PROFILE_LINK\"\nexec /bin/cp \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cp, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let harness = temp.path().join("remove-path-block.sh");
+    fs::write(
+        &harness,
+        format!("{function_prefix}\nremove_path_block \"$1\"\n"),
+    )
+    .unwrap();
+    let output = Command::new("bash")
+        .arg(&harness)
+        .arg(&profile_link)
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .env("PROFILE_LINK", &profile_link)
+        .env("REPLACEMENT_PROFILE", &replacement_profile)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a changed profile symlink must abort the rewrite"
+    );
+    assert_eq!(
+        fs::read_to_string(&original_profile).unwrap(),
+        original_contents
+    );
+    assert_eq!(
+        fs::read_to_string(&replacement_profile).unwrap(),
+        replacement_contents
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_installer_aborts_if_profile_parent_symlink_changes() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::process::Command;
+
+    let script = repo_file("scripts/install.sh");
+    let function_prefix = script
+        .split("\nremove_managed_path_blocks() {")
+        .next()
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir_a = temp.path().join("dir-a");
+    let dir_b = temp.path().join("dir-b");
+    let current = temp.path().join("current");
+    fs::create_dir(&dir_a).unwrap();
+    fs::create_dir(&dir_b).unwrap();
+    let managed =
+        "# >>> codex-switch PATH >>>\nexport PATH=/tmp/cs:$PATH\n# <<< codex-switch PATH <<<\n";
+    let contents_a = format!("export A=1\n{managed}");
+    let contents_b = format!("export B=1\n{managed}");
+    fs::write(dir_a.join("profile"), &contents_a).unwrap();
+    fs::write(dir_b.join("profile"), &contents_b).unwrap();
+    symlink("dir-a", &current).unwrap();
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let fake_cp = fake_bin.join("cp");
+    fs::write(
+        &fake_cp,
+        "#!/bin/sh\nrm -f \"$CURRENT_LINK\"\nln -s \"$NEW_DIR\" \"$CURRENT_LINK\"\nexec /bin/cp \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cp, fs::Permissions::from_mode(0o755)).unwrap();
+    let harness = temp.path().join("remove-path-block.sh");
+    fs::write(
+        &harness,
+        format!("{function_prefix}\nremove_path_block \"$1\"\n"),
+    )
+    .unwrap();
+
+    let output = Command::new("bash")
+        .arg(&harness)
+        .arg(current.join("profile"))
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .env("CURRENT_LINK", &current)
+        .env("NEW_DIR", &dir_b)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(dir_a.join("profile")).unwrap(),
+        contents_a
+    );
+    assert_eq!(
+        fs::read_to_string(dir_b.join("profile")).unwrap(),
+        contents_b
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_installer_aborts_if_profile_inode_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let script = repo_file("scripts/install.sh");
+    let function_prefix = script
+        .split("\nremove_managed_path_blocks() {")
+        .next()
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let profile = temp.path().join("profile");
+    let replacement = temp.path().join("replacement");
+    let managed =
+        "# >>> codex-switch PATH >>>\nexport PATH=/tmp/cs:$PATH\n# <<< codex-switch PATH <<<\n";
+    fs::write(&profile, format!("export OLD=1\n{managed}")).unwrap();
+    let replacement_contents = format!("export NEW=1\n{managed}");
+    fs::write(&replacement, &replacement_contents).unwrap();
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let fake_cp = fake_bin.join("cp");
+    fs::write(
+        &fake_cp,
+        "#!/bin/sh\nmv -f \"$REPLACEMENT_PROFILE\" \"$PROFILE_FILE\"\nexec /bin/cp \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cp, fs::Permissions::from_mode(0o755)).unwrap();
+    let harness = temp.path().join("remove-path-block.sh");
+    fs::write(
+        &harness,
+        format!("{function_prefix}\nremove_path_block \"$1\"\n"),
+    )
+    .unwrap();
+
+    let output = Command::new("bash")
+        .arg(&harness)
+        .arg(&profile)
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .env("PROFILE_FILE", &profile)
+        .env("REPLACEMENT_PROFILE", &replacement)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(fs::read_to_string(&profile).unwrap(), replacement_contents);
+}
+
+#[test]
+fn release_build_installs_cross_with_locked_dependencies() {
+    let workflow = repo_file(".github/workflows/release.yml");
+
+    assert!(workflow.contains(
+        "cargo install cross --locked --git https://github.com/cross-rs/cross --rev 64b5bb4d3d34de062552b9a2093affe77b4ad16a"
+    ));
+}
+
+#[test]
 fn unix_installer_records_and_cleans_explicit_system_install_intent() {
     let script = repo_file("scripts/install.sh");
 

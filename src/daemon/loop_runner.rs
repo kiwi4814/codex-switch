@@ -36,6 +36,19 @@ fn poll_backoff_secs(poll_secs: u64, consecutive_failures: u32) -> u64 {
     poll_secs * 2u64.pow(consecutive_failures.min(4))
 }
 
+fn current_usage_percent_for_switch(current_usage: &usage::UsageInfo) -> f64 {
+    if current_usage.account_limited {
+        return 100.0;
+    }
+
+    current_usage
+        .primary
+        .as_ref()
+        .or(current_usage.secondary.as_ref())
+        .and_then(|w| w.used_percent)
+        .unwrap_or(0.0)
+}
+
 /// Main daemon event loop: periodically checks usage and switches account when needed.
 pub async fn run_daemon_loop() -> Result<()> {
     // Registered before anything else can block: from here on every signal is
@@ -196,12 +209,7 @@ async fn check_and_switch() -> Result<PollOutcome> {
     // 2. Check if current account exceeds threshold
     // Free accounts have no primary window (7d is remapped to secondary),
     // so fall back to secondary when primary is absent.
-    let current_used = current_usage
-        .primary
-        .as_ref()
-        .or(current_usage.secondary.as_ref())
-        .and_then(|w| w.used_percent)
-        .unwrap_or(0.0);
+    let current_used = current_usage_percent_for_switch(&current_usage);
 
     if current_used < threshold {
         tracing::debug!(
@@ -322,7 +330,8 @@ async fn check_and_switch() -> Result<PollOutcome> {
 
 #[cfg(test)]
 mod tests {
-    use super::poll_backoff_secs;
+    use super::{current_usage_percent_for_switch, poll_backoff_secs};
+    use crate::usage::{UsageInfo, WindowUsage};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -334,6 +343,20 @@ mod tests {
         assert_eq!(poll_backoff_secs(60, 2), 240);
         assert_eq!(poll_backoff_secs(60, 4), 960);
         assert_eq!(poll_backoff_secs(60, 10), 960);
+    }
+
+    #[test]
+    fn account_limited_usage_bypasses_low_usage_switch_threshold() {
+        let usage = UsageInfo {
+            account_limited: true,
+            primary: Some(WindowUsage {
+                used_percent: Some(1.0),
+                ..WindowUsage::default()
+            }),
+            ..UsageInfo::default()
+        };
+
+        assert!(current_usage_percent_for_switch(&usage) >= 80.0);
     }
 
     #[tokio::test]

@@ -366,9 +366,9 @@ fn parse_reset_credit(value: &Value) -> Option<ResetCredit> {
     let id = obj
         .get("id")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)?;
     let granted_at = obj
         .get("granted_at")
         .or_else(|| obj.get("grantedAt"))
@@ -434,6 +434,27 @@ mod tests {
 
         assert_eq!(credits[0].expires_at, None);
         assert_eq!(earliest_reset_credit(&credits).unwrap().id, "expiring");
+    }
+
+    #[test]
+    fn empty_credit_id_is_filtered_before_earliest_credit_is_selected() {
+        let (_, credits, valid_shape) = parse_reset_credits_summary(&json!({
+            "credits": [
+                {
+                    "id": "  ",
+                    "status": "available",
+                    "expires_at": "2026-07-01T00:00:00Z"
+                },
+                {
+                    "id": "valid-credit",
+                    "status": "available",
+                    "expires_at": "2026-08-01T00:00:00Z"
+                }
+            ]
+        }));
+
+        assert!(valid_shape);
+        assert_eq!(earliest_reset_credit(&credits).unwrap().id, "valid-credit");
     }
 
     #[test]
