@@ -530,14 +530,44 @@ pub fn backup_auth(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let ts = now_unix_secs();
-    let bak = path.with_extension(format!("json.bak.{ts}"));
     let contents =
         std::fs::read(path).with_context(|| format!("reading backup source {}", path.display()))?;
+    let bak = allocate_backup_path(path)?;
     atomic_write_private(&bak, &contents)
         .with_context(|| format!("backing up {} -> {}", path.display(), bak.display()))?;
     cleanup_old_backups(path);
     Ok(())
+}
+
+/// A backup path no earlier backup already occupies.
+///
+/// Nanoseconds rather than seconds: two switches inside one second are ordinary
+/// (`use` followed by `launch`, or any script), and a second-resolution name
+/// made the later backup overwrite the earlier one — quietly retaining fewer
+/// real recovery points than `MAX_BACKUPS` promises.
+///
+/// The wider stamp still sorts correctly in `cleanup_old_backups` against
+/// legacy seconds names, because the leading ten digits of a nanosecond stamp
+/// are that same second, so the shorter name compares as the earlier one.
+fn allocate_backup_path(path: &Path) -> Result<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    for collision in 0..1000u16 {
+        let candidate = if collision == 0 {
+            path.with_extension(format!("json.bak.{nanos}"))
+        } else {
+            path.with_extension(format!("json.bak.{nanos}-{collision}"))
+        };
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!(
+        "could not allocate a unique backup path for {}",
+        path.display()
+    )
 }
 
 pub fn update_tokens(
@@ -903,6 +933,75 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    fn backup_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .filter(|name| name.starts_with("auth.json.bak."))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Two switches inside one second are ordinary — `use` then `launch`, or
+    /// any script. A second-resolution backup name made the later one overwrite
+    /// the earlier, so the pre-switch credentials the user expected to be able
+    /// to recover were gone and `MAX_BACKUPS` retained fewer real recovery
+    /// points than it claims.
+    #[test]
+    fn two_backups_within_the_same_second_are_both_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        write_auth(&path, &json!({ "tokens": { "refresh_token": "first" } })).unwrap();
+        backup_auth(&path).unwrap();
+        write_auth(&path, &json!({ "tokens": { "refresh_token": "second" } })).unwrap();
+        backup_auth(&path).unwrap();
+
+        let names = backup_names(dir.path());
+        assert_eq!(
+            names.len(),
+            2,
+            "the first backup must survive a second one taken in the same second: {names:?}"
+        );
+    }
+
+    /// `cleanup_old_backups` orders by file name, and this release changes the
+    /// timestamp from seconds to nanoseconds — so both widths can sit in one
+    /// directory. Lexicographic order stays equal to age order here because a
+    /// 10-digit seconds value is compared against the leading 10 digits of the
+    /// 19-digit nanosecond value, which are that same second. This test pins
+    /// that reasoning so a future format change cannot break it silently.
+    #[test]
+    fn cleanup_keeps_the_newest_backups_across_both_timestamp_widths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        write_auth(&path, &json!({ "tokens": {} })).unwrap();
+
+        // Oldest first: a legacy seconds name, then three nanosecond names.
+        for suffix in [
+            "1785000000",
+            "1785000001000000000",
+            "1785000002000000000",
+            "1785000003000000000",
+        ] {
+            std::fs::write(dir.path().join(format!("auth.json.bak.{suffix}")), b"x").unwrap();
+        }
+
+        cleanup_old_backups(&path);
+
+        assert_eq!(
+            backup_names(dir.path()),
+            vec![
+                "auth.json.bak.1785000001000000000",
+                "auth.json.bak.1785000002000000000",
+                "auth.json.bak.1785000003000000000",
+            ],
+            "the legacy seconds backup is the oldest and must be the one dropped"
+        );
     }
 
     #[cfg(unix)]

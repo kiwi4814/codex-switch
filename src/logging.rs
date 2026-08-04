@@ -6,12 +6,24 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tracing_subscriber::fmt::MakeWriter;
 
 const LOG_PREFIX: &str = "codex-switch";
 const MAX_LOG_AGE_DAYS: u64 = 3;
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+
+/// How long retention may go unenforced, and how many bytes may be appended in
+/// the meantime.
+///
+/// `tracing` calls `Write::write` once per record and the retention scan walks
+/// the log directory, so running it per record made every debug-level log line
+/// a directory walk. Retention only has to be approximately timely: whichever
+/// of these two is reached first triggers the next scan, which bounds how far
+/// the directory can drift past [`MAX_LOG_BYTES`] to one byte budget.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const MAINTENANCE_BYTE_BUDGET: u64 = 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct FileLogWriter {
@@ -20,6 +32,10 @@ pub(crate) struct FileLogWriter {
 
 struct LogState {
     dir: PathBuf,
+    /// When retention was last enforced; `None` until the first record.
+    last_maintenance: Option<Instant>,
+    /// Bytes appended since that enforcement.
+    bytes_since_maintenance: u64,
 }
 
 pub(crate) fn file_log_writer() -> Result<FileLogWriter> {
@@ -27,7 +43,11 @@ pub(crate) fn file_log_writer() -> Result<FileLogWriter> {
     create_private_log_dir(&dir)
         .with_context(|| format!("creating log directory {}", dir.display()))?;
     Ok(FileLogWriter {
-        state: Arc::new(Mutex::new(LogState { dir })),
+        state: Arc::new(Mutex::new(LogState {
+            dir,
+            last_maintenance: None,
+            bytes_since_maintenance: 0,
+        })),
     })
 }
 
@@ -74,11 +94,26 @@ impl Write for LogFile {
         } else {
             buf
         };
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| io::Error::other("log writer lock poisoned"))?;
-        append_log(&state.dir, Local::now().date_naive(), retained)?;
+        state.bytes_since_maintenance = state
+            .bytes_since_maintenance
+            .saturating_add(retained.len() as u64);
+        let now = Instant::now();
+        let run_maintenance =
+            maintenance_due(state.last_maintenance, now, state.bytes_since_maintenance);
+        append_log(
+            &state.dir,
+            Local::now().date_naive(),
+            retained,
+            run_maintenance,
+        )?;
+        if run_maintenance {
+            state.last_maintenance = Some(now);
+            state.bytes_since_maintenance = 0;
+        }
         Ok(buf.len())
     }
 
@@ -87,7 +122,19 @@ impl Write for LogFile {
     }
 }
 
-fn append_log(dir: &Path, today: NaiveDate, bytes: &[u8]) -> io::Result<()> {
+/// Whether this record should also pay for a retention scan.
+///
+/// The first record of a process always does — nothing earlier can have done
+/// it — and after that whichever of the byte budget or the interval arrives
+/// first.
+fn maintenance_due(last: Option<Instant>, now: Instant, bytes_since: u64) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    bytes_since >= MAINTENANCE_BYTE_BUDGET || now.duration_since(last) >= MAINTENANCE_INTERVAL
+}
+
+fn append_log(dir: &Path, today: NaiveDate, bytes: &[u8], run_maintenance: bool) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -105,8 +152,9 @@ fn append_log(dir: &Path, today: NaiveDate, bytes: &[u8]) -> io::Result<()> {
     tighten_file_permissions(&lock)?;
     FileExt::lock(&lock)?;
     let result = (|| {
-        prune_log_files(dir, today)?;
-        enforce_log_size_limit(dir, today, bytes.len() as u64)?;
+        if run_maintenance {
+            run_log_maintenance(dir, today, bytes.len() as u64)?;
+        }
         let mut log_options = OpenOptions::new();
         log_options.create(true).append(true);
         #[cfg(unix)]
@@ -123,14 +171,27 @@ fn append_log(dir: &Path, today: NaiveDate, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-fn prune_log_files(dir: &Path, today: NaiveDate) -> io::Result<()> {
+/// Drop log files outside the retention window.
+///
+/// Size enforcement used to be nested at the end of this, which meant a single
+/// append ran three directory scans: this one, the nested one, and the caller's.
+/// The two passes are now siblings under [`run_log_maintenance`], so an append
+/// that does maintenance costs two scans and one that does not costs none.
+fn prune_expired_log_files(dir: &Path, today: NaiveDate) -> io::Result<()> {
     let oldest = today - Days::new(MAX_LOG_AGE_DAYS - 1);
     for (path, date, _) in log_files(dir)? {
         if date < oldest {
             fs::remove_file(path)?;
         }
     }
-    enforce_log_size_limit(dir, today, 0)
+    Ok(())
+}
+
+/// Age retention, then size retention accounting for the record about to be
+/// written.
+fn run_log_maintenance(dir: &Path, today: NaiveDate, incoming: u64) -> io::Result<()> {
+    prune_expired_log_files(dir, today)?;
+    enforce_log_size_limit(dir, today, incoming)
 }
 
 fn enforce_log_size_limit(dir: &Path, today: NaiveDate, incoming: u64) -> io::Result<()> {
@@ -209,7 +270,7 @@ mod tests {
             );
         }
 
-        prune_log_files(dir.path(), today).unwrap();
+        prune_expired_log_files(dir.path(), today).unwrap();
 
         assert!(!log_path(dir.path(), NaiveDate::from_ymd_opt(2026, 7, 8).unwrap()).exists());
         assert!(!log_path(dir.path(), NaiveDate::from_ymd_opt(2026, 7, 9).unwrap()).exists());
@@ -229,7 +290,7 @@ mod tests {
             );
         }
 
-        prune_log_files(dir.path(), today).unwrap();
+        run_log_maintenance(dir.path(), today, 0).unwrap();
 
         assert!(!log_path(dir.path(), NaiveDate::from_ymd_opt(2026, 7, 10).unwrap()).exists());
         assert!(log_path(dir.path(), NaiveDate::from_ymd_opt(2026, 7, 11).unwrap()).exists());
@@ -242,9 +303,66 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
         create_log(dir.path(), today, MAX_LOG_BYTES);
 
-        append_log(dir.path(), today, b"next event").unwrap();
+        append_log(dir.path(), today, b"next event", true).unwrap();
 
         assert!(fs::metadata(log_path(dir.path(), today)).unwrap().len() <= MAX_LOG_BYTES);
+    }
+
+    // ── retention runs on a budget, not on every record ────────
+    //
+    // `tracing` calls `write` once per log record, and the retention scan is
+    // several `read_dir` passes over the log directory. At debug level that
+    // turned every single log line into a directory walk.
+
+    /// The scan has to happen on the first write of a process — there is no
+    /// earlier one to have done it — and then only when a budget is spent.
+    #[test]
+    fn the_first_write_of_a_process_always_runs_maintenance() {
+        assert!(maintenance_due(None, Instant::now(), 0));
+    }
+
+    #[test]
+    fn an_ordinary_record_shortly_after_a_scan_does_not_rescan() {
+        let now = Instant::now();
+        assert!(
+            !maintenance_due(Some(now), now, 64),
+            "a handful of bytes moments after a scan must not trigger another one"
+        );
+    }
+
+    #[test]
+    fn maintenance_runs_again_once_the_byte_budget_is_spent() {
+        let now = Instant::now();
+        assert!(maintenance_due(Some(now), now, MAINTENANCE_BYTE_BUDGET));
+    }
+
+    #[test]
+    fn maintenance_runs_again_once_the_interval_has_passed() {
+        let now = Instant::now();
+        let last = now.checked_sub(MAINTENANCE_INTERVAL).unwrap();
+        assert!(maintenance_due(Some(last), now, 1));
+    }
+
+    /// The wiring, not just the decision: a write that is not due must leave
+    /// out-of-retention files alone, and a due one must still collect them.
+    #[test]
+    fn a_skipped_maintenance_write_does_not_scan_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
+        let expired = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        create_log(dir.path(), expired, 1);
+
+        append_log(dir.path(), today, b"skipped\n", false).unwrap();
+        assert!(
+            log_path(dir.path(), expired).exists(),
+            "a write that is not due for maintenance must not walk the log directory"
+        );
+
+        append_log(dir.path(), today, b"due\n", true).unwrap();
+        assert!(
+            !log_path(dir.path(), expired).exists(),
+            "a write that is due must still apply retention"
+        );
     }
 
     #[cfg(unix)]
@@ -262,7 +380,7 @@ mod tests {
         fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o666)).unwrap();
         fs::set_permissions(&current_log, fs::Permissions::from_mode(0o666)).unwrap();
 
-        append_log(dir.path(), today, b"private event").unwrap();
+        append_log(dir.path(), today, b"private event", true).unwrap();
 
         assert_eq!(
             fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
