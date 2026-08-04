@@ -55,6 +55,13 @@ impl AppConfig {
             );
             self.daemon.token_check_interval_secs = 300;
         }
+        // Not merely a tidy default: at zero, `launch` restores the original
+        // auth.json before Codex has read the staged one, so the session runs
+        // on the wrong account with nothing reporting it.
+        if self.launch.restore_delay_secs == 0 {
+            warnings.push("config.launch.restore_delay_secs=0 is invalid; using 3 instead".into());
+            self.launch.restore_delay_secs = 3;
+        }
         self
     }
 }
@@ -345,5 +352,22 @@ cache_refresh_interval_secs = 0
         assert_eq!(config.daemon.poll_interval_secs, 60);
         assert_eq!(config.daemon.token_check_interval_secs, 300);
         assert_eq!(config.daemon.cache_refresh_interval_secs, 300);
+    }
+
+    /// A zero restore delay makes `launch` put the original auth.json back
+    /// before Codex has read the staged one, so the session silently runs on
+    /// the wrong account. Every sibling interval already gets this treatment.
+    #[test]
+    fn launch_zero_restore_delay_uses_default_and_warns() {
+        let (config, warnings) =
+            super::load_from_str_with_warnings("[launch]\nrestore_delay_secs = 0\n").unwrap();
+
+        assert_eq!(config.launch.restore_delay_secs, 3);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("restore_delay_secs")),
+            "a silently-corrected launch delay is what hands Codex the wrong account: {warnings:?}"
+        );
     }
 }

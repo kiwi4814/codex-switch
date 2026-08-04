@@ -301,6 +301,10 @@ pub async fn check_for_dev_update() -> Result<Option<UpdateInfo>> {
 }
 
 pub async fn self_update(version: Option<&str>, show_progress: bool) -> Result<SelfUpdateResult> {
+    // Before anything reaches the network: the argument becomes part of a
+    // GitHub API path, so it is rejected here rather than encoded and sent.
+    let requested_version = version.map(validate_requested_version).transpose()?;
+
     let install_source = detect_install_source();
     if install_source == InstallSource::Homebrew {
         anyhow::bail!(
@@ -310,11 +314,10 @@ pub async fn self_update(version: Option<&str>, show_progress: bool) -> Result<S
     }
 
     let current_version = current_version().to_string();
-    let release = fetch_release(version).await?;
+    let release = fetch_release(requested_version.as_deref()).await?;
     let latest_version = extract_release_version(&release);
 
-    if let Some(requested) = version {
-        let requested = normalize_version(requested);
+    if let Some(requested) = requested_version {
         if requested != latest_version {
             anyhow::bail!("requested version '{requested}' was not found on GitHub Releases");
         }
@@ -876,9 +879,12 @@ fn release_api_url(version: Option<&str>) -> String {
     let base = github_api_base();
 
     match version {
+        // Encoded for the same reason as `tag_ref_api_url`: the tag is a path
+        // segment, and `url` would otherwise resolve `..` inside it and send
+        // the request to a different repository.
         Some(version) => format!(
             "{base}/repos/{REPO_OWNER}/{REPO_NAME}/releases/tags/{}",
-            release_tag(version)
+            urlencoding::encode(&release_tag(version))
         ),
         None => format!("{base}/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest"),
     }
@@ -908,6 +914,26 @@ fn github_api_base() -> String {
 
 fn normalize_version(version: &str) -> String {
     version.trim().trim_start_matches('v').to_string()
+}
+
+/// Normalize a `--version` argument, rejecting anything that is not a plain
+/// semantic version.
+///
+/// The value reaches `release_api_url` as a path segment. `url` resolves `..`
+/// segments per the WHATWG spec, so an unencoded traversal would walk the
+/// request onto another repository's release metadata. `release_api_url` now
+/// percent-encodes, which contains the value; this rejects it outright so the
+/// safety of that path never rests on a downstream string comparison, and so a
+/// typo is reported as a bad argument rather than as a 404.
+fn validate_requested_version(version: &str) -> Result<String> {
+    let normalized = normalize_version(version);
+    Version::parse(&normalized).map_err(|err| {
+        anyhow::anyhow!(
+            "invalid --version '{version}': expected a semantic version such as 20260731.1.0 ({err}). \
+             Use --dev for the rolling development build."
+        )
+    })?;
+    Ok(normalized)
 }
 
 fn update_ttl_secs() -> i64 {
@@ -1093,6 +1119,48 @@ mod tests {
             release_api_url(Some("0.1.0")),
             "https://api.github.com/repos/xjoker/codex-switch/releases/tags/v0.1.0"
         );
+    }
+
+    /// `--version` is interpolated into a GitHub API path. `url` resolves `..`
+    /// segments per the WHATWG spec, so an unencoded value can walk the request
+    /// out of this repository and onto another one's release metadata. Sibling
+    /// `tag_ref_api_url` already encodes; this closes the inconsistency rather
+    /// than leaving the safety of the path to a downstream string comparison.
+    #[test]
+    fn release_api_url_percent_encodes_the_requested_version() {
+        let url = release_api_url(Some("0.1.0/../../../../../attacker/evil/releases/latest"));
+
+        assert!(
+            !url.contains("/../"),
+            "path traversal survived encoding: {url}"
+        );
+        assert!(
+            url.starts_with("https://api.github.com/repos/xjoker/codex-switch/releases/tags/"),
+            "the request must stay inside this repository: {url}"
+        );
+    }
+
+    /// The encoding above keeps a hostile value inside its path segment; this
+    /// rejects it outright, before any request is built, so the error names the
+    /// bad input instead of surfacing as a confusing 404.
+    #[test]
+    fn a_requested_version_that_is_not_semver_is_rejected_before_any_request() {
+        assert_eq!(
+            validate_requested_version("20260731.1.0").unwrap(),
+            "20260731.1.0"
+        );
+        assert_eq!(
+            validate_requested_version("v20260731.1.0").unwrap(),
+            "20260731.1.0"
+        );
+
+        let err = validate_requested_version("0.1.0/../../../../../attacker/evil/releases/latest")
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid --version"), "{err}");
+
+        // The dev channel is reached with `--dev`, not by naming a tag: this
+        // has never resolved, and now says so instead of 404-ing.
+        assert!(validate_requested_version("dev").is_err());
     }
 
     #[test]
