@@ -269,8 +269,7 @@ async fn run_scheduled_warmups(
     for alias in profiles {
         let current = current.clone();
         let sem = semaphore.clone();
-        let weekly_allowed =
-            weekly_auto_warmup && !schedule.weekly_recently_warmed(&alias, now);
+        let weekly_allowed = weekly_auto_warmup && !schedule.weekly_recently_warmed(&alias, now);
         tasks.spawn(async move {
             let Ok(_permit) = sem.acquire_owned().await else {
                 return (

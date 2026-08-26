@@ -123,11 +123,15 @@ For a workday-oriented schedule, for example:
 poll_interval_secs = 60
 auto_warmup = false
 weekly_auto_warmup = true
-five_hour_warmup_times = ["06:00", "23:30"]
+five_hour_warmup_times = [
+    "05:00",
+    "10:10",
+    "15:20",
+]
 ```
 
 This checks for a fresh/reset weekly window once per minute while leaving the 5-hour
-window alone except at 06:00 and 23:30 in the host system's local timezone. A single
+window alone except at 05:00, 10:10, and 15:20 in the host system's local timezone. A single
 minimal warmup request can start both upstream windows; the two settings only control
 when the daemon decides a warmup is needed.
 

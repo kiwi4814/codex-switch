@@ -87,8 +87,7 @@ fn valid_schedule_time(value: &str) -> bool {
     if hour.len() != 2 || minute.len() != 2 || minute.contains(':') {
         return false;
     }
-    matches!(hour.parse::<u8>(), Ok(0..=23))
-        && matches!(minute.parse::<u8>(), Ok(0..=59))
+    matches!(hour.parse::<u8>(), Ok(0..=23)) && matches!(minute.parse::<u8>(), Ok(0..=59))
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -190,7 +189,11 @@ impl Default for DaemonConfig {
             cache_refresh_interval_secs: 300,
             auto_warmup: false,
             weekly_auto_warmup: true,
-            five_hour_warmup_times: vec!["06:00".to_string(), "23:30".to_string()],
+            five_hour_warmup_times: vec![
+                "05:00".to_string(),
+                "10:10".to_string(),
+                "15:20".to_string(),
+            ],
             token_check_interval_secs: 300,
             notify: false,
             log_level: "error".to_string(),
@@ -403,18 +406,32 @@ cache_refresh_interval_secs = 0
     }
 
     #[test]
+    fn scheduled_warmup_defaults_to_expected_times() {
+        let config = load_from_str("").unwrap();
+        assert_eq!(
+            config.daemon.five_hour_warmup_times,
+            vec![
+                "05:00".to_string(),
+                "10:10".to_string(),
+                "15:20".to_string(),
+            ]
+        );
+        assert!(config.daemon.weekly_auto_warmup);
+    }
+
+    #[test]
     fn scheduled_warmup_times_are_trimmed_deduplicated_and_validated() {
         let (config, warnings) = super::load_from_str_with_warnings(
             r#"
 [daemon]
-five_hour_warmup_times = [" 06:00 ", "23:30", "06:00", "24:00", "bad"]
+five_hour_warmup_times = [" 05:00 ", "10:10", "05:00", "24:00", "bad"]
 "#,
         )
         .unwrap();
 
         assert_eq!(
             config.daemon.five_hour_warmup_times,
-            vec!["06:00".to_string(), "23:30".to_string()]
+            vec!["05:00".to_string(), "10:10".to_string()]
         );
         assert_eq!(warnings.len(), 2);
     }
