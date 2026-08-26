@@ -96,18 +96,29 @@ cli_auth_credentials_store = "file"
 
 ### Configure
 
+Create the two host directories first. Compose is configured with
+`create_host_path: false`, so a missing directory is reported as an error instead
+of being silently created as an empty root-owned one:
+
 ```bash
-cp .env.example .env
+mkdir -p "$HOME/.codex" "$HOME/.codex-switch"
+chmod 700 "$HOME/.codex" "$HOME/.codex-switch"
 ```
 
-Fill in the four values — `id -u` for `PUID`, `id -g` for `PGID`, `echo "$HOME"` for `HOST_HOME`:
+Generate `.env` rather than editing UID/GID by hand:
 
-```env
-PUID=1000
-PGID=1000
-HOST_HOME=/home/ubuntu
+```bash
+cat > .env <<EOF
+PUID=$(id -u)
+PGID=$(id -g)
+HOST_HOME=$HOME
 TZ=Asia/Shanghai
+EOF
 ```
+
+`PUID`, `PGID`, and `HOST_HOME` are required and have no defaults — Compose
+aborts if any is missing or empty, so a half-filled `.env` cannot start a
+container against the wrong path or as root.
 
 Then validate and build:
 
@@ -130,6 +141,21 @@ docker compose run --rm codex-switch use account-2
 ```
 
 `--device` is the device-code flow, which is what a headless container needs. Because `~/.codex` is bind-mounted, `use account-2` rewrites the host's `~/.codex/auth.json` — the next `codex` you start on the host uses that account.
+
+What the container is *not* for:
+
+| Command | Why not |
+| --- | --- |
+| `launch` | Starts Codex CLI, which by design is installed on the host, not in this image. Switch with `use`, then run `codex` on the host. |
+| `self-update` | Replaces a directly-installed binary. Upgrade the image instead: `git pull --ff-only && docker compose build --pull && docker compose up -d`. |
+| `daemon install` | Compose owns the lifecycle (`restart: unless-stopped`). |
+| desktop notifications (`notify = true`) | No notification daemon or session bus in the container. Leave `notify = false` and read `docker compose logs`. |
+
+If you set `[proxy] url`, the address must be reachable **from the container's
+network namespace**. `127.0.0.1` inside the container is the container itself, so
+a host-only proxy on `127.0.0.1:7890` will not resolve; use the host's LAN
+address (and allow LAN connections in the proxy). Do not add `network_mode: host`
+for this.
 
 ### Run the daemon
 
@@ -174,9 +200,31 @@ defer_switch_while_codex_running = true
 
 The trade-off: the container can see the host's full process list, including other users' command lines. That is the only host integration this deployment uses — there is no `privileged: true`, no Docker socket mount, no host networking, and no published port (`codex-switch` serves no network traffic).
 
+Verify it on your own host rather than assuming it works. Counting entries in
+`/proc` proves nothing; the daemon needs to *read the command line* of a host
+Codex process. Start an interactive Codex on the host and leave it open:
+
+```bash
+codex
+```
+
+In another shell, find its PID and read that exact process from inside the
+container:
+
+```bash
+pgrep -af codex
+PID=<the codex pid>
+docker compose exec codex-switch sh -c "tr '\0' ' ' < /proc/$PID/cmdline; echo"
+```
+
+It must print the Codex command line. `No such file or directory` means the host
+PID namespace is not in effect; `Permission denied` points at rootless Docker or
+a `hidepid` mount option on `/proc`, and the container UID must match the user
+that owns the Codex process.
+
 ### Permissions
 
-`user: "${PUID}:${PGID}"` makes the container process run as your host user, so `auth.json`, `config.toml`, and `profiles/*` created inside the container stay owned by that user. Leaving `PUID`/`PGID` empty would run as root and leave root-owned files in your home directory.
+`user: "${PUID}:${PGID}"` makes the container process run as your host user, so `auth.json`, `config.toml`, and `profiles/*` created inside the container stay owned by that user. Both variables are mandatory — Compose refuses to start rather than falling back to root and leaving root-owned files in your home directory. The bind mounts likewise use `create_host_path: false`, so Docker never creates `~/.codex` or `~/.codex-switch` for you; create them yourself with the commands above.
 
 ### Upgrade and backup
 

@@ -96,18 +96,25 @@ cli_auth_credentials_store = "file"
 
 ### 配置
 
+先手动创建两个宿主目录。Compose 使用了 `create_host_path: false`，宿主目录不存在时会直接报错，而不是被 Docker 悄悄创建成一个 root 所有的空目录：
+
 ```bash
-cp .env.example .env
+mkdir -p "$HOME/.codex" "$HOME/.codex-switch"
+chmod 700 "$HOME/.codex" "$HOME/.codex-switch"
 ```
 
-填入四个值 — `id -u` 得到 `PUID`，`id -g` 得到 `PGID`，`echo "$HOME"` 得到 `HOST_HOME`：
+`.env` 用命令生成，不要手填 UID/GID：
 
-```env
-PUID=1000
-PGID=1000
-HOST_HOME=/home/ubuntu
+```bash
+cat > .env <<EOF
+PUID=$(id -u)
+PGID=$(id -g)
+HOST_HOME=$HOME
 TZ=Asia/Shanghai
+EOF
 ```
+
+`PUID`、`PGID`、`HOST_HOME` 都是必填且没有默认值 — 缺失或为空时 Compose 直接失败，所以填了一半的 `.env` 不会把容器起到错误的路径上，也不会以 root 运行。
 
 校验并构建：
 
@@ -130,6 +137,17 @@ docker compose run --rm codex-switch use account-2
 ```
 
 `--device` 是设备码登录流程，无浏览器的容器必须用它。因为 `~/.codex` 是 bind mount，`use account-2` 改写的就是宿主机的 `~/.codex/auth.json`，宿主机下一次 `codex` 即使用该账号。
+
+容器**不适合**做这些事：
+
+| 命令 | 原因 |
+| --- | --- |
+| `launch` | 它要启动 Codex CLI，而 Codex CLI 按设计装在宿主机、不在这个镜像里。请先 `use` 切号，再在宿主机执行 `codex`。 |
+| `self-update` | 它替换的是直装的二进制。Docker 模式请重建镜像：`git pull --ff-only && docker compose build --pull && docker compose up -d`。 |
+| `daemon install` | 生命周期由 Compose 的 `restart: unless-stopped` 负责。 |
+| 桌面通知（`notify = true`） | 容器内没有通知守护进程和 session bus。保持 `notify = false`，看 `docker compose logs`。 |
+
+如果配置了 `[proxy] url`，该地址必须**从容器网络可达**。容器里的 `127.0.0.1` 指的是容器自己，所以只监听宿主 `127.0.0.1:7890` 的代理在容器内访问不到；请填宿主机的局域网地址（并在代理侧放开 LAN 访问）。不要为此添加 `network_mode: host`。
 
 ### 启动常驻 daemon
 
@@ -174,9 +192,25 @@ defer_switch_while_codex_running = true
 
 代价：容器能看到宿主机完整进程列表，包括其他用户的命令行。这是本方案唯一使用的宿主机集成 — 没有 `privileged: true`、没有挂载 Docker socket、没有 host networking、也不发布任何端口（`codex-switch` 不提供网络服务）。
 
+请在自己的宿主机上实测，不要假设它生效。数 `/proc` 下的条目数量证明不了任何事，daemon 需要的是**读到宿主 Codex 进程的命令行**。先在宿主机启动一个交互式 Codex 并保持会话：
+
+```bash
+codex
+```
+
+另开一个 shell，拿到它的 PID，然后从容器内读这个具体进程：
+
+```bash
+pgrep -af codex
+PID=<codex 的 pid>
+docker compose exec codex-switch sh -c "tr '\0' ' ' < /proc/$PID/cmdline; echo"
+```
+
+必须打印出 Codex 的命令行。出现 `No such file or directory` 说明宿主 PID namespace 没生效；出现 `Permission denied` 则要查 rootless Docker 或 `/proc` 的 `hidepid` 挂载选项，同时容器 UID 必须与拥有该 Codex 进程的用户一致。
+
 ### 权限
 
-`user: "${PUID}:${PGID}"` 让容器进程以宿主普通用户身份运行，容器内生成的 `auth.json`、`config.toml`、`profiles/*` 仍归该用户所有。`PUID`/`PGID` 留空会以 root 运行，在家目录留下 root 所有的文件。
+`user: "${PUID}:${PGID}"` 让容器进程以宿主普通用户身份运行，容器内生成的 `auth.json`、`config.toml`、`profiles/*` 仍归该用户所有。这两个变量是强制的 — 缺失时 Compose 拒绝启动，而不是退回 root 在家目录留下 root 所有的文件。两个 bind mount 同样使用 `create_host_path: false`，Docker 不会替你创建 `~/.codex` 和 `~/.codex-switch`，请用上面的命令自行创建。
 
 ### 升级与备份
 

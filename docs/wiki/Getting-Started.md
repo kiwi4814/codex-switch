@@ -50,14 +50,25 @@ Homebrew distributes stable releases only and keeps ownership of its binary; upd
 Codex CLI stays on the host; only the daemon is containerized, and the two share the host's `~/.codex` and `~/.codex-switch` through bind mounts.
 
 ```bash
-cp .env.example .env      # PUID=$(id -u), PGID=$(id -g), HOST_HOME=$HOME, TZ=Asia/Shanghai
+mkdir -p "$HOME/.codex" "$HOME/.codex-switch"
+chmod 700 "$HOME/.codex" "$HOME/.codex-switch"
+
+cat > .env <<EOF
+PUID=$(id -u)
+PGID=$(id -g)
+HOST_HOME=$HOME
+TZ=Asia/Shanghai
+EOF
+
 docker compose config -q
 docker compose build
 docker compose run --rm codex-switch login --device account-1
 docker compose up -d
 ```
 
-Prefix any one-off command with `docker compose run --rm` (add `-it` for `tui`). Compose owns the daemon lifecycle, so `codex-switch daemon install` is not used in this mode. Full walkthrough, including the `pid: host` requirement for `defer_switch_while_codex_running`, is in the [README](https://github.com/kiwi4814/codex-switch#docker-compose-deployment-single-host-ubuntu).
+`PUID`, `PGID`, and `HOST_HOME` are required; Compose fails rather than guessing, and it never creates the two host directories for you (`create_host_path: false`).
+
+Prefix any one-off command with `docker compose run --rm` (add `-it` for `tui`). Compose owns the daemon lifecycle, so `codex-switch daemon install` is not used in this mode. `launch` and `self-update` are host-side commands and are not meant to run in the container. Full walkthrough, including the `pid: host` requirement for `defer_switch_while_codex_running`, is in the [README](https://github.com/kiwi4814/codex-switch#docker-compose-deployment-single-host-ubuntu).
 
 Verify the installation:
 

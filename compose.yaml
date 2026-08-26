@@ -6,7 +6,7 @@ services:
     image: codex-switch:local
     # Runs as the host user so auth.json, config.toml and profiles/* stay owned
     # by that user instead of root.
-    user: "${PUID}:${PGID}"
+    user: "${PUID:?PUID must be set (see .env.example)}:${PGID:?PGID must be set (see .env.example)}"
     # Host PID namespace: the daemon detects interactive Codex sessions by
     # scanning the process table (src/daemon/codex_process.rs). Codex CLI runs
     # on the host, so without this the daemon sees no sessions and
@@ -15,11 +15,23 @@ services:
     environment:
       # five_hour_warmup_times is compared against local wall-clock time, so the
       # container timezone has to be set explicitly.
-      TZ: "${TZ:-UTC}"
+      TZ: "${TZ:?TZ must be set (see .env.example)}"
     volumes:
       # Bind mounts, not named volumes: the host Codex CLI and the container
       # must read and write the same auth.json / profiles.
-      - "${HOST_HOME}/.codex:/data/codex"
-      - "${HOST_HOME}/.codex-switch:/data/codex-switch"
+      #
+      # create_host_path: false — a missing host directory is a configuration
+      # error (wrong HOST_HOME). Letting Docker create it would produce an empty
+      # root-owned directory that the non-root container cannot write to.
+      - type: bind
+        source: "${HOST_HOME:?HOST_HOME must be set (see .env.example)}/.codex"
+        target: /data/codex
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${HOST_HOME:?HOST_HOME must be set (see .env.example)}/.codex-switch"
+        target: /data/codex-switch
+        bind:
+          create_host_path: false
     restart: unless-stopped
     # No ports: codex-switch exposes no network service.
