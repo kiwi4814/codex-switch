@@ -55,6 +55,20 @@ impl AppConfig {
             );
             self.daemon.token_check_interval_secs = 300;
         }
+        let mut normalized_times = Vec::new();
+        for value in std::mem::take(&mut self.daemon.five_hour_warmup_times) {
+            let value = value.trim();
+            if valid_schedule_time(value) {
+                if !normalized_times.iter().any(|existing| existing == value) {
+                    normalized_times.push(value.to_string());
+                }
+            } else {
+                warnings.push(format!(
+                    "config.daemon.five_hour_warmup_times contains invalid time '{value}'; expected HH:MM"
+                ));
+            }
+        }
+        self.daemon.five_hour_warmup_times = normalized_times;
         // Not merely a tidy default: at zero, `launch` restores the original
         // auth.json before Codex has read the staged one, so the session runs
         // on the wrong account with nothing reporting it.
@@ -64,6 +78,17 @@ impl AppConfig {
         }
         self
     }
+}
+
+fn valid_schedule_time(value: &str) -> bool {
+    let Some((hour, minute)) = value.split_once(':') else {
+        return false;
+    };
+    if hour.len() != 2 || minute.len() != 2 || minute.contains(':') {
+        return false;
+    }
+    matches!(hour.parse::<u8>(), Ok(0..=23))
+        && matches!(minute.parse::<u8>(), Ok(0..=59))
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -143,6 +168,10 @@ pub struct DaemonConfig {
     pub cache_refresh_interval_secs: u64,
     /// Warm up accounts whose quota window is not active during cache refresh (default: false)
     pub auto_warmup: bool,
+    /// Check weekly windows on each daemon poll and warm them when a fresh/reset window is idle.
+    pub weekly_auto_warmup: bool,
+    /// Local HH:MM times when the daemon should try to start the 5h window.
+    pub five_hour_warmup_times: Vec<String>,
     /// Token expiry check interval in seconds (default: 300)
     pub token_check_interval_secs: u64,
     /// Send desktop notification on switch (default: false)
@@ -160,6 +189,8 @@ impl Default for DaemonConfig {
             switch_threshold: 80.0,
             cache_refresh_interval_secs: 300,
             auto_warmup: false,
+            weekly_auto_warmup: true,
+            five_hour_warmup_times: vec!["06:00".to_string(), "23:30".to_string()],
             token_check_interval_secs: 300,
             notify: false,
             log_level: "error".to_string(),
@@ -369,5 +400,22 @@ cache_refresh_interval_secs = 0
                 .any(|warning| warning.contains("restore_delay_secs")),
             "a silently-corrected launch delay is what hands Codex the wrong account: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn scheduled_warmup_times_are_trimmed_deduplicated_and_validated() {
+        let (config, warnings) = super::load_from_str_with_warnings(
+            r#"
+[daemon]
+five_hour_warmup_times = [" 06:00 ", "23:30", "06:00", "24:00", "bad"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.daemon.five_hour_warmup_times,
+            vec!["06:00".to_string(), "23:30".to_string()]
+        );
+        assert_eq!(warnings.len(), 2);
     }
 }

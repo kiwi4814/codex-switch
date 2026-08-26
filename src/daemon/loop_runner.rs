@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 
 use super::state::{self, DaemonState, PendingSwitch, SwitchRecord};
 use crate::signals::ShutdownListener;
@@ -49,6 +50,48 @@ fn current_usage_percent_for_switch(current_usage: &usage::UsageInfo) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn window_needs_start(window: Option<&usage::WindowUsage>, now: i64) -> bool {
+    let Some(window) = window else {
+        return false;
+    };
+    match window.resets_at {
+        Some(reset_at) if reset_at <= now => true,
+        Some(_) => window.used_percent.unwrap_or(0.0) <= 0.0,
+        None => false,
+    }
+}
+
+#[derive(Default)]
+struct WarmupScheduleState {
+    last_five_hour_slot: Option<String>,
+    weekly_warmed_at: HashMap<String, i64>,
+}
+
+impl WarmupScheduleState {
+    fn five_hour_due(&mut self, times: &[String]) -> bool {
+        if times.is_empty() {
+            return false;
+        }
+        let local_now = chrono::Local::now();
+        let hhmm = local_now.format("%H:%M").to_string();
+        if !times.iter().any(|time| time == &hhmm) {
+            return false;
+        }
+        let slot = local_now.format("%Y-%m-%d %H:%M").to_string();
+        if self.last_five_hour_slot.as_deref() == Some(slot.as_str()) {
+            return false;
+        }
+        self.last_five_hour_slot = Some(slot);
+        true
+    }
+
+    fn weekly_recently_warmed(&self, alias: &str, now: i64) -> bool {
+        self.weekly_warmed_at
+            .get(alias)
+            .is_some_and(|at| now.saturating_sub(*at) < usage::MIN_WARMUP_ELAPSED_SECS)
+    }
+}
+
 /// Main daemon event loop: periodically checks usage and switches account when needed.
 pub async fn run_daemon_loop() -> Result<()> {
     // Registered before anything else can block: from here on every signal is
@@ -60,6 +103,8 @@ pub async fn run_daemon_loop() -> Result<()> {
     let token_secs = cfg.daemon.token_check_interval_secs;
     let cache_refresh_secs = cfg.daemon.cache_refresh_interval_secs;
     let auto_warmup = cfg.daemon.auto_warmup;
+    let weekly_auto_warmup = cfg.daemon.weekly_auto_warmup;
+    let five_hour_warmup_times = cfg.daemon.five_hour_warmup_times.clone();
 
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
     poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -77,14 +122,17 @@ pub async fn run_daemon_loop() -> Result<()> {
         started_at: auth::now_unix_secs(),
         ..DaemonState::default()
     };
+    let mut warmup_schedule = WarmupScheduleState::default();
     state::write(&mut st);
 
     tracing::info!(
-        "Daemon loop started: poll={}s, token_check={}s, cache_refresh={}s, auto_warmup={}, threshold={}%",
+        "Daemon loop started: poll={}s, token_check={}s, cache_refresh={}s, auto_warmup={}, weekly_auto_warmup={}, five_hour_warmup_times={:?}, threshold={}%",
         poll_secs,
         token_secs,
         cache_refresh_secs,
         auto_warmup,
+        weekly_auto_warmup,
+        five_hour_warmup_times,
         cfg.daemon.switch_threshold,
     );
 
@@ -94,6 +142,24 @@ pub async fn run_daemon_loop() -> Result<()> {
                 // Failure backoff suspends polling only; token and cache
                 // timers keep running.
                 let now = auth::now_unix_secs();
+                let five_hour_due = warmup_schedule.five_hour_due(&five_hour_warmup_times);
+                if weekly_auto_warmup || five_hour_due {
+                    match run_scheduled_warmups(
+                        weekly_auto_warmup,
+                        five_hour_due,
+                        &mut warmup_schedule,
+                    )
+                    .await
+                    {
+                        Ok(summary) => tracing::debug!(
+                            "Scheduled warmup check completed: refreshed={}, warmed={}, failed={}",
+                            summary.refreshed,
+                            summary.warmed,
+                            summary.failed
+                        ),
+                        Err(e) => tracing::warn!("Scheduled warmup check skipped: {e}"),
+                    }
+                }
                 if let Some(until) = st.backoff_until {
                     if now < until {
                         tracing::debug!("Poll suspended by backoff for {}s more", until - now);
@@ -181,6 +247,110 @@ pub async fn run_daemon_loop() -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn run_scheduled_warmups(
+    weekly_auto_warmup: bool,
+    five_hour_due: bool,
+    schedule: &mut WarmupScheduleState,
+) -> Result<CacheRefreshSummary> {
+    let profiles = profile::list_profiles()?;
+    if profiles.is_empty() {
+        return Ok(CacheRefreshSummary::default());
+    }
+
+    let current = profile::read_current();
+    let now = auth::now_unix_secs();
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        config::get().network.max_concurrent,
+    ));
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for alias in profiles {
+        let current = current.clone();
+        let sem = semaphore.clone();
+        let weekly_allowed =
+            weekly_auto_warmup && !schedule.weekly_recently_warmed(&alias, now);
+        tasks.spawn(async move {
+            let Ok(_permit) = sem.acquire_owned().await else {
+                return (
+                    alias,
+                    false,
+                    false,
+                    false,
+                    Some("usage limiter closed".to_string()),
+                );
+            };
+            let path = match profile::profile_auth_path(&alias) {
+                Ok(path) => path,
+                Err(e) => return (alias, false, false, false, Some(e.to_string())),
+            };
+
+            let account_usage =
+                match usage::fetch_usage_retried_unattended(&alias, &path, &current).await {
+                    Ok(usage) => usage,
+                    Err(e) => return (alias, false, false, false, Some(e.summary)),
+                };
+
+            if account_usage.account_limited {
+                return (alias, true, false, false, None);
+            }
+
+            let weekly_due =
+                weekly_allowed && window_needs_start(account_usage.secondary.as_ref(), now);
+            let five_hour_account_due =
+                five_hour_due && window_needs_start(account_usage.primary.as_ref(), now);
+
+            if !weekly_due && !five_hour_account_due {
+                return (alias, true, false, false, None);
+            }
+
+            if let Err(e) = warmup::warmup_account(&alias, &path).await {
+                return (
+                    alias,
+                    true,
+                    false,
+                    false,
+                    Some(format!("scheduled warmup failed: {e}")),
+                );
+            }
+
+            if let Err(e) = usage::fetch_usage_retried_unattended(&alias, &path, &current).await {
+                tracing::warn!(
+                    "[{alias}] post-scheduled-warmup cache refresh failed: {}",
+                    e.summary
+                );
+            }
+            (alias, true, true, weekly_due, None)
+        });
+    }
+
+    let mut summary = CacheRefreshSummary::default();
+    while let Some(res) = tasks.join_next().await {
+        let (alias, refreshed, warmed, weekly_warmed, err) = match res {
+            Ok(value) => value,
+            Err(e) => {
+                summary.failed += 1;
+                tracing::warn!("Scheduled warmup worker failed: {e}");
+                continue;
+            }
+        };
+        if refreshed {
+            summary.refreshed += 1;
+        }
+        if warmed {
+            summary.warmed += 1;
+        }
+        if weekly_warmed {
+            schedule.weekly_warmed_at.insert(alias.clone(), now);
+        }
+        if let Some(err) = err {
+            summary.failed += 1;
+            tracing::warn!("[{alias}] scheduled warmup check failed: {err}");
+        }
+    }
+
+    Ok(summary)
 }
 
 /// Check current account usage and switch to a better candidate if threshold exceeded.
@@ -330,7 +500,7 @@ async fn check_and_switch() -> Result<PollOutcome> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_usage_percent_for_switch, poll_backoff_secs};
+    use super::{current_usage_percent_for_switch, poll_backoff_secs, window_needs_start};
     use crate::usage::{UsageInfo, WindowUsage};
     use std::sync::{
         Arc,
@@ -357,6 +527,31 @@ mod tests {
         };
 
         assert!(current_usage_percent_for_switch(&usage) >= 80.0);
+    }
+
+    #[test]
+    fn scheduled_warmup_only_starts_idle_or_expired_windows() {
+        let now = 1_000_000;
+        let idle = WindowUsage {
+            used_percent: Some(0.0),
+            resets_at: Some(now + 3600),
+            ..WindowUsage::default()
+        };
+        let active = WindowUsage {
+            used_percent: Some(1.0),
+            resets_at: Some(now + 3600),
+            ..WindowUsage::default()
+        };
+        let expired = WindowUsage {
+            used_percent: Some(100.0),
+            resets_at: Some(now - 1),
+            ..WindowUsage::default()
+        };
+
+        assert!(window_needs_start(Some(&idle), now));
+        assert!(!window_needs_start(Some(&active), now));
+        assert!(window_needs_start(Some(&expired), now));
+        assert!(!window_needs_start(None, now));
     }
 
     #[tokio::test]

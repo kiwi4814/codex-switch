@@ -67,6 +67,8 @@ poll_interval_secs = 60            # usage poll; 0 is normalized to 60
 switch_threshold = 80              # 5h usage % that triggers an auto-switch
 cache_refresh_interval_secs = 300  # all-profile cache refresh; 0 is normalized to 300
 auto_warmup = false                # warm inactive quota windows during cache refresh
+weekly_auto_warmup = true          # check 7d windows on each daemon poll and warm fresh/reset windows
+five_hour_warmup_times = ["06:00", "23:30"]  # local HH:MM times for scheduled 5h warmup
 token_check_interval_secs = 300    # proactive token refresh; 0 is normalized to 300
 notify = false                     # desktop notification on switch
 log_level = "error"                # daemon log level; empty is normalized to "error"
@@ -75,6 +77,14 @@ defer_switch_while_codex_running = true  # hold a pending switch during interact
 [launch]
 restore_delay_secs = 3             # seconds before restoring auth.json after launch
 ```
+
+`weekly_auto_warmup` uses the existing daemon poll interval, so the default
+`poll_interval_secs = 60` checks weekly windows once per minute. After a successful
+weekly warmup, the daemon waits five minutes before it can retry that same account.
+
+`five_hour_warmup_times` uses the host system's local timezone and only evaluates
+the listed minute(s). Keep `auto_warmup = false` if you want 5-hour windows to be
+started only by these fixed times rather than by the general cache-refresh warmup.
 
 `launch.restore_delay_secs` is a compatibility delay, not a handshake; increase it only if the local Codex process reads authentication later than three seconds after launch.
 

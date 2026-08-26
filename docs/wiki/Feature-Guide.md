@@ -114,7 +114,22 @@ codex-switch daemon status
 
 Service integration is platform-native: LaunchAgent on macOS, a systemd user service on Linux, and Task Scheduler on Windows. Windows installation requires elevated PowerShell.
 
-The daemon runs three independent timers: account polling (`poll_interval_secs`), full cache refresh with optional warmup (`cache_refresh_interval_secs`, `auto_warmup`), and proactive token refresh (`token_check_interval_secs`). A switch happens only when at least two profiles exist and the current profile's 5-hour usage reaches `switch_threshold`.
+The daemon runs three independent timers: account polling (`poll_interval_secs`), full cache refresh with optional warmup (`cache_refresh_interval_secs`, `auto_warmup`), and proactive token refresh (`token_check_interval_secs`). The polling timer can also check weekly windows (`weekly_auto_warmup`) and run fixed local-time 5-hour warmups (`five_hour_warmup_times`). A switch happens only when at least two profiles exist and the current profile's 5-hour usage reaches `switch_threshold`.
+
+For a workday-oriented schedule, for example:
+
+```toml
+[daemon]
+poll_interval_secs = 60
+auto_warmup = false
+weekly_auto_warmup = true
+five_hour_warmup_times = ["06:00", "23:30"]
+```
+
+This checks for a fresh/reset weekly window once per minute while leaving the 5-hour
+window alone except at 06:00 and 23:30 in the host system's local timezone. A single
+minimal warmup request can start both upstream windows; the two settings only control
+when the daemon decides a warmup is needed.
 
 By default, a switch is deferred while an interactive Codex process (`codex`, `codex resume`, `codex exec`) is running; the daemon records the pending switch and retries on the next poll. Long-lived MCP or app-server processes do not block a switch. Operational state lives in `daemon-state.json` and is shown by `daemon status`. Daemon switches cannot ask for confirmation: an untracked live `auth.json` is replaced after the normal backup rotation, so save or import an account first if you want to keep it selectable.
 

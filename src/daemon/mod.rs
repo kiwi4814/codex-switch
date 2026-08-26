@@ -362,6 +362,8 @@ fn status(json: bool) -> Result<()> {
                 "poll_interval_secs": cfg.daemon.poll_interval_secs,
                 "cache_refresh_interval_secs": cfg.daemon.cache_refresh_interval_secs,
                 "auto_warmup": cfg.daemon.auto_warmup,
+                "weekly_auto_warmup": cfg.daemon.weekly_auto_warmup,
+                "five_hour_warmup_times": cfg.daemon.five_hour_warmup_times,
                 "token_check_interval_secs": cfg.daemon.token_check_interval_secs,
                 "switch_threshold": cfg.daemon.switch_threshold,
                 "notify": cfg.daemon.notify,
