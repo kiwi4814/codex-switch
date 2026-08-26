@@ -43,6 +43,22 @@ Homebrew distributes stable releases only and keeps ownership of its binary; upd
 
 > **Note:** this project is not distributed on crates.io. Do not `cargo install codex-switch` — that package name belongs to an unrelated project of the same name.
 
+> The installers and Homebrew ship upstream `xjoker/codex-switch`. They do **not** include this fork's scheduled 5h warmup. For that, use the Docker Compose deployment below or build from source.
+
+**Docker Compose (single-host Ubuntu, this fork):**
+
+Codex CLI stays on the host; only the daemon is containerized, and the two share the host's `~/.codex` and `~/.codex-switch` through bind mounts.
+
+```bash
+cp .env.example .env      # PUID=$(id -u), PGID=$(id -g), HOST_HOME=$HOME, TZ=Asia/Shanghai
+docker compose config -q
+docker compose build
+docker compose run --rm codex-switch login --device account-1
+docker compose up -d
+```
+
+Prefix any one-off command with `docker compose run --rm` (add `-it` for `tui`). Compose owns the daemon lifecycle, so `codex-switch daemon install` is not used in this mode. Full walkthrough, including the `pid: host` requirement for `defer_switch_while_codex_running`, is in the [README](https://github.com/kiwi4814/codex-switch#docker-compose-deployment-single-host-ubuntu).
+
 Verify the installation:
 
 ```bash
@@ -83,6 +99,8 @@ codex-switch launch      # select, start Codex, restore auth afterwards
 ## Where your data lives
 
 Saved profiles, cache, configuration, and daemon state default to `~/.codex-switch` (`%USERPROFILE%\.codex-switch` on Windows). The live Codex file stays at `$CODEX_HOME/auth.json`. See [Configuration](Configuration) for every path and setting.
+
+Under Docker Compose these two directories are bind-mounted into the container as `/data/codex-switch` and `/data/codex` (`CODEX_SWITCH_HOME` and `CODEX_HOME`), so the container and the host Codex CLI read and write the same files. `docker compose down` does not remove them.
 
 Never share profile files, `auth.json`, tokens, proxy credentials, or unredacted `--debug` output.
 

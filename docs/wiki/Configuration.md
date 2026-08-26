@@ -86,6 +86,10 @@ weekly warmup, the daemon waits five minutes before it can retry that same accou
 the listed minute(s). Keep `auto_warmup = false` if you want 5-hour windows to be
 started only by these fixed times rather than by the general cache-refresh warmup.
 
+Under Docker Compose the relevant local timezone is the **container's**, set through
+`TZ` in `.env`. Without it the container runs in UTC and these times fire at the wrong
+wall-clock moment.
+
 `launch.restore_delay_secs` is a compatibility delay, not a handshake; increase it only if the local Codex process reads authentication later than three seconds after launch.
 
 The legacy `[use] mode` and `[use] min_remaining` keys are ignored and produce a startup warning; the unified scoring algorithm replaced the old selection modes.
@@ -134,6 +138,8 @@ Every command writes diagnostic logs to `$CODEX_SWITCH_HOME/logs/`, one file per
 - Windows uses Task Scheduler and requires elevated PowerShell for daemon installation. Windows Terminal or PowerShell is recommended for the TUI.
 
 > **`CODEX_SWITCH_HOME` and installed daemon services:** `daemon install` writes a service definition that forwards only `HOME` and `CODEX_HOME` into the daemon's environment. If you relocate data with `CODEX_SWITCH_HOME`, an installed service still uses the default `~/.codex-switch` unless you add the variable to the generated LaunchAgent plist, systemd unit, or Task Scheduler command yourself.
+
+> **Docker Compose:** `docker compose` sets `CODEX_HOME=/data/codex` and `CODEX_SWITCH_HOME=/data/codex-switch`, bind-mounted from the host's `~/.codex` and `~/.codex-switch`. The container runs `daemon start --foreground` under `restart: unless-stopped`, so `daemon install` and its platform services are not used. `pid: host` is required there so the daemon can still see host Codex CLI processes for `defer_switch_while_codex_running`.
 
 ## Next steps
 

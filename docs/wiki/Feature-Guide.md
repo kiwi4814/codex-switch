@@ -137,6 +137,18 @@ when the daemon decides a warmup is needed.
 
 By default, a switch is deferred while an interactive Codex process (`codex`, `codex resume`, `codex exec`) is running; the daemon records the pending switch and retries on the next poll. Long-lived MCP or app-server processes do not block a switch. Operational state lives in `daemon-state.json` and is shown by `daemon status`. Daemon switches cannot ask for confirmation: an untracked live `auth.json` is replaced after the normal backup rotation, so save or import an account first if you want to keep it selectable.
 
+### Docker Compose
+
+Under the Compose deployment the container runs `codex-switch daemon start --foreground` and Compose supplies the lifecycle, so `daemon install` is not used and no systemd user service, LaunchAgent, or `enable-linger` is involved:
+
+```bash
+docker compose up -d
+docker compose logs -f codex-switch
+docker compose down
+```
+
+Two details matter for the behavior described above. `five_hour_warmup_times` compares against the container's local time, which comes from `TZ` in `.env`; UTC is the default without it. And the deferral in the previous paragraph relies on scanning host processes, which requires `pid: host` in `compose.yaml` — Codex CLI runs on the host while the daemon runs in the container. See the [README](https://github.com/kiwi4814/codex-switch#docker-compose-deployment-single-host-ubuntu) for the full deployment.
+
 ## Update the binary
 
 Direct installs support the stable and rolling development channels, verify release checksums before replacing the binary, and restart a running daemon around the update. See [Updating](Updating) for channels, Homebrew rules, and legacy-install migration, and [Testing development releases](Development-Releases) for the dev channel.

@@ -1,0 +1,41 @@
+# VCS
+.git
+.gitignore
+.github
+
+# build output
+/target
+/temp
+
+# local agent/editor state
+.claude/
+.AIINFO/
+.vscode/
+.idea/
+
+# credentials and local state — must never enter the build context
+.env
+.env.*
+!.env.example
+.codex
+.codex-switch
+auth.json
+*.pem
+*.key
+
+# archives and patches
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.patch
+*.diff
+
+# docker files themselves
+Dockerfile
+compose.yaml
+docker-compose.yml
+.dockerignore
+
+# os noise
+.DS_Store

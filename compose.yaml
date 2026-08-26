@@ -1,0 +1,25 @@
+services:
+  codex-switch:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codex-switch:local
+    # Runs as the host user so auth.json, config.toml and profiles/* stay owned
+    # by that user instead of root.
+    user: "${PUID}:${PGID}"
+    # Host PID namespace: the daemon detects interactive Codex sessions by
+    # scanning the process table (src/daemon/codex_process.rs). Codex CLI runs
+    # on the host, so without this the daemon sees no sessions and
+    # defer_switch_while_codex_running can never defer a switch.
+    pid: host
+    environment:
+      # five_hour_warmup_times is compared against local wall-clock time, so the
+      # container timezone has to be set explicitly.
+      TZ: "${TZ:-UTC}"
+    volumes:
+      # Bind mounts, not named volumes: the host Codex CLI and the container
+      # must read and write the same auth.json / profiles.
+      - "${HOST_HOME}/.codex:/data/codex"
+      - "${HOST_HOME}/.codex-switch:/data/codex-switch"
+    restart: unless-stopped
+    # No ports: codex-switch exposes no network service.
