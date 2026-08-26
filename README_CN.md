@@ -184,7 +184,7 @@ log_level = "info"
 defer_switch_while_codex_running = true
 ```
 
-`five_hour_warmup_times` 比对的是**容器**本地时间，由 `.env` 里的 `TZ` 决定。不设 `TZ` 时容器是 UTC，这几个时刻会落在错误的挂钟时间上。
+`five_hour_warmup_times` 比对的是**容器**本地时间。Docker Compose 部署强制要求设置 `TZ`，不设置容器不会启动。如果 `05:00` / `10:10` / `15:20` 按北京时间执行，请设置 `TZ=Asia/Shanghai`。
 
 ### 为什么需要 `pid: host`
 

@@ -192,7 +192,7 @@ log_level = "info"
 defer_switch_while_codex_running = true
 ```
 
-`five_hour_warmup_times` is matched against **container** local time, which is set by `TZ` in `.env`. Without `TZ` the container is UTC and those hours fire at the wrong wall-clock time.
+`five_hour_warmup_times` is matched against **container** local time. `TZ` is required by the Compose deployment — the container will not start without it. Set `TZ=Asia/Shanghai` if `05:00` / `10:10` / `15:20` should be interpreted as China Standard Time.
 
 ### Why `pid: host`
 

@@ -87,8 +87,9 @@ the listed minute(s). Keep `auto_warmup = false` if you want 5-hour windows to b
 started only by these fixed times rather than by the general cache-refresh warmup.
 
 Under Docker Compose the relevant local timezone is the **container's**, set through
-`TZ` in `.env`. Without it the container runs in UTC and these times fire at the wrong
-wall-clock moment.
+`TZ` in `.env`. `TZ` is required by that deployment — the container will not start
+without it. Set `TZ=Asia/Shanghai` if these times should be interpreted as China
+Standard Time.
 
 `launch.restore_delay_secs` is a compatibility delay, not a handshake; increase it only if the local Codex process reads authentication later than three seconds after launch.
 

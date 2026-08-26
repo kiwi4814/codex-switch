@@ -147,7 +147,7 @@ docker compose logs -f codex-switch
 docker compose down
 ```
 
-Two details matter for the behavior described above. `five_hour_warmup_times` compares against the container's local time, which comes from `TZ` in `.env`; UTC is the default without it. And the deferral in the previous paragraph relies on scanning host processes, which requires `pid: host` in `compose.yaml` — Codex CLI runs on the host while the daemon runs in the container. See the [README](https://github.com/kiwi4814/codex-switch#docker-compose-deployment-single-host-ubuntu) for the full deployment.
+Two details matter for the behavior described above. `five_hour_warmup_times` compares against the container's local time, which comes from `TZ` in `.env`; that variable is required and the container will not start without it, so set `TZ=Asia/Shanghai` if these times should be interpreted as China Standard Time. And the deferral in the previous paragraph relies on scanning host processes, which requires `pid: host` in `compose.yaml` — Codex CLI runs on the host while the daemon runs in the container. See the [README](https://github.com/kiwi4814/codex-switch#docker-compose-deployment-single-host-ubuntu) for the full deployment.
 
 ## Update the binary
 
